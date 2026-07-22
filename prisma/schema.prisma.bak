@@ -1,0 +1,130 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id         String   @id
+  email      String   @unique
+  username   String   @unique
+  name       String
+  image      String?
+  bio        String?
+  location   String?
+  birthday   String?
+  coverPhoto String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  posts                    Post[]
+  reactions                Reaction[]
+  comments                 Comment[]
+  sentFriendRequests       Friendship[]              @relation("FriendshipRequester")
+  receivedFriendRequests   Friendship[]              @relation("FriendshipAddressee")
+  notificationsReceived    Notification[]            @relation("NotifReceiver")
+  notificationsSent        Notification[]            @relation("NotifSender")
+  conversationParticipants ConversationParticipant[]
+  messages                 Message[]
+}
+
+model Post {
+  id               String     @id @default(cuid())
+  userId           String
+  user             User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type             String
+  content          String?
+  image            String?
+  locationName     String?
+  venueCategory    String?
+  musicTitle       String?
+  musicArtist      String?
+  musicAlbum       String?
+  musicMode        String?
+  activityType     String?
+  activityDuration String?
+  mealName         String?
+  sleepAction      String?
+  sleepDuration    String?
+  reactions        Reaction[]
+  comments         Comment[]
+  createdAt        DateTime   @default(now())
+}
+
+model Reaction {
+  id     String @id @default(cuid())
+  postId String
+  post   Post   @relation(fields: [postId], references: [id], onDelete: Cascade)
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type   String
+
+  @@unique([postId, userId, type])
+}
+
+model Comment {
+  id        String   @id @default(cuid())
+  postId    String
+  post      Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  content   String
+  createdAt DateTime @default(now())
+}
+
+model Friendship {
+  id          String   @id @default(cuid())
+  requesterId String
+  requester   User     @relation("FriendshipRequester", fields: [requesterId], references: [id], onDelete: Cascade)
+  addresseeId String
+  addressee   User     @relation("FriendshipAddressee", fields: [addresseeId], references: [id], onDelete: Cascade)
+  status      String   @default("pending")
+  createdAt   DateTime @default(now())
+
+  @@unique([requesterId, addresseeId])
+}
+
+model Notification {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation("NotifReceiver", fields: [userId], references: [id], onDelete: Cascade)
+  fromUserId String?
+  fromUser   User?    @relation("NotifSender", fields: [fromUserId], references: [id], onDelete: SetNull)
+  type       String
+  message    String
+  postId     String?
+  read       Boolean  @default(false)
+  createdAt  DateTime @default(now())
+}
+
+model Conversation {
+  id           String                    @id @default(cuid())
+  participants ConversationParticipant[]
+  messages     Message[]
+  createdAt    DateTime                  @default(now())
+  updatedAt    DateTime                  @updatedAt
+}
+
+model ConversationParticipant {
+  id             String       @id @default(cuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([conversationId, userId])
+}
+
+model Message {
+  id             String       @id @default(cuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  senderId       String
+  sender         User         @relation(fields: [senderId], references: [id], onDelete: Cascade)
+  text           String
+  image          String?
+  createdAt      DateTime     @default(now())
+}
