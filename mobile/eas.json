@@ -1,0 +1,41 @@
+{
+  "cli": {
+    "version": "16.17.4"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "ios": {
+        "simulator": true
+      }
+    },
+    "preview": {
+      "distribution": "internal"
+    },
+    "production": {
+      "env": {
+        "EXPO_PUBLIC_SUPABASE_ANON_KEY": "sb_publishable_U5tTrVu3kQoL6R3hqzGw2g_DIw3n9F_",
+        "EXPO_PUBLIC_SUPABASE_URL": "https://mxdgwftyvupxmlyzsvqk.supabase.co",
+        "EXPO_PUBLIC_EXAMPLE_ENV_VAR": "test",
+        "EXPO_PUBLIC_GOOGLE_PLACES_API_KEY": "AIzaSyC7gUIOmkjn4BV0zKx6GfYmpGssTZ91uDQ",
+        "BACKEND_URL": "https://flecked-ridge.vibecode.run",
+        "EXPO_PUBLIC_BACKEND_URL": "https://flecked-ridge.vibecode.run",
+        "EXPO_PUBLIC_VIBECODE_BACKEND_URL": "https://flecked-ridge.vibecode.run"
+      },
+      "ios": {
+        "distribution": "store"
+      },
+      "android": {
+        "distribution": "store"
+      }
+    }
+  },
+  "submit": {
+    "production": {
+      "ios": {
+        "ascAppId": "6761956947"
+      }
+    }
+  }
+}

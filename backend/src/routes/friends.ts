@@ -1,0 +1,258 @@
+import { Hono } from "hono";
+import { createUserClient, supabaseAdmin } from "../supabase";
+import { sendPushNotification, getPushToken } from "../lib/push";
+import type { HonoVariables } from "../types";
+
+const friendsRouter = new Hono<{ Variables: HonoVariables }>();
+
+function formatProfile(p: any) {
+  return {
+    id: p.id,
+    name: p.full_name ?? "",
+    username: p.username ?? "",
+    avatar: p.avatar_url ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${p.id}`,
+    bio: p.bio ?? "",
+    location: p.location ?? "",
+    birthday: p.birthday ?? "",
+    coverPhoto: p.cover_url ?? "https://images.unsplash.com/photo-1519638399535-1b036603ac77?w=800",
+    joinDate: p.created_at ?? new Date().toISOString(),
+    friendCount: 0,
+    postCount: 0,
+    momentCount: 0,
+  };
+}
+
+friendsRouter.get("/", async (c) => {
+  const user = c.get("user");
+  const userId = c.get("userId");
+  const token = c.get("accessToken");
+  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const userClient = createUserClient(token);
+
+  const { data: acceptedFriendships } = await userClient
+    .from("friendships")
+    .select("id, requester_id, receiver_id")
+    .eq("status", "accepted")
+    .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`);
+
+  const friendIds = (acceptedFriendships ?? []).map((f: any) =>
+    f.requester_id === userId ? f.receiver_id : f.requester_id
+  );
+
+  const { data: pendingFriendships } = await userClient
+    .from("friendships")
+    .select("id, requester_id, created_at")
+    .eq("receiver_id", userId)
+    .eq("status", "pending");
+
+  const pendingRequesterIds = (pendingFriendships ?? []).map((f: any) => f.requester_id);
+
+  const { data: pendingSentFriendships } = await userClient
+    .from("friendships")
+    .select("id, receiver_id")
+    .eq("requester_id", userId)
+    .eq("status", "pending");
+
+  const pendingSentIds = (pendingSentFriendships ?? []).map((f: any) => f.receiver_id);
+
+  const allIds = [...new Set([...friendIds, ...pendingRequesterIds])];
+
+  let profileMap: Record<string, any> = {};
+  if (allIds.length > 0) {
+    const { data: profiles } = await userClient.from("profiles").select("*").in("id", allIds);
+    for (const p of profiles ?? []) profileMap[p.id] = p;
+  }
+
+  const friends = friendIds.map((id: string) => profileMap[id]).filter(Boolean).map(formatProfile);
+  const requests = (pendingFriendships ?? []).map((f: any) => ({
+    id: f.id,
+    user: profileMap[f.requester_id] ? formatProfile(profileMap[f.requester_id]) : { id: f.requester_id, name: "Unknown" },
+    mutualFriends: 0,
+    createdAt: f.created_at,
+  }));
+
+  const excludeIds = [userId, ...friendIds, ...pendingRequesterIds, ...pendingSentIds];
+  const { data: suggested } = await userClient
+    .from("profiles")
+    .select("*")
+    .not("id", "in", `(${excludeIds.join(",")})`)
+    .limit(5);
+
+  return c.json({ data: { friends, requests, suggested: (suggested ?? []).map(formatProfile) } });
+});
+
+friendsRouter.post("/request/:userId", async (c) => {
+  const user = c.get("user");
+  const userId = c.get("userId");
+  const token = c.get("accessToken");
+  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const { userId: targetId } = c.req.param();
+  if (targetId === userId) return c.json({ error: { message: "Cannot friend yourself" } }, 400);
+
+  const userClient = createUserClient(token);
+
+  const { data: existing } = await userClient
+    .from("friendships")
+    .select("id")
+    .or(`and(requester_id.eq.${userId},receiver_id.eq.${targetId}),and(requester_id.eq.${targetId},receiver_id.eq.${userId})`)
+    .maybeSingle();
+
+  if (existing) return c.json({ error: { message: "Friend request already exists" } }, 409);
+
+  const { data: friendship, error } = await userClient
+    .from("friendships")
+    .insert({ requester_id: userId, receiver_id: targetId, status: "pending" })
+    .select()
+    .single();
+
+  if (error) return c.json({ error: { message: "Failed to send request" } }, 500);
+
+  await userClient.from("notifications").insert({
+    user_id: targetId,
+    from_user_id: userId,
+    type: "friend_request",
+    message: `${user.full_name} sent you a friend request`,
+    read: false,
+  });
+
+  // Send push notification to target user
+  try {
+    const pushToken = await getPushToken(supabaseAdmin, targetId);
+    await sendPushNotification(
+      pushToken,
+      "Friend Request",
+      `${user.full_name} sent you a friend request`,
+      { type: "friend_request", fromUserId: userId }
+    );
+  } catch (e) {
+    console.error("[push] friend request notification error:", e);
+  }
+
+  return c.json({ data: friendship }, 201);
+});
+
+friendsRouter.post("/accept/:id", async (c) => {
+  const user = c.get("user");
+  const userId = c.get("userId");
+  const token = c.get("accessToken");
+  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const { id } = c.req.param();
+  const userClient = createUserClient(token);
+
+  const { data: friendship } = await userClient.from("friendships").select("*").eq("id", id).single();
+  if (!friendship || friendship.receiver_id !== userId) {
+    return c.json({ error: { message: "Not found" } }, 404);
+  }
+
+  const { data: updated } = await userClient
+    .from("friendships")
+    .update({ status: "accepted" })
+    .eq("id", id)
+    .select()
+    .single();
+
+  // Notify the requester that their friend request was accepted
+  try {
+    await userClient.from("notifications").insert({
+      user_id: friendship.requester_id,
+      from_user_id: userId,
+      type: "friend_accepted",
+      message: `${user.full_name} accepted your friend request`,
+      read: false,
+    });
+  } catch (e) {
+    console.error("[notifications] friend_accepted insert error:", e);
+  }
+
+  try {
+    const pushToken = await getPushToken(supabaseAdmin, friendship.requester_id);
+    await sendPushNotification(
+      pushToken,
+      "Friend Request Accepted",
+      `${user.full_name} accepted your friend request`,
+      { type: "friend_accepted", fromUserId: userId }
+    );
+  } catch (e) {
+    console.error("[push] friend accepted notification error:", e);
+  }
+
+  return c.json({ data: updated });
+});
+
+friendsRouter.get("/status/:userId", async (c) => {
+  const user = c.get("user");
+  const userId = c.get("userId");
+  const token = c.get("accessToken");
+  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const { userId: targetId } = c.req.param();
+  const userClient = createUserClient(token);
+
+  const { data: friendship } = await userClient
+    .from("friendships")
+    .select("id, requester_id, receiver_id, status")
+    .or(`and(requester_id.eq.${userId},receiver_id.eq.${targetId}),and(requester_id.eq.${targetId},receiver_id.eq.${userId})`)
+    .maybeSingle();
+
+  let status: "none" | "pending_sent" | "pending_received" | "friends" = "none";
+  let friendshipId: string | null = null;
+
+  if (friendship) {
+    friendshipId = friendship.id;
+    if (friendship.status === "accepted") {
+      status = "friends";
+    } else if (friendship.status === "pending") {
+      status = friendship.requester_id === userId ? "pending_sent" : "pending_received";
+    }
+  }
+
+  const [currentUserFriendships, targetUserFriendships] = await Promise.all([
+    userClient
+      .from("friendships")
+      .select("requester_id, receiver_id")
+      .eq("status", "accepted")
+      .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
+    userClient
+      .from("friendships")
+      .select("requester_id, receiver_id")
+      .eq("status", "accepted")
+      .or(`requester_id.eq.${targetId},receiver_id.eq.${targetId}`),
+  ]);
+
+  const currentFriendIds = new Set(
+    (currentUserFriendships.data ?? []).map((f: any) =>
+      f.requester_id === userId ? f.receiver_id : f.requester_id
+    )
+  );
+  const targetFriendIds = (targetUserFriendships.data ?? []).map((f: any) =>
+    f.requester_id === targetId ? f.receiver_id : f.requester_id
+  );
+  const mutualFriends = targetFriendIds.filter((id: string) => currentFriendIds.has(id)).length;
+
+  return c.json({ data: { status, friendshipId, mutualFriends } });
+});
+
+friendsRouter.delete("/:id", async (c) => {
+  const user = c.get("user");
+  const userId = c.get("userId");
+  const token = c.get("accessToken");
+  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const { id } = c.req.param();
+  const userClient = createUserClient(token);
+
+  const { data: friendship } = await userClient.from("friendships").select("*").eq("id", id).maybeSingle();
+  if (!friendship) return c.body(null, 204);
+
+  if (friendship.requester_id !== userId && friendship.receiver_id !== userId) {
+    return c.json({ error: { message: "Unauthorized" } }, 403);
+  }
+
+  await userClient.from("friendships").delete().eq("id", id);
+  return c.body(null, 204);
+});
+
+export { friendsRouter };
