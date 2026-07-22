@@ -34,6 +34,8 @@ const app = new Hono<{ Variables: HonoVariables }>();
 const allowed = [
   /^http:\/\/localhost(:\d+)?$/,
   /^http:\/\/127\.0\.0\.1(:\d+)?$/,
+  /^http:\/\/\d{1,3}(\.\d{1,3}){3}(:\d+)?$/,
+  /^https:\/\/\d{1,3}(\.\d{1,3}){3}(:\d+)?$/,
   /^https:\/\/[a-z0-9-]+\.dev\.vibecode\.run$/,
   /^https:\/\/[a-z0-9-]+\.vibecode\.run$/,
   /^https:\/\/[a-z0-9-]+\.vibecodeapp\.com$/,
@@ -42,7 +44,11 @@ const allowed = [
 ];
 
 app.use("*", cors({
-  origin: (origin) => (origin && allowed.some((re) => re.test(origin)) ? origin : null),
+  origin: (origin) => {
+    // Native mobile clients often omit Origin; allow those requests.
+    if (!origin) return "*";
+    return allowed.some((re) => re.test(origin)) ? origin : null;
+  },
   credentials: true,
 }));
 

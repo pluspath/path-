@@ -8,6 +8,8 @@ const envSchema = z.object({
   SUPABASE_SERVICE_ROLE_KEY: z.string().optional(),
   BACKEND_URL: z.string().default("http://localhost:3000"),
   GOOGLE_PLACES_API_KEY: z.string().min(1, "GOOGLE_PLACES_API_KEY is required"),
+  OPENAI_API_KEY: z.string().optional(),
+  BETTER_AUTH_SECRET: z.string().optional(),
   RESEND_API_KEY: z.string().optional(),
 });
 
