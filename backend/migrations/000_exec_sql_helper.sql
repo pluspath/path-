@@ -16,3 +16,7 @@ REVOKE ALL ON FUNCTION public.exec_sql(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.exec_sql(text) FROM anon;
 REVOKE ALL ON FUNCTION public.exec_sql(text) FROM authenticated;
 -- Service role / dashboard SQL can still execute it as owner.
+bun run admin:dev
+
+Username: admin
+Password: Admin@PathPlus2026!
