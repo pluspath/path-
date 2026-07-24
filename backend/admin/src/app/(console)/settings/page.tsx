@@ -48,8 +48,16 @@ export default function SettingsPage() {
       .get<{ data: SettingsPayload }>("/settings")
       .then((r) => {
         setData(r.data);
-        const row = r.data.settings?.find((s) => s.key === "general");
-        const value = (row?.value || {}) as Partial<GeneralSettings>;
+        const settings = r.data.settings;
+        // API returns an array of { key, value }; tolerate a legacy map shape too.
+        let value: Partial<GeneralSettings> = {};
+        if (Array.isArray(settings)) {
+          const row = settings.find((s) => s.key === "general");
+          value = (row?.value || {}) as Partial<GeneralSettings>;
+        } else if (settings && typeof settings === "object") {
+          const map = settings as unknown as Record<string, Record<string, unknown>>;
+          value = (map.general || {}) as Partial<GeneralSettings>;
+        }
         setGeneral({
           appName: String(value.appName ?? defaultGeneral.appName),
           logoUrl: String(value.logoUrl ?? ""),

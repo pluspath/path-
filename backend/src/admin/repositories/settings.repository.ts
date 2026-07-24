@@ -2,13 +2,17 @@ import { supabaseAdmin } from "../../supabase";
 
 export const settingsRepository = {
   async getAll() {
-    const { data, error } = await supabaseAdmin.from("app_settings").select("*");
+    const { data, error } = await supabaseAdmin
+      .from("app_settings")
+      .select("key, value, updated_at, updated_by")
+      .order("key", { ascending: true });
     if (error) throw error;
-    const map: Record<string, unknown> = {};
-    for (const row of data ?? []) {
-      map[row.key] = row.value;
-    }
-    return map;
+    return (data ?? []) as {
+      key: string;
+      value: Record<string, unknown>;
+      updated_at?: string;
+      updated_by?: string | null;
+    }[];
   },
 
   async get(key: string) {
