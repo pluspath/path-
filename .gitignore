@@ -35,3 +35,9 @@ studio.log
 
 # Prisma generated files (bunx prisma generate)
 /generated/prisma.env
+
+# Admin Next.js
+admin/.next
+admin/node_modules
+admin/out
+admin/.env.local

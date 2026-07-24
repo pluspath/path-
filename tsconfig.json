@@ -1,5 +1,12 @@
 {
-  "exclude": ["prisma/seed.ts"],
+  "exclude": [
+    "prisma/seed.ts",
+    "admin",
+    "admin/**",
+    "scripts/**",
+    "Path-Plus/**",
+    "**/node_modules/**"
+  ],
   "compilerOptions": {
     // Environment setup & latest features
     "lib": ["ESNext"],

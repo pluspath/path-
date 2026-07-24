@@ -8,17 +8,37 @@ const postsRouter = new Hono<{ Variables: HonoVariables }>();
 
 postsRouter.get("/", async (c) => {
   const user = c.get("user");
+  const userId = c.get("userId");
   const token = c.get("accessToken");
-  if (!user || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const userClient = createUserClient(token);
-  const { data: posts } = await userClient
-    .from("posts")
-    .select("*, profiles(*), reactions(user_id, type, profiles:user_id(avatar_url))")
-    .order("created_at", { ascending: false })
-    .limit(50);
+  const [{ data: posts }, { data: friendships }] = await Promise.all([
+    userClient
+      .from("posts")
+      .select("*, profiles(*), reactions(user_id, type, profiles:user_id(avatar_url))")
+      .order("created_at", { ascending: false })
+      .limit(80),
+    userClient
+      .from("friendships")
+      .select("requester_id, receiver_id")
+      .eq("status", "accepted")
+      .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
+  ]);
 
-  return c.json({ data: (posts ?? []).map(formatPost) });
+  const friendIds = new Set<string>();
+  for (const f of friendships ?? []) {
+    friendIds.add(f.requester_id === userId ? f.receiver_id : f.requester_id);
+  }
+
+  const visible = (posts ?? []).filter((p: any) => {
+    if (p.user_id === userId) return true;
+    const visibility = p.profiles?.post_visibility === "everyone" ? "everyone" : "friends";
+    if (visibility === "everyone") return true;
+    return friendIds.has(p.user_id);
+  }).slice(0, 50);
+
+  return c.json({ data: visible.map(formatPost) });
 });
 
 postsRouter.get("/:id", async (c) => {

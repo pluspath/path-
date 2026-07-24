@@ -4,8 +4,10 @@ import { z } from "zod";
 import { Resend } from "resend";
 import { supabase, supabaseAdmin } from "../supabase";
 import { env } from "../env";
+import { authLimiter } from "../lib/rate-limit";
 
 const authRouter = new Hono();
+authRouter.use("*", authLimiter);
 
 // In-memory OTP store: email → { otp, expiry, username, fullName, password }
 const otpStore = new Map<string, { otp: string; expiry: number; username: string; fullName: string; password: string }>();
