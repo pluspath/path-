@@ -7,9 +7,15 @@
     "dev": "bun run --hot src/index.ts",
     "start": "bun run src/index.ts",
     "studio": "cloud-studio --port 3001 --hostname 0.0.0.0",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "seed:admin": "bun run scripts/seed-admin.ts",
+    "migrate:admin": "bun run scripts/apply-admin-migration.ts",
+    "admin:dev": "bun --cwd admin run dev",
+    "admin:build": "bun --cwd admin run build",
+    "admin:start": "bun --cwd admin run start"
   },
   "devDependencies": {
+    "@types/bcryptjs": "^3.0.0",
     "@types/bun": "latest",
     "prisma": "6",
     "typescript": "5.8.3"
@@ -23,8 +29,11 @@
     "@vibecodeapp/backend-sdk": "^1.0.1",
     "@vibecodeapp/cloud-studio": "^0.2.4",
     "@vibecodeapp/proxy": "^2.0.3",
+    "bcryptjs": "^3.0.3",
     "better-auth": "^1.5.6",
     "hono": "4.6.0",
+    "hono-rate-limiter": "^0.5.3",
+    "jose": "^6.2.4",
     "postgres": "^3.4.9",
     "resend": "^6.12.4",
     "zod": "4.1.11"

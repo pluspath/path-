@@ -1,0 +1,125 @@
+# Path+ Admin Dashboard — VPS Deployment
+
+## Prerequisites
+
+- Bun installed on the VPS
+- Node.js 20+ (optional; Bun can run Next.js)
+- PM2 (`npm i -g pm2`)
+- Nginx
+- Supabase project already used by production
+
+## 1. Database migration (REQUIRED before first admin login)
+
+**Option A — Supabase SQL Editor (recommended)**
+
+1. Open Supabase → SQL Editor  
+2. Run `migrations/001_admin_system.sql`  
+3. (Optional) Run `migrations/000_exec_sql_helper.sql` if you want auto-migrate via RPC later  
+
+**Option B — DATABASE_URL**
+
+```bash
+# Add DATABASE_URL to backend .env (from Supabase → Project Settings → Database)
+bun run migrate:admin
+```
+
+This creates admin tables only and adds additive columns. Existing mobile tables are not recreated.
+
+Then seed (if the SQL seed did not apply):
+
+```bash
+cd /path/to/backend
+bun run seed:admin
+```
+
+Default credentials (change immediately after first login):
+
+- Username: `admin`
+- Password: `Admin@PathPlus2026!`
+
+## 2. Environment variables
+
+Backend `.env` must include existing production vars plus:
+
+```env
+ADMIN_JWT_SECRET=<openssl rand -hex 48>
+ADMIN_JWT_EXPIRES_IN=8h
+ADMIN_CORS_ORIGIN=https://admin.yourdomain.com
+```
+
+Admin frontend `admin/.env.local` / production env:
+
+```env
+NEXT_PUBLIC_API_URL=https://api.yourdomain.com
+NEXT_PUBLIC_APP_NAME=Path+ Admin
+```
+
+## 3. Build
+
+```bash
+cd /path/to/backend
+bun install
+bun run typecheck
+
+cd admin
+bun install
+bun run build
+```
+
+## 4. Start with PM2
+
+```bash
+cd /path/to/backend
+pm2 start ecosystem.config.cjs
+pm2 save
+pm2 status
+```
+
+Processes:
+
+- `pathplus-api` → port **3000**
+- `pathplus-admin` → port **3001**
+
+## 5. Nginx
+
+Use `deploy/nginx.pathplus.conf` as a template.
+
+Point:
+
+- `api.yourdomain.com` → `127.0.0.1:3000`
+- `admin.yourdomain.com` → `127.0.0.1:3001`
+
+Enable TLS with Certbot.
+
+Update `ADMIN_CORS_ORIGIN` and `NEXT_PUBLIC_API_URL` accordingly, then restart:
+
+```bash
+pm2 restart pathplus-api pathplus-admin
+```
+
+## 6. Verify mobile compatibility
+
+Existing endpoints must still work:
+
+```bash
+curl "$BACKEND_URL/health"
+curl "$BACKEND_URL/health/supabase"
+# Mobile-auth routes unchanged under /api/auth, /api/posts, /api/friends, etc.
+```
+
+Admin:
+
+```bash
+curl -X POST "$BACKEND_URL/api/admin/auth/login" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"Admin@PathPlus2026!"}'
+```
+
+## 7. Security checklist
+
+- [ ] `ADMIN_JWT_SECRET` is unique and long
+- [ ] Default admin password rotated
+- [ ] Admin panel not publicly indexed (optional Basic Auth / IP allowlist)
+- [ ] HTTPS enabled
+- [ ] Service role key never exposed to the admin frontend
+- [ ] Migrations applied in production Supabase
