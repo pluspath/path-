@@ -36,6 +36,8 @@ export function formatPost(p: any) {
     content: p.content ?? undefined,
     image: p.image_url ?? undefined,
     locationName: p.location ?? undefined,
+    locationLat: p.location_lat ?? undefined,
+    locationLng: p.location_lng ?? undefined,
     venueCategory: p.venue_category ?? undefined,
     musicTitle: p.music_title ?? undefined,
     musicArtist: p.music_artist ?? undefined,

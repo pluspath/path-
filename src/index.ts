@@ -33,6 +33,8 @@ const app = new Hono<{ Variables: HonoVariables }>();
         "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS post_visibility TEXT NOT NULL DEFAULT 'friends';",
         "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS push_notifications_enabled BOOLEAN NOT NULL DEFAULT TRUE;",
         "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS email_notifications_enabled BOOLEAN NOT NULL DEFAULT FALSE;",
+        "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS location_lat DOUBLE PRECISION;",
+        "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS location_lng DOUBLE PRECISION;",
       ];
       for (const sql of statements) {
         await supabaseAdmin.rpc("exec_sql", { sql });
@@ -40,7 +42,7 @@ const app = new Hono<{ Variables: HonoVariables }>();
     }
   } catch {
     console.log(
-      "[migration] column migrations may not have run — ensure profiles preference columns exist (see migrations/002_user_preferences.sql)."
+      "[migration] column migrations may not have run — ensure profiles preference columns and posts.location_lat/location_lng exist (see migrations/002_user_preferences.sql and 003_posts_location_coords.sql)."
     );
   }
 })();
