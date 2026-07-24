@@ -50,9 +50,22 @@ ADMIN_CORS_ORIGIN=https://admin.yourdomain.com
 Admin frontend `admin/.env.local` / production env:
 
 ```env
-NEXT_PUBLIC_API_URL=https://api.yourdomain.com
+# Leave empty when using same VPS (recommended): browser calls /api/admin on :3001
+# and Next.js proxies to the API on 127.0.0.1:3000.
+# NEXT_PUBLIC_API_URL=
+
 NEXT_PUBLIC_APP_NAME=Path+ Admin
+API_INTERNAL_URL=http://127.0.0.1:3000
 ```
+
+If admin and API use **separate domains**, set the public API URL instead:
+
+```env
+NEXT_PUBLIC_API_URL=https://api.yourdomain.com
+ADMIN_CORS_ORIGIN=https://admin.yourdomain.com
+```
+
+**Important:** `NEXT_PUBLIC_*` is baked in at `bun run build`. After changing it, rebuild the admin app.
 
 ## 3. Build
 
@@ -63,7 +76,41 @@ bun run typecheck
 
 cd admin
 bun install
+# Do NOT set NEXT_PUBLIC_API_URL=http://localhost:3000 for a public VPS —
+# that makes browsers call the visitor's own machine ("Failed to fetch").
 bun run build
+```
+
+### Quick fix if login shows "Failed to fetch"
+
+You are almost certainly opening `http://YOUR_VPS_IP:3001` while the UI still points at `localhost:3000`.
+
+```bash
+cd /path/to/backend/admin
+# Ensure no NEXT_PUBLIC_API_URL=http://localhost:3000 in .env / .env.local
+rm -f .env.local   # only if it forces localhost
+echo 'API_INTERNAL_URL=http://127.0.0.1:3000' > .env.local
+bun run build
+cd ..
+pm2 restart ecosystem.config.cjs
+```
+
+Then open `http://YOUR_VPS_IP:3001` and log in again.
+
+Verify the API itself (from the VPS):
+
+```bash
+curl -X POST "http://127.0.0.1:3000/api/admin/auth/login" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"Admin@PathPlus2026!"}'
+```
+
+And via the admin proxy:
+
+```bash
+curl -X POST "http://127.0.0.1:3001/api/admin/auth/login" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"Admin@PathPlus2026!"}'
 ```
 
 ## 4. Start with PM2

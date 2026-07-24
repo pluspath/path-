@@ -32,6 +32,8 @@ module.exports = {
       env: {
         NODE_ENV: "production",
         PORT: 3001,
+        // Next.js server-side proxy target (browser uses same-origin /api/admin)
+        API_INTERNAL_URL: "http://127.0.0.1:3000",
       },
       max_memory_restart: "512M",
       time: true,

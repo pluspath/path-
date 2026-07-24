@@ -14,7 +14,10 @@ bun run dev
 ```
 
 Dashboard: http://localhost:3001  
-API expected at: `NEXT_PUBLIC_API_URL` (default http://localhost:3000)
+API:
+
+- Default: same-origin `/api/admin` (Next.js proxies to `API_INTERNAL_URL`, default `http://127.0.0.1:3000`)
+- Optional cross-origin: set `NEXT_PUBLIC_API_URL` to the public API base (rebuild required)
 
 ## Production
 

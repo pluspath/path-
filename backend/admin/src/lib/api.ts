@@ -1,4 +1,15 @@
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3000";
+/**
+ * Browser API base.
+ * - Prefer NEXT_PUBLIC_API_URL when admin + API are on different hosts.
+ * - Default "" = same origin (Next.js rewrites /api/admin → backend).
+ *   This avoids "Failed to fetch" when opening the dashboard via a public IP
+ *   (browser localhost would point at the user's PC, not the VPS).
+ */
+function getApiBase(): string {
+  const configured = process.env.NEXT_PUBLIC_API_URL?.trim().replace(/\/$/, "");
+  if (configured) return configured;
+  return "";
+}
 
 export type ApiError = { message: string; details?: unknown };
 
@@ -24,10 +35,18 @@ async function request<T>(
   const token = getToken();
   if (token) headers.set("Authorization", `Bearer ${token}`);
 
-  const res = await fetch(`${API_URL}/api/admin${path}`, {
-    ...options,
-    headers,
-  });
+  const url = `${getApiBase()}/api/admin${path}`;
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      ...options,
+      headers,
+    });
+  } catch {
+    throw new Error(
+      "Cannot reach the API. If you open the admin panel by IP/domain, rebuild with an empty NEXT_PUBLIC_API_URL (same-origin proxy) or set NEXT_PUBLIC_API_URL to your public API URL."
+    );
+  }
 
   if (options.raw) {
     if (!res.ok) {
