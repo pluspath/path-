@@ -62,14 +62,10 @@ usersRouter.get("/search", async (c) => {
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const q = c.req.query("q") ?? "";
-  if (q.length < 2) return c.json({ data: [] });
+  const sanitized = q.replace(/[%_,.()]/g, " ").trim();
+  if (sanitized.length < 2) return c.json({ data: [] });
 
   const userClient = createUserClient(token);
-  const { data: profiles } = await userClient
-    .from("profiles")
-    .select("*")
-    .or(`full_name.ilike.%${q}%,username.ilike.%${q}%`)
-    .limit(20);
 
   // Fetch all friendships involving the current user
   const { data: myFriendships } = await userClient
@@ -83,7 +79,14 @@ usersRouter.get("/search", async (c) => {
     friendshipByUser[otherId] = { id: f.id, status: f.status, isSender: f.requester_id === userId };
   }
 
-  const results = (profiles ?? []).map((p: any) => {
+  const { data: profilesSafe } = await userClient
+    .from("profiles")
+    .select("*")
+    .or(`full_name.ilike.%${sanitized}%,username.ilike.%${sanitized}%`)
+    .neq("id", userId)
+    .limit(20);
+
+  const results = (profilesSafe ?? []).map((p: any) => {
     const fs = friendshipByUser[p.id];
     let friendshipStatus: 'none' | 'pending_sent' | 'pending_received' | 'friends' = 'none';
     let friendshipId: string | undefined;

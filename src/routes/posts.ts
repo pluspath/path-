@@ -65,6 +65,10 @@ postsRouter.post("/", async (c) => {
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const body = await c.req.json();
+  if (!body?.type || typeof body.type !== "string") {
+    return c.json({ error: { message: "Post type is required" } }, 400);
+  }
+
   const userClient = createUserClient(token);
 
   const { data: post, error } = await userClient
@@ -93,10 +97,20 @@ postsRouter.post("/", async (c) => {
 
   if (error) {
     console.error("Create post error:", error);
-    return c.json({ error: { message: "Failed to create post" } }, 500);
+    const isRls = error.code === "42501";
+    return c.json({
+      error: {
+        message: isRls
+          ? "Post create blocked by database security policy. Ensure RLS policies are applied (migrations/004_rls_policies.sql)."
+          : (error.message || "Failed to create post"),
+        code: error.code,
+      },
+    }, 500);
   }
 
-  if (body.sleepAction === "sleep") {
+  // Mobile sends "sleeping"; older clients may send "sleep"
+  const isGoingToSleep = body.sleepAction === "sleep" || body.sleepAction === "sleeping";
+  if (isGoingToSleep) {
     const { data: friends } = await userClient
       .from("friendships")
       .select("requester_id, receiver_id")
@@ -112,7 +126,8 @@ postsRouter.post("/", async (c) => {
         post_id: post.id,
         read: false,
       }));
-      await userClient.from("notifications").insert(notifications);
+      // Service role: notify other users (their rows) without weakening posts RLS
+      await supabaseAdmin.from("notifications").insert(notifications);
     }
   }
 
@@ -277,11 +292,14 @@ postsRouter.post("/:id/comments", async (c) => {
 
   const { id } = c.req.param();
   const body = await c.req.json();
-  const userClient = createUserClient(token);
+  const content = typeof body?.content === "string" ? body.content.trim() : "";
+  if (!content) {
+    return c.json({ error: { message: "Comment content is required" } }, 400);
+  }
 
   const { data: comment, error } = await supabaseAdmin
     .from("comments")
-    .insert({ id: crypto.randomUUID(), post_id: id, user_id: userId, content: body.content })
+    .insert({ id: crypto.randomUUID(), post_id: id, user_id: userId, content })
     .select("id, post_id, user_id, content, created_at")
     .single();
 
@@ -290,14 +308,15 @@ postsRouter.post("/:id/comments", async (c) => {
     return c.json({ error: { message: "Failed to create comment" } }, 500);
   }
 
-  const { data: postData } = await userClient
+  // comment_count on another user's post requires service role (RLS only allows own-row updates)
+  const { data: postData } = await supabaseAdmin
     .from("posts")
-    .select("comment_count")
+    .select("comment_count, user_id")
     .eq("id", id)
     .single();
 
   if (postData) {
-    await userClient
+    await supabaseAdmin
       .from("posts")
       .update({ comment_count: (postData.comment_count ?? 0) + 1 })
       .eq("id", id);
@@ -311,9 +330,8 @@ postsRouter.post("/:id/comments", async (c) => {
 
   // Send push notification to post owner (not to themselves)
   try {
-    const { data: postOwner } = await userClient.from("posts").select("user_id").eq("id", id).maybeSingle();
-    if (postOwner && postOwner.user_id !== userId) {
-      const pushToken = await getPushToken(supabaseAdmin, postOwner.user_id);
+    if (postData && postData.user_id !== userId) {
+      const pushToken = await getPushToken(supabaseAdmin, postData.user_id);
       await sendPushNotification(
         pushToken,
         "New Comment",
@@ -348,7 +366,6 @@ postsRouter.delete("/:id/comments/:commentId", async (c) => {
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const { id, commentId } = c.req.param();
-  const userClient = createUserClient(token);
 
   const { data: comment, error: fetchError } = await supabaseAdmin
     .from("comments")
@@ -372,14 +389,14 @@ postsRouter.delete("/:id/comments/:commentId", async (c) => {
     return c.json({ error: { message: "Failed to delete comment" } }, 500);
   }
 
-  const { data: postData } = await userClient
+  const { data: postData } = await supabaseAdmin
     .from("posts")
     .select("comment_count")
     .eq("id", id)
     .single();
 
   if (postData) {
-    await userClient
+    await supabaseAdmin
       .from("posts")
       .update({ comment_count: Math.max((postData.comment_count ?? 1) - 1, 0) })
       .eq("id", id);

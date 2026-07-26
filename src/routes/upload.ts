@@ -100,7 +100,8 @@ async function handleUpload(
 
 uploadRouter.post("/avatar", async (c) => handleUpload(c, "Avatars", "avatar"));
 uploadRouter.post("/cover", async (c) => handleUpload(c, "Covers", "cover"));
-uploadRouter.post("/image", async (c) => handleUpload(c, "Avatars", "post"));
+// Post media lives in the Posts bucket (images + optional video via /post)
+uploadRouter.post("/image", async (c) => handleUpload(c, "Posts", "post"));
 uploadRouter.post("/post", async (c) => handleUpload(c, "Posts", "post", { allowVideo: true }));
 
 export { uploadRouter };

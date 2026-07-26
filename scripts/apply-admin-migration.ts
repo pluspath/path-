@@ -16,6 +16,8 @@ const files = [
   "migrations/001_admin_system.sql",
   "migrations/002_user_preferences.sql",
   "migrations/003_posts_location_coords.sql",
+  "migrations/004_rls_policies.sql",
+  "migrations/005_storage_buckets.sql",
 ];
 
 async function applyViaDatabaseUrl(databaseUrl: string) {
