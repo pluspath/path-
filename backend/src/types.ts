@@ -9,6 +9,10 @@ export type Profile = {
   birthday: string | null;
   show_zodiac: boolean | null;
   username_changed: boolean | null;
+  post_visibility?: "everyone" | "friends" | null;
+  push_notifications_enabled?: boolean | null;
+  email_notifications_enabled?: boolean | null;
+  push_token?: string | null;
   created_at: string;
 };
 

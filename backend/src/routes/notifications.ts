@@ -71,7 +71,21 @@ notificationsRouter.post("/:id/read", async (c) => {
 
   const { id } = c.req.param();
   const userClient = createUserClient(token);
-  await userClient.from("notifications").update({ read: true }).eq("id", id).eq("user_id", userId);
+  const { data: updated, error } = await userClient
+    .from("notifications")
+    .update({ read: true })
+    .eq("id", id)
+    .eq("user_id", userId)
+    .select("id")
+    .maybeSingle();
+
+  if (error) {
+    console.error("[notifications] mark read error:", error.message);
+    return c.json({ error: { message: "Failed to mark notification as read" } }, 500);
+  }
+  if (!updated) {
+    return c.json({ error: { message: "Notification not found" } }, 404);
+  }
   return c.body(null, 204);
 });
 

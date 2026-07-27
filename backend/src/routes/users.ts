@@ -21,6 +21,9 @@ function formatProfile(p: any, postCount = 0, friendCount = 0) {
     momentCount: postCount,
     showZodiac: p.show_zodiac ?? false,
     usernameChanged: p.username_changed ?? false,
+    postVisibility: (p.post_visibility === "everyone" ? "everyone" : "friends") as "everyone" | "friends",
+    pushNotificationsEnabled: p.push_notifications_enabled ?? true,
+    emailNotificationsEnabled: p.email_notifications_enabled ?? false,
   };
 }
 
@@ -33,6 +36,8 @@ export function formatPost(p: any) {
     content: p.content ?? undefined,
     image: p.image_url ?? undefined,
     locationName: p.location ?? undefined,
+    locationLat: p.location_lat ?? undefined,
+    locationLng: p.location_lng ?? undefined,
     venueCategory: p.venue_category ?? undefined,
     musicTitle: p.music_title ?? undefined,
     musicArtist: p.music_artist ?? undefined,
@@ -57,14 +62,10 @@ usersRouter.get("/search", async (c) => {
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const q = c.req.query("q") ?? "";
-  if (q.length < 2) return c.json({ data: [] });
+  const sanitized = q.replace(/[%_,.()]/g, " ").trim();
+  if (sanitized.length < 2) return c.json({ data: [] });
 
   const userClient = createUserClient(token);
-  const { data: profiles } = await userClient
-    .from("profiles")
-    .select("*")
-    .or(`full_name.ilike.%${q}%,username.ilike.%${q}%`)
-    .limit(20);
 
   // Fetch all friendships involving the current user
   const { data: myFriendships } = await userClient
@@ -78,7 +79,14 @@ usersRouter.get("/search", async (c) => {
     friendshipByUser[otherId] = { id: f.id, status: f.status, isSender: f.requester_id === userId };
   }
 
-  const results = (profiles ?? []).map((p: any) => {
+  const { data: profilesSafe } = await userClient
+    .from("profiles")
+    .select("*")
+    .or(`full_name.ilike.%${sanitized}%,username.ilike.%${sanitized}%`)
+    .neq("id", userId)
+    .limit(20);
+
+  const results = (profilesSafe ?? []).map((p: any) => {
     const fs = friendshipByUser[p.id];
     let friendshipStatus: 'none' | 'pending_sent' | 'pending_received' | 'friends' = 'none';
     let friendshipId: string | undefined;
@@ -207,6 +215,21 @@ usersRouter.put("/me", async (c) => {
   if (body.coverPhoto !== undefined) updateData.cover_url = body.coverPhoto;
   if (body.avatar !== undefined) updateData.avatar_url = body.avatar;
   if (body.push_token !== undefined) updateData.push_token = body.push_token;
+  if (body.postVisibility !== undefined) {
+    if (body.postVisibility !== "everyone" && body.postVisibility !== "friends") {
+      return c.json({ error: { message: "postVisibility must be everyone or friends" } }, 400);
+    }
+    updateData.post_visibility = body.postVisibility;
+  }
+  if (body.pushNotificationsEnabled !== undefined) {
+    updateData.push_notifications_enabled = Boolean(body.pushNotificationsEnabled);
+    if (body.pushNotificationsEnabled === false) {
+      updateData.push_token = null;
+    }
+  }
+  if (body.emailNotificationsEnabled !== undefined) {
+    updateData.email_notifications_enabled = Boolean(body.emailNotificationsEnabled);
+  }
 
   const { data: updated, error } = await userClient
     .from("profiles")
@@ -247,11 +270,31 @@ usersRouter.get("/:id", async (c) => {
 // GET /api/:id/posts
 usersRouter.get("/:id/posts", async (c) => {
   const user = c.get("user");
+  const userId = c.get("userId");
   const token = c.get("accessToken");
-  if (!user || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const { id } = c.req.param();
   const userClient = createUserClient(token);
+
+  if (id !== userId) {
+    const { data: target } = await userClient.from("profiles").select("post_visibility").eq("id", id).maybeSingle();
+    const visibility = target?.post_visibility === "everyone" ? "everyone" : "friends";
+    if (visibility === "friends") {
+      const { data: friendship } = await userClient
+        .from("friendships")
+        .select("id")
+        .eq("status", "accepted")
+        .or(
+          `and(requester_id.eq.${userId},receiver_id.eq.${id}),and(requester_id.eq.${id},receiver_id.eq.${userId})`
+        )
+        .maybeSingle();
+      if (!friendship) {
+        return c.json({ data: [] });
+      }
+    }
+  }
+
   const { data: posts } = await userClient
     .from("posts")
     .select("*, profiles(*), reactions(user_id, type, profiles:user_id(avatar_url))")

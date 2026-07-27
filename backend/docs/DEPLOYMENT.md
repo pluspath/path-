@@ -14,7 +14,8 @@
 
 1. Open Supabase → SQL Editor  
 2. Run `migrations/001_admin_system.sql`  
-3. (Optional) Run `migrations/000_exec_sql_helper.sql` if you want auto-migrate via RPC later  
+3. Run `migrations/002_user_preferences.sql` (privacy / notification prefs)  
+4. (Optional) Run `migrations/000_exec_sql_helper.sql` if you want auto-migrate via RPC later  
 
 **Option B — DATABASE_URL**
 

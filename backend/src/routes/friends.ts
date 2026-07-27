@@ -109,13 +109,17 @@ friendsRouter.post("/request/:userId", async (c) => {
 
   if (error) return c.json({ error: { message: "Failed to send request" } }, 500);
 
-  await userClient.from("notifications").insert({
+  // Cross-user notification row — use service role (RLS targets recipient's user_id)
+  const { error: notifError } = await supabaseAdmin.from("notifications").insert({
     user_id: targetId,
     from_user_id: userId,
     type: "friend_request",
     message: `${user.full_name} sent you a friend request`,
     read: false,
   });
+  if (notifError) {
+    console.error("[notifications] friend_request insert error:", notifError.message);
+  }
 
   // Send push notification to target user
   try {
@@ -142,29 +146,36 @@ friendsRouter.post("/accept/:id", async (c) => {
   const { id } = c.req.param();
   const userClient = createUserClient(token);
 
-  const { data: friendship } = await userClient.from("friendships").select("*").eq("id", id).single();
+  const { data: friendship } = await userClient.from("friendships").select("*").eq("id", id).maybeSingle();
   if (!friendship || friendship.receiver_id !== userId) {
     return c.json({ error: { message: "Not found" } }, 404);
   }
+  if (friendship.status !== "pending") {
+    return c.json({ error: { message: "Friend request is not pending" } }, 400);
+  }
 
-  const { data: updated } = await userClient
+  const { data: updated, error: acceptError } = await userClient
     .from("friendships")
     .update({ status: "accepted" })
     .eq("id", id)
+    .eq("status", "pending")
     .select()
     .single();
 
-  // Notify the requester that their friend request was accepted
-  try {
-    await userClient.from("notifications").insert({
-      user_id: friendship.requester_id,
-      from_user_id: userId,
-      type: "friend_accepted",
-      message: `${user.full_name} accepted your friend request`,
-      read: false,
-    });
-  } catch (e) {
-    console.error("[notifications] friend_accepted insert error:", e);
+  if (acceptError || !updated) {
+    console.error("[friends] accept error:", acceptError?.message);
+    return c.json({ error: { message: "Failed to accept request" } }, 500);
+  }
+
+  const { error: notifError } = await supabaseAdmin.from("notifications").insert({
+    user_id: friendship.requester_id,
+    from_user_id: userId,
+    type: "friend_accepted",
+    message: `${user.full_name} accepted your friend request`,
+    read: false,
+  });
+  if (notifError) {
+    console.error("[notifications] friend_accepted insert error:", notifError.message);
   }
 
   try {
@@ -209,13 +220,14 @@ friendsRouter.get("/status/:userId", async (c) => {
     }
   }
 
+  // Target's full friend list requires service role (RLS only exposes caller's rows)
   const [currentUserFriendships, targetUserFriendships] = await Promise.all([
     userClient
       .from("friendships")
       .select("requester_id, receiver_id")
       .eq("status", "accepted")
       .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
-    userClient
+    supabaseAdmin
       .from("friendships")
       .select("requester_id, receiver_id")
       .eq("status", "accepted")
@@ -251,7 +263,11 @@ friendsRouter.delete("/:id", async (c) => {
     return c.json({ error: { message: "Unauthorized" } }, 403);
   }
 
-  await userClient.from("friendships").delete().eq("id", id);
+  const { error: deleteError } = await userClient.from("friendships").delete().eq("id", id);
+  if (deleteError) {
+    console.error("[friends] delete error:", deleteError.message);
+    return c.json({ error: { message: "Failed to remove friendship" } }, 500);
+  }
   return c.body(null, 204);
 });
 

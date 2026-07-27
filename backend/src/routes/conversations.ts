@@ -158,18 +158,36 @@ conversationsRouter.post("/unread-counts", async (c) => {
   const token = c.get("accessToken");
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
-  const { readTimestamps } = await c.req.json();
+  const body = await c.req.json().catch(() => ({}));
+  const readTimestamps = (body?.readTimestamps ?? {}) as Record<string, string>;
+  if (!readTimestamps || typeof readTimestamps !== "object") {
+    return c.json({ data: {} });
+  }
 
+  const convIds = Object.keys(readTimestamps);
+  if (convIds.length === 0) return c.json({ data: {} });
+
+  const { data: participations } = await supabaseAdmin
+    .from("conversation_participants")
+    .select("conversation_id")
+    .eq("user_id", userId)
+    .in("conversation_id", convIds);
+
+  const allowed = new Set((participations ?? []).map((p: any) => p.conversation_id));
   const result: Record<string, number> = {};
 
   await Promise.all(
-    Object.entries(readTimestamps as Record<string, string>).map(async ([convId, lastReadAt]) => {
+    Object.entries(readTimestamps).map(async ([convId, lastReadAt]) => {
+      if (!allowed.has(convId)) {
+        result[convId] = 0;
+        return;
+      }
       const { count } = await supabaseAdmin
         .from("messages")
         .select("*", { count: "exact", head: true })
         .eq("conversation_id", convId)
         .neq("sender_id", userId)
-        .gt("created_at", lastReadAt);
+        .gt("created_at", lastReadAt || "1970-01-01T00:00:00.000Z");
 
       result[convId] = count ?? 0;
     })
@@ -250,6 +268,19 @@ conversationsRouter.post("/start/:userId", async (c) => {
   const { userId: targetId } = c.req.param();
   console.log(`[conversations/start] userId=${userId} targetId=${targetId}`);
 
+  if (targetId === userId) {
+    return c.json({ error: { message: "Cannot start a conversation with yourself" } }, 400);
+  }
+
+  const { data: targetExists } = await supabaseAdmin
+    .from("profiles")
+    .select("id")
+    .eq("id", targetId)
+    .maybeSingle();
+  if (!targetExists) {
+    return c.json({ error: { message: "User not found" } }, 404);
+  }
+
   // Check for existing 1-on-1 conversation between these two users
   const { data: myParticipations } = await supabaseAdmin
     .from("conversation_participants")
@@ -314,6 +345,8 @@ conversationsRouter.post("/start/:userId", async (c) => {
 
   if (participantError) {
     console.error("[conversations/start] participant insert error:", participantError);
+    await supabaseAdmin.from("conversations").delete().eq("id", newConv.id);
+    return c.json({ error: { message: "Failed to create conversation" } }, 500);
   }
 
   const { data: targetProfile } = await supabaseAdmin.from("profiles").select("*").eq("id", targetId).single();
@@ -348,15 +381,20 @@ conversationsRouter.post("/:id/ping", async (c) => {
 
   if (!participation) return c.json({ error: { message: "Unauthorized" } }, 403);
 
-  const { data: message } = await supabaseAdmin
+  const { data: message, error } = await supabaseAdmin
     .from("messages")
     .insert({ conversation_id: id, sender_id: userId, content: "Ping!", type: "ping" })
     .select()
     .single();
 
+  if (error || !message) {
+    console.error("[conversations/ping] insert error:", error?.message);
+    return c.json({ error: { message: "Failed to send ping" } }, 500);
+  }
+
   await supabaseAdmin.from("conversations").update({ updated_at: new Date().toISOString() }).eq("id", id);
 
-  return c.json({ data: { id: message?.id, senderId: userId, text: "Ping!", type: "ping", createdAt: message?.created_at } }, 201);
+  return c.json({ data: { id: message.id, senderId: userId, text: "Ping!", type: "ping", createdAt: message.created_at } }, 201);
 });
 
 export { conversationsRouter };

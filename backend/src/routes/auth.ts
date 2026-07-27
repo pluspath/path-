@@ -4,8 +4,10 @@ import { z } from "zod";
 import { Resend } from "resend";
 import { supabase, supabaseAdmin } from "../supabase";
 import { env } from "../env";
+import { authLimiter } from "../lib/rate-limit";
 
 const authRouter = new Hono();
+authRouter.use("*", authLimiter);
 
 // In-memory OTP store: email → { otp, expiry, username, fullName, password }
 const otpStore = new Map<string, { otp: string; expiry: number; username: string; fullName: string; password: string }>();
@@ -82,16 +84,19 @@ authRouter.post(
     }
 
     // Upsert profile directly via supabaseAdmin (skip Prisma/SQLite entirely)
-    if (userId) {
-      const { error: profileError } = await supabaseAdmin
-        .from("profiles")
-        .upsert(
-          { id: userId, username: username.toLowerCase().trim(), full_name: fullName },
-          { onConflict: "id" }
-        );
-      if (profileError) {
-        console.error("[auth/signup] Failed to upsert profile:", profileError.message, profileError);
-      }
+    if (!userId) {
+      return c.json({ error: { message: "Account creation failed. Please try again." } }, 500);
+    }
+
+    const { error: profileError } = await supabaseAdmin
+      .from("profiles")
+      .upsert(
+        { id: userId, username: username.toLowerCase().trim(), full_name: fullName },
+        { onConflict: "id" }
+      );
+    if (profileError) {
+      console.error("[auth/signup] Failed to upsert profile:", profileError.message, profileError);
+      return c.json({ error: { message: "Failed to create profile. Please try again." } }, 500);
     }
 
     const otp = generateOTP();
@@ -173,16 +178,22 @@ authRouter.post(
     const key = email.toLowerCase();
     const existing = otpStore.get(key);
 
-    const fullName = existing?.fullName ?? "there";
-    const username = existing?.username ?? "";
-    const password = existing?.password ?? "";
+    if (!existing) {
+      return c.json({ error: { message: "No signup in progress for this email. Please sign up first." } }, 400);
+    }
 
     const otp = generateOTP();
     const expiry = Date.now() + 10 * 60 * 1000;
-    otpStore.set(key, { otp, expiry, username, fullName, password });
+    otpStore.set(key, {
+      otp,
+      expiry,
+      username: existing.username,
+      fullName: existing.fullName,
+      password: existing.password,
+    });
 
     try {
-      await sendOTPEmail(email, otp, fullName);
+      await sendOTPEmail(email, otp, existing.fullName);
     } catch (err: any) {
       console.error("[auth/resend-otp] Failed to send OTP email:", err.message);
       return c.json({ error: { message: "Failed to send verification email. Please try again." } }, 500);

@@ -13,24 +13,51 @@ import { uploadRouter } from "./routes/upload";
 import { authRouter } from "./routes/auth";
 import { adminRouter } from "./admin/routes";
 import { bootstrapAdminSystem } from "./admin/bootstrap";
+import { apiLimiter } from "./lib/rate-limit";
 import { env, supabaseProjectRef } from "./env";
 import type { HonoVariables } from "./types";
 
 const app = new Hono<{ Variables: HonoVariables }>();
 
-// Attempt to add push_token column to profiles (gracefully handles if already exists or if it fails)
+// Attempt to add profile columns + ensure core RLS policies (graceful if exec_sql missing)
 (async () => {
   try {
     const serviceKey = env.SUPABASE_SERVICE_ROLE_KEY;
     const supabaseUrl = env.SUPABASE_URL;
     if (serviceKey && supabaseUrl) {
-      await supabaseAdmin.rpc('exec_sql', { sql: 'ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS push_token TEXT;' });
-      await supabaseAdmin.rpc('exec_sql', { sql: 'ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS birthday TEXT;' });
-      await supabaseAdmin.rpc('exec_sql', { sql: 'ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS show_zodiac BOOLEAN DEFAULT FALSE;' });
-      await supabaseAdmin.rpc('exec_sql', { sql: 'ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS username_changed BOOLEAN DEFAULT FALSE;' });
+      const statements = [
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS push_token TEXT;",
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS birthday TEXT;",
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS show_zodiac BOOLEAN DEFAULT FALSE;",
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS username_changed BOOLEAN DEFAULT FALSE;",
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS post_visibility TEXT NOT NULL DEFAULT 'friends';",
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS push_notifications_enabled BOOLEAN NOT NULL DEFAULT TRUE;",
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS email_notifications_enabled BOOLEAN NOT NULL DEFAULT FALSE;",
+        "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS location_lat DOUBLE PRECISION;",
+        "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS location_lng DOUBLE PRECISION;",
+        // Critical posts RLS — fixes 42501 on POST /api/posts when policies were never applied
+        "ALTER TABLE public.posts ENABLE ROW LEVEL SECURITY;",
+        'DROP POLICY IF EXISTS "Anyone can view posts" ON public.posts;',
+        'DROP POLICY IF EXISTS "Users can create posts" ON public.posts;',
+        'DROP POLICY IF EXISTS "Users can update own posts" ON public.posts;',
+        'DROP POLICY IF EXISTS "Users can delete own posts" ON public.posts;',
+        'CREATE POLICY "Anyone can view posts" ON public.posts FOR SELECT USING (true);',
+        `CREATE POLICY "Users can create posts" ON public.posts FOR INSERT TO authenticated WITH CHECK (auth.uid() = user_id);`,
+        `CREATE POLICY "Users can update own posts" ON public.posts FOR UPDATE TO authenticated USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);`,
+        `CREATE POLICY "Users can delete own posts" ON public.posts FOR DELETE TO authenticated USING (auth.uid() = user_id);`,
+      ];
+      for (const sql of statements) {
+        const { error } = await supabaseAdmin.rpc("exec_sql", { sql });
+        if (error) {
+          console.warn(`[migration] exec_sql failed: ${error.message}`);
+        }
+      }
+      console.log("[migration] column + posts RLS bootstrap finished");
     }
   } catch {
-    console.log('[migration] column migrations may not have run - ensure birthday, show_zodiac, username_changed columns exist in profiles table.');
+    console.log(
+      "[migration] column/RLS migrations may not have run — run: bun run migrate:admin (see migrations/004_rls_policies.sql)."
+    );
   }
 })();
 
@@ -88,6 +115,7 @@ bootstrapAdminSystem().catch((err) => {
 });
 
 app.use("*", logger());
+app.use("/api/*", apiLimiter);
 
 app.use("*", async (c, next) => {
   c.set("user", null);
@@ -139,17 +167,15 @@ app.get("/health/supabase", async (c) => {
       return c.json({
         status: "error",
         project,
-        supabaseUrl: env.SUPABASE_URL,
         message: error.message,
       }, 503);
     }
 
-    return c.json({ status: "ok", project, supabaseUrl: env.SUPABASE_URL });
+    return c.json({ status: "ok", project });
   } catch (err) {
     return c.json({
       status: "error",
       project,
-      supabaseUrl: env.SUPABASE_URL,
       message: err instanceof Error ? err.message : "Connection failed",
     }, 503);
   }
