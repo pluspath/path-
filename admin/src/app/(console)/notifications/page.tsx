@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
@@ -103,14 +103,14 @@ export default function NotificationsPage() {
       cell: (n) => (
         <div className="max-w-lg">
           <p className="font-medium">{n.title || n.type || "Notification"}</p>
-          <p className="line-clamp-2 text-sm text-zinc-500">{n.message || n.body || "—"}</p>
+          <p className="line-clamp-2 text-sm text-slate-500">{n.message || n.body || "â€”"}</p>
         </div>
       ),
     },
     {
       key: "user",
       header: "User",
-      cell: (n) => <span className="text-xs text-zinc-500">{n.user_id?.slice(0, 8) || "broadcast"}</span>,
+      cell: (n) => <span className="text-xs text-slate-500">{n.user_id?.slice(0, 8) || "broadcast"}</span>,
     },
     {
       key: "read",
@@ -130,7 +130,7 @@ export default function NotificationsPage() {
 
   return (
     <div className="space-y-6 animate-fade-up">
-      <PageHeader title="Notifications" description="Broadcast and review recent notifications" />
+      <PageHeader eyebrow="Community" title="Notifications" description="Broadcast and review recent notifications" />
 
       {hasPermission("notifications:send") && (
         <Card>
@@ -158,7 +158,7 @@ export default function NotificationsPage() {
             <div className="space-y-1.5">
               <Label>Audience</Label>
               <select
-                className="flex h-10 w-full rounded-lg border border-zinc-200 bg-white px-3 text-sm dark:border-zinc-700 dark:bg-zinc-950"
+                className="atlas-select"
                 value={form.audience}
                 onChange={(e) =>
                   setForm((f) => ({
@@ -176,7 +176,7 @@ export default function NotificationsPage() {
               <div className="space-y-1.5">
                 <Label>Group</Label>
                 <select
-                  className="flex h-10 w-full rounded-lg border border-zinc-200 bg-white px-3 text-sm dark:border-zinc-700 dark:bg-zinc-950"
+                  className="atlas-select"
                   value={form.group}
                   onChange={(e) =>
                     setForm((f) => ({ ...f, group: e.target.value as "active" | "suspended" }))

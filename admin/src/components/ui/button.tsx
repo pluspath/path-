@@ -1,17 +1,19 @@
-import * as React from "react";
+﻿import * as React from "react";
 import { Slot } from "@radix-ui/react-slot";
 import { cva, type VariantProps } from "class-variance-authority";
 import { cn } from "@/lib/utils";
 
 const buttonVariants = cva(
-  "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-lg text-sm font-medium transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60 disabled:pointer-events-none disabled:opacity-50",
+  "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-lg text-sm font-medium transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gold/50 disabled:pointer-events-none disabled:opacity-50 active:scale-[0.98]",
   {
     variants: {
       variant: {
-        default: "bg-emerald-600 text-white hover:bg-emerald-500 shadow-sm",
-        secondary: "bg-zinc-100 text-zinc-900 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-100 dark:hover:bg-zinc-700",
-        outline: "border border-zinc-200 bg-transparent hover:bg-zinc-50 dark:border-zinc-700 dark:hover:bg-zinc-900",
-        ghost: "hover:bg-zinc-100 dark:hover:bg-zinc-800",
+        default: "bg-navy text-white shadow-sm hover:bg-navy-soft dark:bg-gold dark:text-navy-deep dark:hover:bg-gold-muted dark:hover:text-white",
+        secondary:
+          "bg-cream text-navy hover:bg-cream-dark dark:bg-[#132038] dark:text-cream dark:hover:bg-[#1A2740]",
+        outline:
+          "border border-[#E8E4DC] bg-white hover:bg-cream dark:border-[#1A2740] dark:bg-transparent dark:hover:bg-[#0C1830]",
+        ghost: "hover:bg-cream dark:hover:bg-[#132038]",
         destructive: "bg-rose-600 text-white hover:bg-rose-500",
       },
       size: {

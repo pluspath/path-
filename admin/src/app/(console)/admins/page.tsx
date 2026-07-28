@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
@@ -98,7 +98,7 @@ export default function AdminsPage() {
       cell: (a) => (
         <div>
           <p className="font-medium">{a.display_name || a.username}</p>
-          <p className="text-xs text-zinc-500">@{a.username}</p>
+          <p className="text-xs text-slate-500">@{a.username}</p>
         </div>
       ),
     },
@@ -108,7 +108,7 @@ export default function AdminsPage() {
       cell: (a) =>
         hasPermission("admins:write") ? (
           <select
-            className="h-8 rounded-md border border-zinc-200 bg-white px-2 text-sm dark:border-zinc-700 dark:bg-zinc-950"
+            className="atlas-select h-8"
             value={a.role}
             onChange={(e) => void patchAdmin(a.id, { role: e.target.value })}
           >
@@ -166,7 +166,7 @@ export default function AdminsPage() {
             </Button>
           </div>
         ) : (
-          "—"
+          "â€”"
         ),
     },
   ];
@@ -176,7 +176,7 @@ export default function AdminsPage() {
   return (
     <div className="space-y-6 animate-fade-up">
       <PageHeader
-        title="Admin Accounts"
+        eyebrow="Operations" title="Admin Accounts"
         description="Manage console operators and roles"
         actions={
           hasPermission("admins:write") ? (
@@ -213,7 +213,7 @@ export default function AdminsPage() {
               <div className="space-y-1.5">
                 <Label>Role</Label>
                 <select
-                  className="flex h-10 w-full rounded-lg border border-zinc-200 bg-white px-3 text-sm dark:border-zinc-700 dark:bg-zinc-950"
+                  className="atlas-select"
                   value={form.role}
                   onChange={(e) =>
                     setForm((f) => ({ ...f, role: e.target.value as (typeof ROLES)[number] }))

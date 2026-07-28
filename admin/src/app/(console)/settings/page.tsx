@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
@@ -88,7 +88,7 @@ export default function SettingsPage() {
   return (
     <div className="space-y-6 animate-fade-up">
       <PageHeader
-        title="Settings"
+        eyebrow="Operations" title="Settings"
         description="Application configuration and environment overview"
         actions={
           hasPermission("settings:write") ? (
@@ -143,7 +143,7 @@ export default function SettingsPage() {
               disabled={!hasPermission("settings:write")}
               value={general.social}
               onChange={(e) => setGeneral((g) => ({ ...g, social: e.target.value }))}
-              placeholder="instagram.com/…, x.com/…"
+              placeholder="instagram.com/â€¦, x.com/â€¦"
             />
           </div>
           <label className="flex items-center gap-2 text-sm md:col-span-2">
@@ -168,13 +168,13 @@ export default function SettingsPage() {
           <div className="grid gap-3 sm:grid-cols-2">
             {Object.entries(data.safeEnv || {}).map(([key, value]) => (
               <div key={key} className="rounded-xl border px-3 py-2">
-                <p className="text-xs uppercase tracking-wide text-zinc-500">{key}</p>
+                <p className="text-xs uppercase tracking-wide text-slate-500">{key}</p>
                 <p className="mt-1 break-all font-mono text-sm">{String(value)}</p>
               </div>
             ))}
           </div>
           {data.redactedSecrets?.length ? (
-            <p className="mt-4 text-xs text-zinc-500">
+            <p className="mt-4 text-xs text-slate-500">
               Redacted secrets: {data.redactedSecrets.join(", ")}
             </p>
           ) : null}

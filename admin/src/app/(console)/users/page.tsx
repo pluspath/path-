@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { Suspense, useCallback, useEffect, useState } from "react";
 import { useSearchParams } from "next/navigation";
@@ -111,15 +111,15 @@ function UsersPageInner() {
       header: "User",
       cell: (u) => (
         <div>
-          <p className="font-medium">{u.full_name || u.username || "—"}</p>
-          <p className="text-xs text-zinc-500">@{u.username}</p>
+          <p className="font-medium">{u.full_name || u.username || "â€”"}</p>
+          <p className="text-xs text-slate-500">@{u.username}</p>
         </div>
       ),
     },
     {
       key: "email",
       header: "Email",
-      cell: (u) => <span className="text-zinc-600 dark:text-zinc-300">{u.email || "—"}</span>,
+      cell: (u) => <span className="text-slate-600 dark:text-slate-300">{u.email || "â€”"}</span>,
     },
     {
       key: "status",
@@ -132,8 +132,8 @@ function UsersPageInner() {
       key: "stats",
       header: "Stats",
       cell: (u) => (
-        <span className="text-xs text-zinc-500">
-          {formatNumber(u.postCount ?? 0)} posts · {formatNumber(u.friendCount ?? 0)} friends
+        <span className="text-xs text-slate-500">
+          {formatNumber(u.postCount ?? 0)} posts آ· {formatNumber(u.friendCount ?? 0)} friends
         </span>
       ),
     },
@@ -158,7 +158,7 @@ function UsersPageInner() {
   return (
     <div className="space-y-6 animate-fade-up">
       <PageHeader
-        title="Users"
+        eyebrow="Community" title="Users"
         description="Search, moderate, and manage Path+ accounts"
         actions={
           hasPermission("users:read") ? (
@@ -187,7 +187,7 @@ function UsersPageInner() {
             <Label htmlFor="user-search">Search</Label>
             <Input
               id="user-search"
-              placeholder="Name, username, location…"
+              placeholder="Name, username, locationâ€¦"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               onKeyDown={(e) => {
@@ -199,7 +199,7 @@ function UsersPageInner() {
             <Label htmlFor="user-status">Status</Label>
             <select
               id="user-status"
-              className="flex h-10 w-full rounded-lg border border-zinc-200 bg-white px-3 text-sm dark:border-zinc-700 dark:bg-zinc-950"
+              className="atlas-select"
               value={status}
               onChange={(e) => {
                 setStatus(e.target.value);
@@ -240,7 +240,7 @@ function UsersPageInner() {
       {(selected || detailLoading) && (
         <div className="fixed inset-0 z-50 flex justify-end bg-black/40 p-0 sm:p-4" onClick={() => setSelected(null)}>
           <div
-            className="h-full w-full max-w-lg overflow-y-auto rounded-none border bg-white shadow-xl dark:bg-zinc-950 sm:rounded-2xl"
+            className="h-full w-full max-w-lg overflow-y-auto rounded-none border bg-white shadow-atlas-lg dark:bg-slate-900 sm:rounded-xl"
             onClick={(e) => e.stopPropagation()}
           >
             {detailLoading || !selected ? (
@@ -252,7 +252,7 @@ function UsersPageInner() {
                     <h2 className="text-xl font-semibold">
                       {selected.profile.full_name || selected.profile.username}
                     </h2>
-                    <p className="text-sm text-zinc-500">@{selected.profile.username}</p>
+                    <p className="text-sm text-slate-500">@{selected.profile.username}</p>
                   </div>
                   <Button variant="ghost" size="sm" onClick={() => setSelected(null)}>
                     Close
@@ -274,21 +274,21 @@ function UsersPageInner() {
                   </CardHeader>
                   <CardContent className="space-y-2 text-sm">
                     <p>
-                      <span className="text-zinc-500">Email:</span> {selected.email || "—"}
+                      <span className="text-slate-500">Email:</span> {selected.email || "â€”"}
                     </p>
                     <p>
-                      <span className="text-zinc-500">Location:</span> {selected.profile.location || "—"}
+                      <span className="text-slate-500">Location:</span> {selected.profile.location || "â€”"}
                     </p>
                     <p>
-                      <span className="text-zinc-500">Posts:</span> {formatNumber(selected.postCount)}
+                      <span className="text-slate-500">Posts:</span> {formatNumber(selected.postCount)}
                     </p>
                     <p>
-                      <span className="text-zinc-500">Friends:</span> {formatNumber(selected.friendCount)}
+                      <span className="text-slate-500">Friends:</span> {formatNumber(selected.friendCount)}
                     </p>
                     <p>
-                      <span className="text-zinc-500">Joined:</span> {formatDate(selected.profile.created_at)}
+                      <span className="text-slate-500">Joined:</span> {formatDate(selected.profile.created_at)}
                     </p>
-                    <p className="break-all text-xs text-zinc-400">ID: {selected.profile.id}</p>
+                    <p className="break-all text-xs text-slate-400">ID: {selected.profile.id}</p>
                   </CardContent>
                 </Card>
 
@@ -300,8 +300,8 @@ function UsersPageInner() {
                     <CardContent className="space-y-2">
                       {selected.recentPosts.map((p) => (
                         <div key={p.id} className="rounded-xl border px-3 py-2 text-sm">
-                          <p className="line-clamp-2">{p.content || p.type || "—"}</p>
-                          <p className="text-xs text-zinc-500">{formatDate(p.created_at)}</p>
+                          <p className="line-clamp-2">{p.content || p.type || "â€”"}</p>
+                          <p className="text-xs text-slate-500">{formatDate(p.created_at)}</p>
                         </div>
                       ))}
                     </CardContent>

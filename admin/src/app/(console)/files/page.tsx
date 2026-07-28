@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
@@ -109,13 +109,13 @@ export default function FilesPage() {
             // eslint-disable-next-line @next/next/no-img-element
             <img src={f.publicUrl} alt="" className="h-10 w-10 rounded-lg object-cover" />
           ) : (
-            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-zinc-100 text-xs dark:bg-zinc-800">
+            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-slate-100 text-xs dark:bg-slate-800">
               {f.isFolder ? "DIR" : "FILE"}
             </div>
           )}
           <div>
             <p className="font-medium">{f.name}</p>
-            <p className="text-xs text-zinc-500">{f.path}</p>
+            <p className="text-xs text-slate-500">{f.path}</p>
           </div>
         </div>
       ),
@@ -180,7 +180,7 @@ export default function FilesPage() {
 
   return (
     <div className="space-y-6 animate-fade-up">
-      <PageHeader title="Files" description="Browse and manage storage buckets" />
+      <PageHeader eyebrow="Content" title="Files" description="Browse and manage storage buckets" />
 
       <input
         ref={fileRef}
@@ -198,7 +198,7 @@ export default function FilesPage() {
           <div className="w-full space-y-1.5 md:w-48">
             <Label>Bucket</Label>
             <select
-              className="flex h-10 w-full rounded-lg border border-zinc-200 bg-white px-3 text-sm dark:border-zinc-700 dark:bg-zinc-950"
+              className="atlas-select"
               value={bucket}
               onChange={(e) => {
                 setBucket(e.target.value);
@@ -217,7 +217,7 @@ export default function FilesPage() {
             <Input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Filter by name…"
+              placeholder="Filter by nameâ€¦"
             />
           </div>
           <div className="flex gap-2">
@@ -238,7 +238,7 @@ export default function FilesPage() {
         </CardContent>
       </Card>
 
-      <p className="text-xs text-zinc-500">
+      <p className="text-xs text-slate-500">
         Path: /{path || ""}
       </p>
 

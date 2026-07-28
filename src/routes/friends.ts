@@ -72,14 +72,97 @@ friendsRouter.get("/", async (c) => {
     createdAt: f.created_at,
   }));
 
-  const excludeIds = [userId, ...friendIds, ...pendingRequesterIds, ...pendingSentIds];
-  const { data: suggested } = await userClient
-    .from("profiles")
-    .select("*")
-    .not("id", "in", `(${excludeIds.join(",")})`)
-    .limit(5);
+  const { data: blocks } = await userClient
+    .from("user_blocks")
+    .select("blocked_id")
+    .eq("blocker_id", userId);
+  const blockedIds = (blocks ?? []).map((b: any) => b.blocked_id);
 
-  return c.json({ data: { friends, requests, suggested: (suggested ?? []).map(formatProfile) } });
+  const excludeIds = [userId, ...friendIds, ...pendingRequesterIds, ...pendingSentIds, ...blockedIds];
+
+  // Prefer suggestions who share mutual friends
+  let suggestedProfiles: any[] = [];
+  if (friendIds.length > 0) {
+    const { data: friendOfFriends } = await supabaseAdmin
+      .from("friendships")
+      .select("requester_id, receiver_id")
+      .eq("status", "accepted")
+      .or(friendIds.map((id) => `requester_id.eq.${id},receiver_id.eq.${id}`).join(","))
+      .limit(200);
+
+    const mutualCount: Record<string, number> = {};
+    const excludeSet = new Set(excludeIds);
+    for (const f of friendOfFriends ?? []) {
+      for (const candidate of [f.requester_id, f.receiver_id]) {
+        if (excludeSet.has(candidate) || friendIds.includes(candidate)) continue;
+        mutualCount[candidate] = (mutualCount[candidate] ?? 0) + 1;
+      }
+    }
+    const ranked = Object.entries(mutualCount)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 8)
+      .map(([id, count]) => ({ id, count }));
+
+    if (ranked.length > 0) {
+      const { data: profiles } = await userClient
+        .from("profiles")
+        .select("*")
+        .in(
+          "id",
+          ranked.map((r) => r.id)
+        );
+      const countMap = Object.fromEntries(ranked.map((r) => [r.id, r.count]));
+      suggestedProfiles = (profiles ?? [])
+        .map((p: any) => ({ ...formatProfile(p), mutualFriends: countMap[p.id] ?? 0 }))
+        .sort((a: any, b: any) => (b.mutualFriends ?? 0) - (a.mutualFriends ?? 0));
+    }
+  }
+
+  if (suggestedProfiles.length < 5) {
+    const already = new Set([
+      ...excludeIds,
+      ...suggestedProfiles.map((p: any) => p.id),
+    ]);
+    const { data: fallback } = await userClient
+      .from("profiles")
+      .select("*")
+      .not("id", "in", `(${[...already].join(",")})`)
+      .limit(8);
+    for (const p of fallback ?? []) {
+      if (suggestedProfiles.length >= 8) break;
+      suggestedProfiles.push({ ...formatProfile(p), mutualFriends: 0 });
+    }
+  }
+
+  // Enrich friend requests with mutual friend counts
+  const requestsWithMutual = await Promise.all(
+    requests.map(async (req: any) => {
+      try {
+        const { data: theirFriends } = await supabaseAdmin
+          .from("friendships")
+          .select("requester_id, receiver_id")
+          .eq("status", "accepted")
+          .or(`requester_id.eq.${req.user.id},receiver_id.eq.${req.user.id}`);
+        const theirIds = new Set(
+          (theirFriends ?? []).map((f: any) =>
+            f.requester_id === req.user.id ? f.receiver_id : f.requester_id
+          )
+        );
+        const mutualFriends = friendIds.filter((id) => theirIds.has(id)).length;
+        return { ...req, mutualFriends };
+      } catch {
+        return req;
+      }
+    })
+  );
+
+  return c.json({
+    data: {
+      friends,
+      requests: requestsWithMutual,
+      suggested: suggestedProfiles.slice(0, 8),
+    },
+  });
 });
 
 friendsRouter.post("/request/:userId", async (c) => {

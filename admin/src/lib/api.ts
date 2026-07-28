@@ -1,7 +1,7 @@
-/**
+﻿/**
  * Browser API base.
  * - Prefer NEXT_PUBLIC_API_URL when admin + API are on different hosts.
- * - Default "" = same origin (Next.js rewrites /api/admin → backend).
+ * - Default "" = same origin (Next.js rewrites /api/admin â†’ backend).
  *   This avoids "Failed to fetch" when opening the dashboard via a public IP
  *   (browser localhost would point at the user's PC, not the VPS).
  */
@@ -13,6 +13,8 @@ function getApiBase(): string {
 
 export type ApiError = { message: string; details?: unknown };
 
+// XSS hygiene note: localStorage tokens are readable by any script on this origin.
+// Prefer httpOnly cookies when moving to a hardened session model.
 function getToken(): string | null {
   if (typeof window === "undefined") return null;
   return localStorage.getItem("admin_token");

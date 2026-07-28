@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
@@ -83,10 +83,10 @@ export default function CommentsPage() {
       header: "Comment",
       cell: (c) => (
         <div className="max-w-md">
-          <p className="line-clamp-3">{c.content || "—"}</p>
-          <p className="mt-1 text-xs text-zinc-500">
+          <p className="line-clamp-3">{c.content || "â€”"}</p>
+          <p className="mt-1 text-xs text-slate-500">
             {c.profiles?.username ? `@${c.profiles.username}` : c.user_id?.slice(0, 8)}
-            {c.admin_reply ? ` · reply: ${c.admin_reply}` : ""}
+            {c.admin_reply ? ` آ· reply: ${c.admin_reply}` : ""}
           </p>
         </div>
       ),
@@ -94,7 +94,7 @@ export default function CommentsPage() {
     {
       key: "status",
       header: "Status",
-      cell: (c) => <Badge variant={statusVariant(c.moderation_status)}>{c.moderation_status || "—"}</Badge>,
+      cell: (c) => <Badge variant={statusVariant(c.moderation_status)}>{c.moderation_status || "â€”"}</Badge>,
     },
     {
       key: "created",
@@ -164,7 +164,7 @@ export default function CommentsPage() {
 
   return (
     <div className="space-y-6 animate-fade-up">
-      <PageHeader title="Comments" description="Moderate user comments and replies" />
+      <PageHeader eyebrow="Community" title="Comments" description="Moderate user comments and replies" />
 
       <Card>
         <CardContent className="flex flex-col gap-3 pt-5 md:flex-row md:items-end">
@@ -173,14 +173,14 @@ export default function CommentsPage() {
             <Input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Comment text…"
+              placeholder="Comment textâ€¦"
               onKeyDown={(e) => e.key === "Enter" && setPage(1)}
             />
           </div>
           <div className="w-full space-y-1.5 md:w-48">
             <Label>Status</Label>
             <select
-              className="flex h-10 w-full rounded-lg border border-zinc-200 bg-white px-3 text-sm dark:border-zinc-700 dark:bg-zinc-950"
+              className="atlas-select"
               value={status}
               onChange={(e) => {
                 setStatus(e.target.value);

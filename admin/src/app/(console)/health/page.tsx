@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
@@ -69,7 +69,7 @@ export default function HealthPage() {
   return (
     <div className="space-y-6 animate-fade-up">
       <PageHeader
-        title="System Health"
+        eyebrow="Operations" title="System Health"
         description="Runtime, database, and admin table status"
         actions={
           <Button
@@ -121,16 +121,16 @@ export default function HealthPage() {
           </CardHeader>
           <CardContent className="space-y-2 text-sm">
             <p>
-              <span className="text-zinc-500">Bun:</span> {data.runtime.bun || "n/a"}
+              <span className="text-slate-500">Bun:</span> {data.runtime.bun || "n/a"}
             </p>
             <p>
-              <span className="text-zinc-500">NODE_ENV:</span> {data.runtime.nodeEnv}
+              <span className="text-slate-500">NODE_ENV:</span> {data.runtime.nodeEnv}
             </p>
             <p>
-              <span className="text-zinc-500">Port:</span> {data.runtime.port}
+              <span className="text-slate-500">Port:</span> {data.runtime.port}
             </p>
             <p className="break-all">
-              <span className="text-zinc-500">Backend URL:</span> {data.runtime.backendUrl}
+              <span className="text-slate-500">Backend URL:</span> {data.runtime.backendUrl}
             </p>
           </CardContent>
         </Card>
@@ -147,14 +147,14 @@ export default function HealthPage() {
           </CardHeader>
           <CardContent className="space-y-2 text-sm">
             <p>
-              <span className="text-zinc-500">Project:</span> {data.supabase.project || "—"}
+              <span className="text-slate-500">Project:</span> {data.supabase.project || "â€”"}
             </p>
             <p>
-              <span className="text-zinc-500">Profiles:</span>{" "}
-              {data.supabase.profileCount == null ? "—" : formatNumber(data.supabase.profileCount)}
+              <span className="text-slate-500">Profiles:</span>{" "}
+              {data.supabase.profileCount == null ? "â€”" : formatNumber(data.supabase.profileCount)}
             </p>
             <p>
-              <span className="text-zinc-500">Message:</span> {data.supabase.message}
+              <span className="text-slate-500">Message:</span> {data.supabase.message}
             </p>
           </CardContent>
         </Card>
@@ -169,7 +169,7 @@ export default function HealthPage() {
             </div>
             <CardDescription>admin_users and related schema</CardDescription>
           </CardHeader>
-          <CardContent className="text-sm text-zinc-500">
+          <CardContent className="text-sm text-slate-500">
             {data.adminTables.ok
               ? "Admin schema is reachable."
               : "Could not query admin tables. Run migrations if needed."}

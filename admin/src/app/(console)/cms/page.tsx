@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
@@ -89,7 +89,7 @@ export default function CmsPage() {
 
   return (
     <div className="space-y-6 animate-fade-up">
-      <PageHeader title="CMS" description="Edit published pages and legal content" />
+      <PageHeader eyebrow="Content" title="CMS" description="Edit published pages and legal content" />
 
       {loading ? (
         <LoadingState />
@@ -109,8 +109,8 @@ export default function CmsPage() {
                 </div>
               </CardHeader>
               <CardContent className="space-y-3">
-                <p className="line-clamp-3 text-sm text-zinc-500">{item.body || "No body yet."}</p>
-                <p className="text-xs text-zinc-400">Updated {formatDate(item.updated_at || item.created_at)}</p>
+                <p className="line-clamp-3 text-sm text-slate-500">{item.body || "No body yet."}</p>
+                <p className="text-xs text-slate-400">Updated {formatDate(item.updated_at || item.created_at)}</p>
                 {hasPermission("cms:write") && (
                   <Button size="sm" variant="outline" onClick={() => void openEdit(item.slug)}>
                     Edit
@@ -121,7 +121,7 @@ export default function CmsPage() {
           ))}
           {items.length === 0 && (
             <Card className="md:col-span-2 xl:col-span-3">
-              <CardContent className="py-10 text-center text-sm text-zinc-500">
+              <CardContent className="py-10 text-center text-sm text-slate-500">
                 No CMS content found.
               </CardContent>
             </Card>
@@ -133,7 +133,7 @@ export default function CmsPage() {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => setSelectedSlug(null)}>
           <Card className="max-h-[90vh] w-full max-w-2xl overflow-y-auto" onClick={(e) => e.stopPropagation()}>
             <CardHeader>
-              <CardTitle>Edit · {selectedSlug}</CardTitle>
+              <CardTitle>Edit آ· {selectedSlug}</CardTitle>
             </CardHeader>
             <CardContent className="space-y-3">
               <div className="space-y-1.5">
