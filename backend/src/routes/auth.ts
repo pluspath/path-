@@ -29,9 +29,16 @@ function escapeHtml(value: string): string {
     .replace(/'/g, "&#39;");
 }
 
-async function sendOTPEmail(email: string, otp: string, fullName: string): Promise<void> {
-  const resendKey = env.RESEND_API_KEY;
-  if (!resendKey) throw new Error("RESEND_API_KEY not configured");
+/** Returns true when email was sent via Resend; false when using local/dev fallback. */
+async function sendOTPEmail(email: string, otp: string, fullName: string): Promise<boolean> {
+  const resendKey = env.RESEND_API_KEY?.trim();
+  if (!resendKey) {
+    // Allow signup without Resend during local setup — OTP is returned to the client.
+    console.warn(
+      `[auth] RESEND_API_KEY not configured — using local OTP for ${email}: ${otp}`
+    );
+    return false;
+  }
 
   const safeName = escapeHtml(fullName);
   const resend = new Resend(resendKey);
@@ -52,6 +59,7 @@ async function sendOTPEmail(email: string, otp: string, fullName: string): Promi
   });
 
   if (error) throw new Error(error.message);
+  return true;
 }
 
 authRouter.post(
@@ -144,8 +152,9 @@ authRouter.post(
       attempts: 0,
     });
 
+    let emailed = true;
     try {
-      await sendOTPEmail(email, otp, fullName);
+      emailed = await sendOTPEmail(email, otp, fullName);
     } catch (err: any) {
       console.error("[auth/signup] Failed to send OTP email:", err.message);
       return c.json(
@@ -155,7 +164,14 @@ authRouter.post(
     }
 
     return c.json({
-      data: { success: true, message: "Verification code sent to your email." },
+      data: {
+        success: true,
+        message: emailed
+          ? "Verification code sent to your email."
+          : "Email service not configured. Use the code shown in the app.",
+        // Only returned when Resend is not configured (local setup).
+        ...(!emailed ? { devOtp: otp } : {}),
+      },
     });
   }
 );
@@ -284,8 +300,9 @@ authRouter.post(
       attempts: 0,
     });
 
+    let emailed = true;
     try {
-      await sendOTPEmail(email, otp, existing.fullName);
+      emailed = await sendOTPEmail(email, otp, existing.fullName);
     } catch (err: any) {
       console.error("[auth/resend-otp] Failed to send OTP email:", err.message);
       return c.json(
@@ -294,7 +311,15 @@ authRouter.post(
       );
     }
 
-    return c.json({ data: { success: true, message: "New verification code sent." } });
+    return c.json({
+      data: {
+        success: true,
+        message: emailed
+          ? "New verification code sent."
+          : "Email service not configured. Use the code shown in the app.",
+        ...(!emailed ? { devOtp: otp } : {}),
+      },
+    });
   }
 );
 

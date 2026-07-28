@@ -19,6 +19,7 @@ function applyEnvFileOverrides() {
     "ADMIN_JWT_SECRET",
     "ADMIN_JWT_EXPIRES_IN",
     "ADMIN_DEFAULT_PASSWORD",
+    "RESEND_API_KEY",
   ]);
 
   const text = readFileSync(envPath, "utf8");
