@@ -139,9 +139,11 @@ export const authService = {
 
   async requestPasswordReset(username: string) {
     const user = await adminUserRepository.findByUsername(username.trim());
-    // Always return success shape to avoid user enumeration
+    // Always return the same message — never return a usable reset token to the client
+    const publicMessage =
+      "If the account exists, a password reset was initiated. Contact a super admin for the out-of-band token.";
     if (!user) {
-      return { resetToken: null as string | null, message: "If the account exists, a reset token was issued." };
+      return { message: publicMessage };
     }
     const raw = randomBytes(32).toString("hex");
     const tokenHash = createHash("sha256").update(raw).digest("hex");
@@ -154,8 +156,17 @@ export const authService = {
       actor_id: user.id,
       actor_name: user.username,
     });
-    // Returned only for controlled admin ops (no email provider wired for admin).
-    return { resetToken: raw, message: "Reset token issued. Use it within 1 hour." };
+    // Dev-only: token appears in server logs for local ops — never in API responses
+    if (process.env.NODE_ENV !== "production") {
+      console.log(
+        `[admin] Password reset token for "${user.username}" (dev only, expires 1h): ${raw}`
+      );
+    } else {
+      console.log(
+        `[admin] Password reset token issued for "${user.username}" (deliver out-of-band; not returned in API)`
+      );
+    }
+    return { message: publicMessage };
   },
 
   async confirmPasswordReset(token: string, newPassword: string) {

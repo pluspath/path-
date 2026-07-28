@@ -2,10 +2,24 @@ import { Hono } from "hono";
 import { createUserClient, supabaseAdmin } from "../supabase";
 import { formatPost } from "./users";
 import { sendPushNotification, getPushToken } from "../lib/push";
-import { enrichPostContent } from "../lib/enrich-post";
 import type { HonoVariables } from "../types";
 
 const postsRouter = new Hono<{ Variables: HonoVariables }>();
+
+/** Only allow https media URLs (uploaded assets / known CDNs) — blocks javascript: and HTML injection payloads. */
+function isSafeMediaUrl(value: unknown): value is string {
+  if (value == null || value === "") return true;
+  if (typeof value !== "string" || value.length > 2048) return false;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:") return false;
+    // Reject URLs that embed quote/script breakouts commonly used in HTML injection
+    if (/[<>"']/.test(value)) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 postsRouter.get("/", async (c) => {
   const user = c.get("user");
@@ -14,7 +28,7 @@ postsRouter.get("/", async (c) => {
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const userClient = createUserClient(token);
-  const [{ data: posts }, { data: friendships }, { data: blocks }] = await Promise.all([
+  const [{ data: posts }, { data: friendships }] = await Promise.all([
     userClient
       .from("posts")
       .select("*, profiles(*), reactions(user_id, type, profiles:user_id(avatar_url))")
@@ -25,17 +39,14 @@ postsRouter.get("/", async (c) => {
       .select("requester_id, receiver_id")
       .eq("status", "accepted")
       .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
-    userClient.from("user_blocks").select("blocked_id").eq("blocker_id", userId),
   ]);
 
   const friendIds = new Set<string>();
   for (const f of friendships ?? []) {
     friendIds.add(f.requester_id === userId ? f.receiver_id : f.requester_id);
   }
-  const blockedIds = new Set((blocks ?? []).map((b: any) => b.blocked_id));
 
   const visible = (posts ?? []).filter((p: any) => {
-    if (blockedIds.has(p.user_id)) return false;
     if (p.user_id === userId) return true;
     const visibility = p.profiles?.post_visibility === "everyone" ? "everyone" : "friends";
     if (visibility === "everyone") return true;
@@ -72,12 +83,8 @@ postsRouter.post("/", async (c) => {
   if (!body?.type || typeof body.type !== "string") {
     return c.json({ error: { message: "Post type is required" } }, 400);
   }
-  const allowedTypes = ["thought", "location", "sleep", "wakeup"];
-  if (!allowedTypes.includes(body.type)) {
-    return c.json({ error: { message: "Invalid post type" } }, 400);
-  }
-  if (body.content != null && typeof body.content === "string" && body.content.length > 5000) {
-    return c.json({ error: { message: "Content too long (max 5000 characters)" } }, 400);
+  if (!isSafeMediaUrl(body.image)) {
+    return c.json({ error: { message: "Invalid media URL" } }, 400);
   }
 
   const userClient = createUserClient(token);
@@ -112,20 +119,11 @@ postsRouter.post("/", async (c) => {
     return c.json({
       error: {
         message: isRls
-          ? "Post create blocked by database security policy. Ensure RLS policies are applied (migrations/004_rls_policies.sql)."
-          : (error.message || "Failed to create post"),
-        code: error.code,
+          ? "Post create blocked by database security policy. Please try again later."
+          : "Failed to create post",
       },
     }, 500);
   }
-
-  // Index hashtags + notify @mentions (non-blocking for client response path)
-  await enrichPostContent({
-    postId: post.id,
-    authorId: userId,
-    authorName: user.full_name ?? "Someone",
-    content: body.content,
-  });
 
   // Mobile sends "sleeping"; older clients may send "sleep"
   const isGoingToSleep = body.sleepAction === "sleep" || body.sleepAction === "sleeping";
@@ -172,6 +170,9 @@ postsRouter.patch("/:id", async (c) => {
   if (existingPost.user_id !== userId) return c.json({ error: { message: "Forbidden" } }, 403);
 
   const body = await c.req.json();
+  if ("image" in body && !isSafeMediaUrl(body.image)) {
+    return c.json({ error: { message: "Invalid media URL" } }, 400);
+  }
   const updateData: Record<string, unknown> = {};
   if ("content" in body) updateData.content = body.content || null;
   if ("image" in body) updateData.image_url = body.image || null;

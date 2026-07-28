@@ -1,14 +1,14 @@
 import { rateLimiter } from "hono-rate-limiter";
 
-function clientKey(c: { req: { header: (name: string) => string | undefined } }) {
+function clientKey(c: { req: { header: (name: string) => string | undefined } }): string {
   return (
     c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ||
     c.req.header("x-real-ip") ||
-    "anon"
+    "unknown"
   );
 }
 
-/** General API traffic */
+/** General API limit — applied to all /api/* routes. */
 export const apiLimiter = rateLimiter({
   windowMs: 60 * 1000,
   limit: 120,
@@ -16,26 +16,19 @@ export const apiLimiter = rateLimiter({
   keyGenerator: clientKey,
 });
 
-/** Auth / OTP / signup */
+/** Stricter limit for auth endpoints (signup, OTP, resend). */
 export const authLimiter = rateLimiter({
   windowMs: 15 * 60 * 1000,
-  limit: 30,
-  standardHeaders: "draft-6",
-  keyGenerator: clientKey,
-});
-
-/** Google Places proxy */
-export const placesLimiter = rateLimiter({
-  windowMs: 60 * 1000,
   limit: 20,
   standardHeaders: "draft-6",
   keyGenerator: clientKey,
 });
 
-/** Media uploads */
+/** Upload endpoints — prevent storage abuse. */
 export const uploadLimiter = rateLimiter({
   windowMs: 60 * 1000,
   limit: 30,
   standardHeaders: "draft-6",
-  keyGenerator: clientKey,
+  keyGenerator: (c) =>
+    c.req.header("authorization")?.slice(0, 48) || clientKey(c),
 });

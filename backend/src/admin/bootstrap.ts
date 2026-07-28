@@ -40,10 +40,16 @@ export async function bootstrapAdminSystem(): Promise<void> {
   try {
     const existing = await adminUserRepository.findByUsername("admin");
     if (!existing) {
-      const password = process.env.ADMIN_DEFAULT_PASSWORD || "Admin@PathPlus2026!";
-      const password_hash = await hashPassword(password);
-      await adminUserRepository.ensureDefaultAdmin(password_hash);
-      console.log("[admin] Default super_admin seeded (username: admin)");
+      const password = process.env.ADMIN_DEFAULT_PASSWORD;
+      if (!password || password.length < 12) {
+        console.warn(
+          "[admin] ADMIN_DEFAULT_PASSWORD not set (min 12 chars) — skipping default admin seed"
+        );
+      } else {
+        const password_hash = await hashPassword(password);
+        await adminUserRepository.ensureDefaultAdmin(password_hash);
+        console.log("[admin] Default super_admin seeded (username: admin)");
+      }
     } else {
       console.log("[admin] Default admin account present");
     }

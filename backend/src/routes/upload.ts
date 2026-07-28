@@ -87,14 +87,14 @@ async function handleUpload(
 
     if (uploadError) {
       console.error(`[upload] Supabase error for bucket "${bucket}":`, uploadError.message);
-      return c.json({ error: { message: uploadError.message } }, 500);
+      return c.json({ error: { message: "Upload failed" } }, 500);
     }
 
     const { data: urlData } = supabaseAdmin.storage.from(bucket).getPublicUrl(fileName);
     return c.json({ data: { url: urlData.publicUrl } });
   } catch (err: any) {
     console.error(`[upload] Unexpected error:`, err?.message ?? err);
-    return c.json({ error: { message: err?.message ?? "Upload failed" } }, 500);
+    return c.json({ error: { message: "Upload failed" } }, 500);
   }
 }
 

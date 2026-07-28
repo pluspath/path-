@@ -2,23 +2,17 @@ import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
 import { z } from "zod";
 import { env } from "../env";
-import { placesLimiter } from "../lib/rate-limit";
 import type { HonoVariables } from "../types";
 
 const placesRouter = new Hono<{ Variables: HonoVariables }>();
 
-placesRouter.use("*", placesLimiter);
-
 placesRouter.post(
   "/nearby",
-  zValidator(
-    "json",
-    z.object({
-      latitude: z.number().min(-90).max(90),
-      longitude: z.number().min(-180).max(180),
-      radius: z.number().min(50).max(2000).optional().default(500),
-    })
-  ),
+  zValidator("json", z.object({
+    latitude: z.number().min(-90).max(90),
+    longitude: z.number().min(-180).max(180),
+    radius: z.number().min(1).max(50000).optional().default(500),
+  })),
   async (c) => {
     const userId = c.get("userId");
     if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
@@ -46,12 +40,11 @@ placesRouter.post(
     });
 
     if (!response.ok) {
-      const errText = await response.text();
-      console.error("[places] Google API error:", errText.slice(0, 300));
-      return c.json({ error: { message: "Places lookup failed" } }, 502);
+      console.error("[places] Google Places API error:", response.status);
+      return c.json({ error: { message: "Places lookup failed. Please try again." } }, 502);
     }
 
-    const data = (await response.json()) as { places?: any[] };
+    const data = await response.json() as { places?: any[] };
     const places = (data.places ?? []).map((p: any) => ({
       name: p.displayName?.text ?? "Unknown Place",
       address: p.formattedAddress ?? "",

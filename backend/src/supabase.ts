@@ -40,10 +40,17 @@ const clientOptions = {
 export const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_ANON_KEY, clientOptions);
 
 // Admin client using service role key — bypasses RLS for trusted server operations
-const serviceKey = env.SUPABASE_SERVICE_ROLE_KEY || env.SUPABASE_ANON_KEY;
 if (!env.SUPABASE_SERVICE_ROLE_KEY) {
-  console.warn("[supabase] SUPABASE_SERVICE_ROLE_KEY not set — storage uploads may fail. Add it via the ENV tab.");
+  if (process.env.NODE_ENV === "production") {
+    throw new Error(
+      "[supabase] SUPABASE_SERVICE_ROLE_KEY is required in production — refusing to fall back to anon key"
+    );
+  }
+  console.warn(
+    "[supabase] SUPABASE_SERVICE_ROLE_KEY not set — falling back to anon key (dev only). Storage/admin may fail."
+  );
 }
+const serviceKey = env.SUPABASE_SERVICE_ROLE_KEY || env.SUPABASE_ANON_KEY;
 export const supabaseAdmin = createClient(env.SUPABASE_URL, serviceKey, clientOptions);
 
 /**
