@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { supabase, createUserClient } from "../supabase";
-import type { HonoVariables, Profile } from "../types";
+import { sanitizeSearchQuery } from "../lib/auth-helpers";
+import type { HonoVariables } from "../types";
 
 const usersRouter = new Hono<{ Variables: HonoVariables }>();
 
@@ -48,7 +49,11 @@ export function formatPost(p: any) {
     mealName: p.meal_name ?? undefined,
     sleepAction: p.sleep_action ?? undefined,
     sleepDuration: p.sleep_duration ?? undefined,
-    reactions: (p.reactions ?? []).map((r: any) => ({ userId: r.user_id, type: r.type, userAvatar: r.profiles?.avatar_url ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${r.user_id}` })),
+    reactions: (p.reactions ?? []).map((r: any) => ({
+      userId: r.user_id,
+      type: r.type,
+      userAvatar: r.profiles?.avatar_url ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${r.user_id}`,
+    })),
     commentCount: p.comment_count ?? 0,
     createdAt: p.created_at,
   };
@@ -61,18 +66,20 @@ usersRouter.get("/search", async (c) => {
   const token = c.get("accessToken");
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
-  const q = c.req.query("q") ?? "";
-  const sanitized = q.replace(/[%_,.()]/g, " ").trim();
+  const sanitized = sanitizeSearchQuery(c.req.query("q") ?? "");
   if (sanitized.length < 2) return c.json({ data: [] });
 
   const userClient = createUserClient(token);
 
-  // Fetch all friendships involving the current user
-  const { data: myFriendships } = await userClient
-    .from("friendships")
-    .select("id, requester_id, receiver_id, status")
-    .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`);
+  const [{ data: myFriendships }, { data: blocks }] = await Promise.all([
+    userClient
+      .from("friendships")
+      .select("id, requester_id, receiver_id, status")
+      .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
+    userClient.from("user_blocks").select("blocked_id").eq("blocker_id", userId),
+  ]);
 
+  const blockedIds = new Set((blocks ?? []).map((b: any) => b.blocked_id));
   const friendshipByUser: Record<string, { id: string; status: string; isSender: boolean }> = {};
   for (const f of myFriendships ?? []) {
     const otherId = f.requester_id === userId ? f.receiver_id : f.requester_id;
@@ -82,24 +89,26 @@ usersRouter.get("/search", async (c) => {
   const { data: profilesSafe } = await userClient
     .from("profiles")
     .select("*")
-    .or(`full_name.ilike.%${sanitized}%,username.ilike.%${sanitized}%`)
+    .or(`full_name.ilike.%${sanitized}%,username.ilike.%${sanitized}%,bio.ilike.%${sanitized}%`)
     .neq("id", userId)
     .limit(20);
 
-  const results = (profilesSafe ?? []).map((p: any) => {
-    const fs = friendshipByUser[p.id];
-    let friendshipStatus: 'none' | 'pending_sent' | 'pending_received' | 'friends' = 'none';
-    let friendshipId: string | undefined;
-    if (fs) {
-      friendshipId = fs.id;
-      if (fs.status === 'accepted') {
-        friendshipStatus = 'friends';
-      } else if (fs.status === 'pending') {
-        friendshipStatus = fs.isSender ? 'pending_sent' : 'pending_received';
+  const results = (profilesSafe ?? [])
+    .filter((p: any) => !blockedIds.has(p.id))
+    .map((p: any) => {
+      const fs = friendshipByUser[p.id];
+      let friendshipStatus: "none" | "pending_sent" | "pending_received" | "friends" = "none";
+      let friendshipId: string | undefined;
+      if (fs) {
+        friendshipId = fs.id;
+        if (fs.status === "accepted") {
+          friendshipStatus = "friends";
+        } else if (fs.status === "pending") {
+          friendshipStatus = fs.isSender ? "pending_sent" : "pending_received";
+        }
       }
-    }
-    return { ...formatProfile(p), friendshipStatus, friendshipId };
-  });
+      return { ...formatProfile(p), friendshipStatus, friendshipId };
+    });
 
   return c.json({ data: results });
 });
@@ -125,7 +134,7 @@ usersRouter.post("/setup-profile", async (c) => {
   if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const body = await c.req.json();
-  const { username, name, email } = body as { username: string; name: string; email: string };
+  const { username, name } = body as { username: string; name: string; email: string };
 
   if (!username || !name) {
     return c.json({ error: { message: "username and name are required" } }, 400);
@@ -178,7 +187,11 @@ usersRouter.get("/me", async (c) => {
 
   const [postsResult, friendsResult] = await Promise.all([
     userClient.from("posts").select("id", { count: "exact", head: true }).eq("user_id", userId),
-    userClient.from("friendships").select("id", { count: "exact", head: true }).eq("status", "accepted").or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
+    userClient
+      .from("friendships")
+      .select("id", { count: "exact", head: true })
+      .eq("status", "accepted")
+      .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
   ]);
 
   return c.json({ data: formatProfile(user, postsResult.count ?? 0, friendsResult.count ?? 0) });
@@ -242,7 +255,11 @@ usersRouter.put("/me", async (c) => {
 
   const [postsResult, friendsResult] = await Promise.all([
     userClient.from("posts").select("id", { count: "exact", head: true }).eq("user_id", userId),
-    userClient.from("friendships").select("id", { count: "exact", head: true }).eq("status", "accepted").or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
+    userClient
+      .from("friendships")
+      .select("id", { count: "exact", head: true })
+      .eq("status", "accepted")
+      .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
   ]);
 
   return c.json({ data: formatProfile(updated, postsResult.count ?? 0, friendsResult.count ?? 0) });
@@ -251,17 +268,32 @@ usersRouter.put("/me", async (c) => {
 // GET /api/:id
 usersRouter.get("/:id", async (c) => {
   const user = c.get("user");
+  const userId = c.get("userId");
   const token = c.get("accessToken");
-  if (!user || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+  if (!user || !token || !userId) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const { id } = c.req.param();
   const userClient = createUserClient(token);
+
+  // Hide blocked users
+  const { data: blocked } = await userClient
+    .from("user_blocks")
+    .select("id")
+    .eq("blocker_id", userId)
+    .eq("blocked_id", id)
+    .maybeSingle();
+  if (blocked) return c.json({ error: { message: "User not found" } }, 404);
+
   const { data: targetProfile } = await userClient.from("profiles").select("*").eq("id", id).single();
   if (!targetProfile) return c.json({ error: { message: "User not found" } }, 404);
 
   const [postsResult, friendsResult] = await Promise.all([
     userClient.from("posts").select("id", { count: "exact", head: true }).eq("user_id", id),
-    userClient.from("friendships").select("id", { count: "exact", head: true }).eq("status", "accepted").or(`requester_id.eq.${id},receiver_id.eq.${id}`),
+    userClient
+      .from("friendships")
+      .select("id", { count: "exact", head: true })
+      .eq("status", "accepted")
+      .or(`requester_id.eq.${id},receiver_id.eq.${id}`),
   ]);
 
   return c.json({ data: formatProfile(targetProfile, postsResult.count ?? 0, friendsResult.count ?? 0) });

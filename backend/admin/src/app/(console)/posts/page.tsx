@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
@@ -140,8 +140,8 @@ export default function PostsPage() {
       cell: (p) => (
         <div className="max-w-md">
           <p className="line-clamp-2 font-medium">{p.content || "(no content)"}</p>
-          <p className="text-xs text-zinc-500">
-            {p.profiles?.username ? `@${p.profiles.username}` : p.user_id?.slice(0, 8)} · {p.type}
+          <p className="text-xs text-slate-500">
+            {p.profiles?.username ? `@${p.profiles.username}` : p.user_id?.slice(0, 8)} آ· {p.type}
           </p>
         </div>
       ),
@@ -161,7 +161,7 @@ export default function PostsPage() {
     {
       key: "location",
       header: "Location",
-      cell: (p) => p.location || "—",
+      cell: (p) => p.location || "â€”",
     },
     {
       key: "created",
@@ -226,7 +226,7 @@ export default function PostsPage() {
   return (
     <div className="space-y-6 animate-fade-up">
       <PageHeader
-        title="Posts"
+        eyebrow="Community" title="Posts"
         description="Moderate moments and content across Path+"
         actions={
           hasPermission("posts:write") ? (
@@ -242,7 +242,7 @@ export default function PostsPage() {
             <Input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Content, location…"
+              placeholder="Content, locationâ€¦"
               onKeyDown={(e) => e.key === "Enter" && setPage(1)}
             />
           </div>
@@ -253,7 +253,7 @@ export default function PostsPage() {
           <div className="space-y-1.5">
             <Label>Hidden</Label>
             <select
-              className="flex h-10 w-full rounded-lg border border-zinc-200 bg-white px-3 text-sm dark:border-zinc-700 dark:bg-zinc-950"
+              className="atlas-select"
               value={hidden}
               onChange={(e) => {
                 setHidden(e.target.value);
@@ -268,7 +268,7 @@ export default function PostsPage() {
           <div className="space-y-1.5">
             <Label>Published</Label>
             <select
-              className="flex h-10 w-full rounded-lg border border-zinc-200 bg-white px-3 text-sm dark:border-zinc-700 dark:bg-zinc-950"
+              className="atlas-select"
               value={published}
               onChange={(e) => {
                 setPublished(e.target.value);

@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
@@ -113,10 +113,10 @@ export default function ReportsPage() {
       cell: (r) => (
         <div className="max-w-md">
           <p className="font-medium">
-            {r.target_type} · {r.target_id}
+            {r.target_type} آ· {r.target_id}
           </p>
-          <p className="line-clamp-2 text-sm text-zinc-500">{r.reason}</p>
-          {r.details ? <p className="mt-1 line-clamp-2 text-xs text-zinc-400">{r.details}</p> : null}
+          <p className="line-clamp-2 text-sm text-slate-500">{r.reason}</p>
+          {r.details ? <p className="mt-1 line-clamp-2 text-xs text-slate-400">{r.details}</p> : null}
         </div>
       ),
     },
@@ -167,7 +167,7 @@ export default function ReportsPage() {
             </div>
           </div>
         ) : (
-          "—"
+          "â€”"
         ),
     },
   ];
@@ -177,7 +177,7 @@ export default function ReportsPage() {
   return (
     <div className="space-y-6 animate-fade-up">
       <PageHeader
-        title="Reports"
+        eyebrow="Community" title="Reports"
         description="Triage abuse reports and moderation queues"
         actions={
           hasPermission("reports:write") ? (
@@ -193,14 +193,14 @@ export default function ReportsPage() {
             <Input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Reason, target…"
+              placeholder="Reason, targetâ€¦"
               onKeyDown={(e) => e.key === "Enter" && setPage(1)}
             />
           </div>
           <div className="w-full space-y-1.5 md:w-48">
             <Label>Status</Label>
             <select
-              className="flex h-10 w-full rounded-lg border border-zinc-200 bg-white px-3 text-sm dark:border-zinc-700 dark:bg-zinc-950"
+              className="atlas-select"
               value={status}
               onChange={(e) => {
                 setStatus(e.target.value);
@@ -249,7 +249,7 @@ export default function ReportsPage() {
               <div className="space-y-1.5">
                 <Label>Target type</Label>
                 <select
-                  className="flex h-10 w-full rounded-lg border border-zinc-200 bg-white px-3 text-sm dark:border-zinc-700 dark:bg-zinc-950"
+                  className="atlas-select"
                   value={createForm.target_type}
                   onChange={(e) =>
                     setCreateForm((f) => ({

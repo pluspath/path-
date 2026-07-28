@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
@@ -72,7 +72,7 @@ export default function FriendshipsPage() {
   }
 
   const name = (u?: { username?: string; full_name?: string | null } | null, id?: string) =>
-    u?.full_name || (u?.username ? `@${u.username}` : id?.slice(0, 8) || "—");
+    u?.full_name || (u?.username ? `@${u.username}` : id?.slice(0, 8) || "â€”");
 
   const columns: Column<Friendship>[] = [
     {
@@ -81,16 +81,16 @@ export default function FriendshipsPage() {
       cell: (f) => (
         <div>
           <p className="font-medium">
-            {name(f.requester, f.requester_id)} → {name(f.receiver, f.receiver_id)}
+            {name(f.requester, f.requester_id)} â†’ {name(f.receiver, f.receiver_id)}
           </p>
-          <p className="text-xs text-zinc-500">{f.id}</p>
+          <p className="text-xs text-slate-500">{f.id}</p>
         </div>
       ),
     },
     {
       key: "status",
       header: "Status",
-      cell: (f) => <Badge variant={statusVariant(f.status)}>{f.status || "—"}</Badge>,
+      cell: (f) => <Badge variant={statusVariant(f.status)}>{f.status || "â€”"}</Badge>,
     },
     {
       key: "created",
@@ -123,7 +123,7 @@ export default function FriendshipsPage() {
             </Button>
           </div>
         ) : (
-          "—"
+          "â€”"
         ),
     },
   ];
@@ -133,7 +133,7 @@ export default function FriendshipsPage() {
   return (
     <div className="space-y-6 animate-fade-up">
       <PageHeader
-        title="Friendships"
+        eyebrow="Community" title="Friendships"
         description="Review and manage friend connections"
         actions={
           hasPermission("friendships:read") ? (
@@ -159,14 +159,14 @@ export default function FriendshipsPage() {
             <Input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Username or ID…"
+              placeholder="Username or IDâ€¦"
               onKeyDown={(e) => e.key === "Enter" && setPage(1)}
             />
           </div>
           <div className="w-full space-y-1.5 md:w-48">
             <Label>Status</Label>
             <select
-              className="flex h-10 w-full rounded-lg border border-zinc-200 bg-white px-3 text-sm dark:border-zinc-700 dark:bg-zinc-950"
+              className="atlas-select"
               value={status}
               onChange={(e) => {
                 setStatus(e.target.value);

@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { useEffect, useMemo, useState } from "react";
 import { api } from "@/lib/api";
@@ -30,14 +30,14 @@ export default function RolesPage() {
   return (
     <div className="space-y-6 animate-fade-up">
       <PageHeader
-        title="Roles & Permissions"
+        eyebrow="Operations" title="Roles & Permissions"
         description="Permission matrix for super_admin, admin, and moderator"
       />
 
       <Card>
         <CardContent className="overflow-x-auto pt-5">
           <table className="min-w-full text-left text-sm">
-            <thead className="bg-zinc-50/80 text-xs uppercase tracking-wide text-zinc-500 dark:bg-zinc-900/60">
+            <thead className="bg-slate-50/90 text-[11px] uppercase tracking-[0.08em] text-slate-500 dark:bg-slate-950/60 dark:text-slate-400">
               <tr>
                 <th className="px-4 py-3 font-medium">Permission</th>
                 {ROLES.map((role) => (
@@ -47,18 +47,18 @@ export default function RolesPage() {
                 ))}
               </tr>
             </thead>
-            <tbody className="divide-y divide-zinc-100 dark:divide-zinc-800">
+            <tbody className="divide-y divide-slate-100 dark:divide-slate-800/80">
               {permissions.map((perm) => {
                 const allowed = new Set(matrix[perm] || []);
                 return (
-                  <tr key={perm} className="hover:bg-emerald-50/40 dark:hover:bg-emerald-950/20">
+                  <tr key={perm} className="hover:bg-blue-50/50 dark:hover:bg-blue-950/20">
                     <td className="px-4 py-3 font-mono text-xs">{perm}</td>
                     {ROLES.map((role) => (
                       <td key={role} className="px-4 py-3">
                         {allowed.has(role) ? (
                           <Badge variant="success">allowed</Badge>
                         ) : (
-                          <Badge variant="muted">—</Badge>
+                          <Badge variant="muted">â€”</Badge>
                         )}
                       </td>
                     ))}

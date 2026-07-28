@@ -1,15 +1,41 @@
-@tailwind base;
+﻿@tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 :root {
-  --background: 250 250 250;
-  --foreground: 24 24 27;
+  --atlas-paper: #f8f6f2;
+  --atlas-ink: #0a1f44;
+  --atlas-muted: #8b8b8b;
+  --atlas-border: #e8e4dc;
+  --atlas-panel: #ffffff;
+  --atlas-accent: #0a1f44;
+  --atlas-accent-soft: #f0ebe3;
+  --atlas-gold: #c9a84c;
+  --atlas-gold-soft: #f7f0e0;
+  --atlas-success: #059669;
+  --atlas-warning: #d97706;
+  --atlas-danger: #e11d48;
+  --background: 248 246 242;
+  --foreground: 10 31 68;
+  --ring: 201 168 76;
 }
 
 .dark {
-  --background: 9 9 11;
-  --foreground: 250 250 250;
+  --atlas-paper: #060f22;
+  --atlas-ink: #f8f6f2;
+  --atlas-muted: #8b8b8b;
+  --atlas-border: #1a2740;
+  --atlas-panel: #0c1830;
+  --atlas-accent: #c9a84c;
+  --atlas-accent-soft: #132038;
+  --atlas-gold: #c9a84c;
+  --atlas-gold-soft: #1a2a14;
+  --atlas-success: #34d399;
+  --atlas-warning: #fbbf24;
+  --atlas-danger: #fb7185;
+  --background: 6 15 34;
+  --foreground: 248 246 242;
+  --ring: 201 168 76;
 }
 
 html,
@@ -18,23 +44,48 @@ body {
 }
 
 body {
-  color: rgb(var(--foreground));
-  background: rgb(var(--background));
-  font-feature-settings: "rlig" 1, "calt" 1;
+  color: var(--atlas-ink);
+  background: var(--atlas-paper);
+  font-feature-settings: "ss01" 1, "cv11" 1;
+  letter-spacing: -0.011em;
 }
 
 * {
-  border-color: rgb(228 228 231 / 0.8);
+  border-color: var(--atlas-border);
 }
 
-.dark * {
-  border-color: rgb(39 39 42 / 0.8);
+::selection {
+  background: color-mix(in srgb, var(--atlas-gold) 28%, transparent);
+}
+
+@layer components {
+  .atlas-select {
+    @apply flex h-10 w-full rounded-lg border border-[#E8E4DC] bg-white px-3 text-sm text-navy shadow-sm transition
+      focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gold/40
+      dark:border-[#1A2740] dark:bg-[#0C1830] dark:text-cream;
+  }
+
+  .atlas-panel {
+    @apply rounded-xl border border-[#E8E4DC]/90 bg-white shadow-[0_1px_2px_rgba(10,31,68,0.04)]
+      dark:border-[#1A2740] dark:bg-[#0C1830] dark:shadow-none;
+  }
+
+  .atlas-skeleton {
+    @apply animate-pulse rounded-md bg-[#E8E4DC]/80 dark:bg-[#1A2740];
+  }
+
+  .atlas-grid-bg {
+    background-image:
+      linear-gradient(to right, color-mix(in srgb, var(--atlas-border) 55%, transparent) 1px, transparent 1px),
+      linear-gradient(to bottom, color-mix(in srgb, var(--atlas-border) 55%, transparent) 1px, transparent 1px);
+    background-size: 48px 48px;
+  }
 }
 
 @keyframes fade-up {
   from {
     opacity: 0;
-    transform: translateY(8px);
+    transform: translateY(10px);
   }
   to {
     opacity: 1;
@@ -42,6 +93,24 @@ body {
   }
 }
 
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
 .animate-fade-up {
-  animation: fade-up 0.35s ease-out both;
+  animation: fade-up 0.4s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.animate-fade-in {
+  animation: fade-in 0.25s ease-out both;
+}
+
+.atlas-table-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--atlas-muted) 45%, transparent) transparent;
 }

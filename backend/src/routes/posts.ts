@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { createUserClient, supabaseAdmin } from "../supabase";
 import { formatPost } from "./users";
 import { sendPushNotification, getPushToken } from "../lib/push";
+import { enrichPostContent } from "../lib/enrich-post";
 import type { HonoVariables } from "../types";
 
 const postsRouter = new Hono<{ Variables: HonoVariables }>();
@@ -13,7 +14,7 @@ postsRouter.get("/", async (c) => {
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const userClient = createUserClient(token);
-  const [{ data: posts }, { data: friendships }] = await Promise.all([
+  const [{ data: posts }, { data: friendships }, { data: blocks }] = await Promise.all([
     userClient
       .from("posts")
       .select("*, profiles(*), reactions(user_id, type, profiles:user_id(avatar_url))")
@@ -24,14 +25,17 @@ postsRouter.get("/", async (c) => {
       .select("requester_id, receiver_id")
       .eq("status", "accepted")
       .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
+    userClient.from("user_blocks").select("blocked_id").eq("blocker_id", userId),
   ]);
 
   const friendIds = new Set<string>();
   for (const f of friendships ?? []) {
     friendIds.add(f.requester_id === userId ? f.receiver_id : f.requester_id);
   }
+  const blockedIds = new Set((blocks ?? []).map((b: any) => b.blocked_id));
 
   const visible = (posts ?? []).filter((p: any) => {
+    if (blockedIds.has(p.user_id)) return false;
     if (p.user_id === userId) return true;
     const visibility = p.profiles?.post_visibility === "everyone" ? "everyone" : "friends";
     if (visibility === "everyone") return true;
@@ -67,6 +71,13 @@ postsRouter.post("/", async (c) => {
   const body = await c.req.json();
   if (!body?.type || typeof body.type !== "string") {
     return c.json({ error: { message: "Post type is required" } }, 400);
+  }
+  const allowedTypes = ["thought", "location", "sleep", "wakeup"];
+  if (!allowedTypes.includes(body.type)) {
+    return c.json({ error: { message: "Invalid post type" } }, 400);
+  }
+  if (body.content != null && typeof body.content === "string" && body.content.length > 5000) {
+    return c.json({ error: { message: "Content too long (max 5000 characters)" } }, 400);
   }
 
   const userClient = createUserClient(token);
@@ -107,6 +118,14 @@ postsRouter.post("/", async (c) => {
       },
     }, 500);
   }
+
+  // Index hashtags + notify @mentions (non-blocking for client response path)
+  await enrichPostContent({
+    postId: post.id,
+    authorId: userId,
+    authorName: user.full_name ?? "Someone",
+    content: body.content,
+  });
 
   // Mobile sends "sleeping"; older clients may send "sleep"
   const isGoingToSleep = body.sleepAction === "sleep" || body.sleepAction === "sleeping";
