@@ -8,8 +8,11 @@ import { resolve } from "path";
  * Prefer SUPABASE_* (and BACKEND_URL) from the workspace .env when present.
  */
 function applyEnvFileOverrides() {
-  const envPath = resolve(process.cwd(), ".env");
-  if (!existsSync(envPath)) return;
+  // Prefer .env / .env.local over empty host or .env.production values.
+  const candidates = [
+    resolve(process.cwd(), ".env"),
+    resolve(process.cwd(), ".env.local"),
+  ];
 
   const overrideKeys = new Set([
     "SUPABASE_URL",
@@ -20,33 +23,43 @@ function applyEnvFileOverrides() {
     "ADMIN_JWT_EXPIRES_IN",
     "ADMIN_DEFAULT_PASSWORD",
     "RESEND_API_KEY",
+    "RESEND_FROM_EMAIL",
   ]);
 
-  const text = readFileSync(envPath, "utf8");
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#")) continue;
+  let appliedFrom: string | null = null;
 
-    const eq = line.indexOf("=");
-    if (eq <= 0) continue;
+  for (const envPath of candidates) {
+    if (!existsSync(envPath)) continue;
 
-    const key = line.slice(0, eq).trim();
-    if (!overrideKeys.has(key)) continue;
+    const text = readFileSync(envPath, "utf8");
+    for (const rawLine of text.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#")) continue;
 
-    let value = line.slice(eq + 1).trim();
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1);
-    }
+      const eq = line.indexOf("=");
+      if (eq <= 0) continue;
 
-    if (value) {
-      process.env[key] = value;
+      const key = line.slice(0, eq).trim();
+      if (!overrideKeys.has(key)) continue;
+
+      let value = line.slice(eq + 1).trim();
+      if (
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))
+      ) {
+        value = value.slice(1, -1);
+      }
+
+      if (value) {
+        process.env[key] = value;
+        appliedFrom = envPath;
+      }
     }
   }
 
-  console.log(`[config] Applied Supabase overrides from ${envPath}`);
+  if (appliedFrom) {
+    console.log(`[config] Applied env overrides from ${appliedFrom}`);
+  }
 }
 
 applyEnvFileOverrides();
@@ -62,6 +75,7 @@ const envSchema = z.object({
   OPENAI_API_KEY: z.string().optional(),
   BETTER_AUTH_SECRET: z.string().optional(),
   RESEND_API_KEY: z.string().optional(),
+  RESEND_FROM_EMAIL: z.string().optional(),
   ADMIN_JWT_SECRET: z.string().min(32).optional(),
   ADMIN_JWT_EXPIRES_IN: z.string().optional().default("8h"),
   ADMIN_DEFAULT_PASSWORD: z.string().optional(),
@@ -91,6 +105,13 @@ function validateEnv() {
       console.warn(
         "[config] ADMIN_JWT_SECRET not set — admin JWT login will fail until configured (min 32 chars)"
       );
+    }
+    if (!parsed.RESEND_API_KEY?.trim()) {
+      console.warn(
+        "[config] RESEND_API_KEY not set — signup OTP emails will not be sent"
+      );
+    } else {
+      console.log("[config] RESEND_API_KEY configured — OTP emails enabled");
     }
     return parsed;
   } catch (error) {
