@@ -63,6 +63,12 @@ CREATE POLICY "Users can unsave posts" ON public.saved_posts
   FOR DELETE TO authenticated
   USING (auth.uid() = user_id);
 
+DROP POLICY IF EXISTS "Users can update own saved posts" ON public.saved_posts;
+CREATE POLICY "Users can update own saved posts" ON public.saved_posts
+  FOR UPDATE TO authenticated
+  USING (auth.uid() = user_id)
+  WITH CHECK (auth.uid() = user_id);
+
 -- ---------------------------------------------------------------------------
 -- Hashtags
 -- ---------------------------------------------------------------------------

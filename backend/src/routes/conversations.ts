@@ -37,6 +37,46 @@ const emptyUser = (id = "unknown") => ({
   momentCount: 0,
 });
 
+/** Normalize message row — DB may use text/image (legacy) or content/image_url (newer). */
+function messageBody(m: any): string {
+  return m?.content ?? m?.text ?? "";
+}
+
+function messageImage(m: any): string | undefined {
+  return m?.image_url ?? m?.image ?? undefined;
+}
+
+function formatMessage(m: any) {
+  return {
+    id: m.id,
+    senderId: m.sender_id,
+    text: messageBody(m),
+    image: messageImage(m),
+    type: m.type ?? "text",
+    createdAt: m.created_at,
+  };
+}
+
+/** Insert payload that satisfies legacy NOT NULL `text` and optional newer columns. */
+function messageInsert(fields: {
+  conversationId: string;
+  senderId: string;
+  text: string;
+  image?: string | null;
+  type?: string;
+}) {
+  const text = fields.text ?? "";
+  return {
+    conversation_id: fields.conversationId,
+    sender_id: fields.senderId,
+    text,
+    content: text,
+    image: fields.image ?? null,
+    image_url: fields.image ?? null,
+    type: fields.type ?? "text",
+  };
+}
+
 conversationsRouter.get("/", async (c) => {
   const user = c.get("user");
   const userId = c.get("userId");
@@ -73,7 +113,7 @@ conversationsRouter.get("/", async (c) => {
 
     const { data: lastMsgs } = await supabaseAdmin
       .from("messages")
-      .select("content, created_at, sender_id")
+      .select("*")
       .eq("conversation_id", conv.id)
       .order("created_at", { ascending: false })
       .limit(1);
@@ -82,7 +122,7 @@ conversationsRouter.get("/", async (c) => {
     return {
       id: conv.id,
       user: otherUser ?? emptyUser(),
-      lastMessage: lastMsg?.content ?? "",
+      lastMessage: messageBody(lastMsg),
       lastMessageTime: lastMsg?.created_at ?? conv.created_at,
       lastMessageSenderId: lastMsg?.sender_id ?? null,
       unreadCount: 0,
@@ -137,17 +177,10 @@ conversationsRouter.get("/:id", async (c) => {
     data: {
       id: conv.id,
       user: otherUser ?? emptyUser(),
-      lastMessage: msgs?.[msgs.length - 1]?.content ?? "",
+      lastMessage: messageBody(msgs?.[msgs.length - 1]),
       lastMessageTime: conv.updated_at,
       unreadCount: 0,
-      messages: (msgs ?? []).map((m: any) => ({
-        id: m.id,
-        senderId: m.sender_id,
-        text: m.content,
-        image: m.image_url ?? undefined,
-        type: m.type,
-        createdAt: m.created_at,
-      })),
+      messages: (msgs ?? []).map(formatMessage),
     },
   });
 });
@@ -215,13 +248,38 @@ conversationsRouter.post("/:id/messages", async (c) => {
 
   if (!participation) return c.json({ error: { message: "Unauthorized" } }, 403);
 
-  const { data: message, error } = await supabaseAdmin
+  const payload = messageInsert({
+    conversationId: id,
+    senderId: userId,
+    text: text ?? "",
+    image: image ?? null,
+    type,
+  });
+
+  let { data: message, error } = await supabaseAdmin
     .from("messages")
-    .insert({ conversation_id: id, sender_id: userId, content: text ?? null, image_url: image ?? null, type })
+    .insert(payload)
     .select()
     .single();
 
-  if (error) return c.json({ error: { message: "Failed to send message" } }, 500);
+  // Fallback if newer columns (content/image_url/type) are not present yet
+  if (error && (error.message?.includes("content") || error.message?.includes("image_url") || error.message?.includes("type"))) {
+    ({ data: message, error } = await supabaseAdmin
+      .from("messages")
+      .insert({
+        conversation_id: id,
+        sender_id: userId,
+        text: text ?? "",
+        image: image ?? null,
+      })
+      .select()
+      .single());
+  }
+
+  if (error) {
+    console.error("[conversations/messages] insert error:", error.message);
+    return c.json({ error: { message: "Failed to send message", detail: error.message } }, 500);
+  }
 
   await supabaseAdmin.from("conversations").update({ updated_at: new Date().toISOString() }).eq("id", id);
 
@@ -247,16 +305,7 @@ conversationsRouter.post("/:id/messages", async (c) => {
     console.error("[push] DM notification error:", e);
   }
 
-  return c.json({
-    data: {
-      id: message.id,
-      senderId: message.sender_id,
-      text: message.content,
-      image: message.image_url ?? undefined,
-      type: message.type,
-      createdAt: message.created_at,
-    },
-  }, 201);
+  return c.json({ data: formatMessage(message) }, 201);
 });
 
 conversationsRouter.post("/start/:userId", async (c) => {
@@ -308,7 +357,7 @@ conversationsRouter.post("/start/:userId", async (c) => {
     const { data: targetProfile } = await supabaseAdmin.from("profiles").select("*").eq("id", targetId).single();
     const { data: msgs } = await supabaseAdmin
       .from("messages")
-      .select("content, created_at")
+      .select("*")
       .eq("conversation_id", existingConvId)
       .order("created_at", { ascending: false })
       .limit(1);
@@ -316,7 +365,7 @@ conversationsRouter.post("/start/:userId", async (c) => {
       data: {
         id: existingConvId,
         user: targetProfile ? formatProfile(targetProfile) : emptyUser(targetId),
-        lastMessage: msgs?.[0]?.content ?? "",
+        lastMessage: messageBody(msgs?.[0]),
         lastMessageTime: conv?.updated_at ?? new Date().toISOString(),
         unreadCount: 0,
         messages: [],
@@ -383,18 +432,28 @@ conversationsRouter.post("/:id/ping", async (c) => {
 
   const { data: message, error } = await supabaseAdmin
     .from("messages")
-    .insert({ conversation_id: id, sender_id: userId, content: "Ping!", type: "ping" })
+    .insert(messageInsert({ conversationId: id, senderId: userId, text: "Ping!", type: "ping" }))
     .select()
     .single();
 
   if (error || !message) {
-    console.error("[conversations/ping] insert error:", error?.message);
-    return c.json({ error: { message: "Failed to send ping" } }, 500);
+    // Fallback for legacy schema without content/type columns
+    const fallback = await supabaseAdmin
+      .from("messages")
+      .insert({ conversation_id: id, sender_id: userId, text: "Ping!", image: null })
+      .select()
+      .single();
+    if (fallback.error || !fallback.data) {
+      console.error("[conversations/ping] insert error:", error?.message ?? fallback.error?.message);
+      return c.json({ error: { message: "Failed to send ping" } }, 500);
+    }
+    await supabaseAdmin.from("conversations").update({ updated_at: new Date().toISOString() }).eq("id", id);
+    return c.json({ data: formatMessage(fallback.data) }, 201);
   }
 
   await supabaseAdmin.from("conversations").update({ updated_at: new Date().toISOString() }).eq("id", id);
 
-  return c.json({ data: { id: message.id, senderId: userId, text: "Ping!", type: "ping", createdAt: message.created_at } }, 201);
+  return c.json({ data: formatMessage(message) }, 201);
 });
 
 export { conversationsRouter };

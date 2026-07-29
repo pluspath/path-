@@ -11,6 +11,9 @@ import { placesRouter } from "./routes/places";
 import { uploadRouter } from "./routes/upload";
 import { authRouter } from "./routes/auth";
 import { configRouter } from "./routes/config";
+import { socialRouter } from "./routes/social";
+import { reportsRouter } from "./routes/reports";
+import { blocksRouter } from "./routes/blocks";
 import { adminRouter } from "./admin/routes";
 import { bootstrapAdminSystem } from "./admin/bootstrap";
 import { apiLimiter } from "./lib/rate-limit";
@@ -36,6 +39,14 @@ const app = new Hono<{ Variables: HonoVariables }>();
         "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS email_notifications_enabled BOOLEAN NOT NULL DEFAULT FALSE;",
         "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS location_lat DOUBLE PRECISION;",
         "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS location_lng DOUBLE PRECISION;",
+        // Messages: align API fields (content/image_url/type) with legacy text/image schema
+        "ALTER TABLE public.messages ADD COLUMN IF NOT EXISTS content TEXT;",
+        "ALTER TABLE public.messages ADD COLUMN IF NOT EXISTS image_url TEXT;",
+        "ALTER TABLE public.messages ADD COLUMN IF NOT EXISTS type TEXT DEFAULT 'text';",
+        "UPDATE public.messages SET content = text WHERE content IS NULL AND text IS NOT NULL;",
+        "UPDATE public.messages SET image_url = image WHERE image_url IS NULL AND image IS NOT NULL;",
+        "UPDATE public.messages SET text = content WHERE (text IS NULL OR text = '') AND content IS NOT NULL;",
+        "UPDATE public.messages SET image = image_url WHERE image IS NULL AND image_url IS NOT NULL;",
         // Critical posts RLS — fixes 42501 on POST /api/posts when policies were never applied
         "ALTER TABLE public.posts ENABLE ROW LEVEL SECURITY;",
         'DROP POLICY IF EXISTS "Anyone can view posts" ON public.posts;',
@@ -46,6 +57,24 @@ const app = new Hono<{ Variables: HonoVariables }>();
         `CREATE POLICY "Users can create posts" ON public.posts FOR INSERT TO authenticated WITH CHECK (auth.uid() = user_id);`,
         `CREATE POLICY "Users can update own posts" ON public.posts FOR UPDATE TO authenticated USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);`,
         `CREATE POLICY "Users can delete own posts" ON public.posts FOR DELETE TO authenticated USING (auth.uid() = user_id);`,
+        // Saved posts (minimal bootstrap if 006 not applied yet)
+        `CREATE TABLE IF NOT EXISTS public.saved_posts (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+          post_id UUID NOT NULL REFERENCES public.posts(id) ON DELETE CASCADE,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE (user_id, post_id)
+        );`,
+        "CREATE INDEX IF NOT EXISTS idx_saved_posts_user ON public.saved_posts (user_id, created_at DESC);",
+        "ALTER TABLE public.saved_posts ENABLE ROW LEVEL SECURITY;",
+        'DROP POLICY IF EXISTS "Users can view own saved posts" ON public.saved_posts;',
+        `CREATE POLICY "Users can view own saved posts" ON public.saved_posts FOR SELECT TO authenticated USING (auth.uid() = user_id);`,
+        'DROP POLICY IF EXISTS "Users can save posts" ON public.saved_posts;',
+        `CREATE POLICY "Users can save posts" ON public.saved_posts FOR INSERT TO authenticated WITH CHECK (auth.uid() = user_id);`,
+        'DROP POLICY IF EXISTS "Users can unsave posts" ON public.saved_posts;',
+        `CREATE POLICY "Users can unsave posts" ON public.saved_posts FOR DELETE TO authenticated USING (auth.uid() = user_id);`,
+        'DROP POLICY IF EXISTS "Users can update own saved posts" ON public.saved_posts;',
+        `CREATE POLICY "Users can update own saved posts" ON public.saved_posts FOR UPDATE TO authenticated USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);`,
       ];
       for (const sql of statements) {
         const { error } = await supabaseAdmin.rpc("exec_sql", { sql });
@@ -53,7 +82,7 @@ const app = new Hono<{ Variables: HonoVariables }>();
           console.warn(`[migration] exec_sql failed: ${error.message}`);
         }
       }
-      console.log("[migration] column + posts RLS bootstrap finished");
+      console.log("[migration] column + posts RLS + social bootstrap finished");
     }
   } catch {
     console.log(
@@ -190,6 +219,9 @@ app.route("/api/notifications", notificationsRouter);
 app.route("/api/conversations", conversationsRouter);
 app.route("/api/places", placesRouter);
 app.route("/api/upload", uploadRouter);
+app.route("/api/social", socialRouter);
+app.route("/api/reports", reportsRouter);
+app.route("/api/blocks", blocksRouter);
 app.route("/api/admin", adminRouter);
 app.route("/api", usersRouter);
 
