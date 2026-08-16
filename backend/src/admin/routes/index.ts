@@ -16,6 +16,8 @@ import { adminsRoutes } from "./admins.routes";
 import { healthRoutes } from "./health.routes";
 import { logRepository } from "../repositories/log.repository";
 import { clientKey } from "../../lib/rate-limit";
+import { getAdminAuthReady } from "../services/ready.service";
+import { ok } from "../utils/response";
 import type { AdminEnv } from "../middlewares/admin-auth";
 
 const adminRouter = new Hono<AdminEnv>();
@@ -101,6 +103,9 @@ adminRouter.get("/", (c) =>
     },
   })
 );
+
+/** Registered on the parent router so it cannot be missed by nested mount issues. */
+adminRouter.get("/auth/ready", async (c) => ok(c, await getAdminAuthReady()));
 
 adminRouter.route("/auth", authRoutes);
 adminRouter.route("/dashboard", dashboardRoutes);

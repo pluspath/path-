@@ -211,6 +211,12 @@ app.get("/health/supabase", async (c) => {
   }
 });
 
+// Public admin readiness — registered on the root app so it always wins over nested mounts.
+app.get("/api/admin/auth/ready", async (c) => {
+  const { getAdminAuthReady } = await import("./admin/services/ready.service");
+  return c.json({ data: await getAdminAuthReady() });
+});
+
 app.route("/api/config", configRouter);
 app.route("/api/auth", authRouter);
 app.route("/api/posts", postsRouter);

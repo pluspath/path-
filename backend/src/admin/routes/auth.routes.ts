@@ -11,8 +11,7 @@ import { authService, AuthError } from "../services/auth.service";
 import { adminAuthMiddleware, type AdminEnv } from "../middlewares/admin-auth";
 import { fail, ok } from "../utils/response";
 import { clientKey } from "../../lib/rate-limit";
-import { env } from "../../env";
-import { supabaseAdmin } from "../../supabase";
+import { getAdminAuthReady } from "../services/ready.service";
 
 const authRoutes = new Hono<AdminEnv>();
 
@@ -23,38 +22,7 @@ const loginLimiter = rateLimiter({
   keyGenerator: clientKey,
 });
 
-/** Public readiness for login troubleshooting (no secrets). */
-authRoutes.get("/ready", async (c) => {
-  let adminTablesOk = false;
-  let adminUserCount: number | null = null;
-  let tablesMessage = "ok";
-  try {
-    const { count, error } = await supabaseAdmin
-      .from("admin_users")
-      .select("id", { count: "exact", head: true });
-    if (error) {
-      tablesMessage = error.message;
-    } else {
-      adminTablesOk = true;
-      adminUserCount = count ?? 0;
-    }
-  } catch (e) {
-    tablesMessage = e instanceof Error ? e.message : String(e);
-  }
-
-  const jwtConfigured = Boolean(env.ADMIN_JWT_SECRET && env.ADMIN_JWT_SECRET.length >= 32);
-  const serviceRoleConfigured = Boolean(env.SUPABASE_SERVICE_ROLE_KEY);
-
-  return ok(c, {
-    jwtConfigured,
-    serviceRoleConfigured,
-    adminTablesOk,
-    adminUserCount,
-    tablesMessage,
-    backendUrl: env.BACKEND_URL,
-    canLogin: jwtConfigured && serviceRoleConfigured && adminTablesOk && (adminUserCount ?? 0) > 0,
-  });
-});
+authRoutes.get("/ready", async (c) => ok(c, await getAdminAuthReady()));
 
 authRoutes.post("/login", loginLimiter, zValidator("json", loginSchema), async (c) => {
   try {

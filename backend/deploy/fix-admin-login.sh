@@ -10,14 +10,14 @@ cd "$ROOT"
 
 echo "==> Backend dir: $ROOT"
 
-if [[ ! -f src/admin/routes/auth.routes.ts ]]; then
-  echo "ERROR: src/admin/routes/auth.routes.ts missing — wrong directory?"
+if [[ ! -f src/index.ts ]]; then
+  echo "ERROR: src/index.ts missing — wrong directory?"
   exit 1
 fi
 
-if ! grep -q 'authRoutes.get("/ready"' src/admin/routes/auth.routes.ts; then
-  echo "ERROR: This server copy does NOT include the login fix (/ready)."
-  echo "Copy/pull the latest backend code here, then run this script again."
+if ! grep -q '/api/admin/auth/ready' src/index.ts; then
+  echo "ERROR: src/index.ts is missing the /api/admin/auth/ready route."
+  echo "Copy the latest backend code to this server, then re-run."
   exit 1
 fi
 
@@ -48,25 +48,31 @@ if ! grep -q '^ADMIN_CORS_ORIGIN=.*admin.pathplus.store' .env; then
   fi
 fi
 
-echo "==> Restarting API with updated env"
-if command -v pm2 >/dev/null 2>&1 && pm2 describe pathplus-api >/dev/null 2>&1; then
-  pm2 restart pathplus-api --update-env
-  pm2 save
-else
-  echo "PM2 process pathplus-api not found. Start with: bash deploy/pm2-setup.sh"
+echo "==> Force-restart API from this folder (delete + start)"
+if ! command -v pm2 >/dev/null 2>&1; then
+  echo "PM2 is not installed. Install with: npm i -g pm2"
   exit 1
 fi
 
+pm2 delete pathplus-api >/dev/null 2>&1 || true
+pm2 start ecosystem.config.cjs --only pathplus-api
+pm2 save
+
 echo ""
-echo "==> Local readiness (bypass Cloudflare)"
-sleep 1
+echo "==> Waiting for boot"
+sleep 2
+
+echo "==> Health"
+curl -sS "http://127.0.0.1:3000/health" || true
+echo ""
+echo "==> Admin ready"
 LOCAL_READY="$(curl -sS "http://127.0.0.1:3000/api/admin/auth/ready" || true)"
 echo "$LOCAL_READY"
 echo ""
 
 if echo "$LOCAL_READY" | grep -q '404'; then
-  echo "Still 404 locally — PM2 is not serving this code folder."
-  echo "Check: pm2 show pathplus-api | grep -E 'exec cwd|script path'"
+  echo "Still 404. Showing PM2 logs:"
+  pm2 logs pathplus-api --lines 40 --nostream || true
   exit 1
 fi
 
@@ -75,10 +81,8 @@ if echo "$LOCAL_READY" | grep -q '"canLogin":true'; then
   exit 0
 fi
 
-echo "Login is not ready yet. Read the JSON above:"
-echo "  jwtConfigured=false     → ADMIN_JWT_SECRET issue (should be fixed by this script)"
-echo "  adminTablesOk=false     → run migrations/001_admin_system.sql in Supabase SQL Editor"
-echo "  adminUserCount=0        → ADMIN_DEFAULT_PASSWORD='YourStrongPass12!' bun run seed:admin"
-echo ""
-echo "Recent API logs:"
+echo "Endpoint works, but login is not ready yet:"
+echo "  jwtConfigured=false  → check ADMIN_JWT_SECRET"
+echo "  adminTablesOk=false  → run migrations/001_admin_system.sql in Supabase SQL Editor"
+echo "  adminUserCount=0     → ADMIN_DEFAULT_PASSWORD='YourStrongPass12!' bun run seed:admin"
 pm2 logs pathplus-api --lines 30 --nostream || true
