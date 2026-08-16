@@ -186,6 +186,41 @@ app.use("*", async (c, next) => {
 
 app.get("/health", (c) => c.json({ status: "ok" }));
 
+/** Instant admin login diagnostics (no nested routers, no dynamic import). */
+app.get("/admin-ready", async (c) => {
+  let adminTablesOk = false;
+  let adminUserCount: number | null = null;
+  let tablesMessage = "ok";
+  try {
+    const { count, error } = await supabaseAdmin
+      .from("admin_users")
+      .select("id", { count: "exact", head: true });
+    if (error) tablesMessage = error.message;
+    else {
+      adminTablesOk = true;
+      adminUserCount = count ?? 0;
+    }
+  } catch (e) {
+    tablesMessage = e instanceof Error ? e.message : String(e);
+  }
+
+  const jwtConfigured = Boolean(env.ADMIN_JWT_SECRET && env.ADMIN_JWT_SECRET.length >= 32);
+  const serviceRoleConfigured = Boolean(env.SUPABASE_SERVICE_ROLE_KEY);
+
+  return c.json({
+    data: {
+      jwtConfigured,
+      serviceRoleConfigured,
+      adminTablesOk,
+      adminUserCount,
+      tablesMessage,
+      backendUrl: env.BACKEND_URL,
+      canLogin:
+        jwtConfigured && serviceRoleConfigured && adminTablesOk && (adminUserCount ?? 0) > 0,
+    },
+  });
+});
+
 app.get("/health/supabase", async (c) => {
   const project = supabaseProjectRef(env.SUPABASE_URL);
   try {
@@ -211,10 +246,13 @@ app.get("/health/supabase", async (c) => {
   }
 });
 
-// Public admin readiness — registered on the root app so it always wins over nested mounts.
+// Alias under /api/admin for the dashboard/scripts
 app.get("/api/admin/auth/ready", async (c) => {
-  const { getAdminAuthReady } = await import("./admin/services/ready.service");
-  return c.json({ data: await getAdminAuthReady() });
+  const res = await app.request("/admin-ready");
+  return new Response(res.body, {
+    status: res.status,
+    headers: res.headers,
+  });
 });
 
 app.route("/api/config", configRouter);
