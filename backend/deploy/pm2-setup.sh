@@ -22,8 +22,11 @@ echo "==> Installing backend deps"
 bun install
 
 echo "==> Installing + building admin dashboard"
-bun --cwd admin install
-bun --cwd admin run build
+(
+  cd admin
+  bun install
+  bun run build
+)
 
 echo "==> Starting (or reloading) PM2 apps"
 if pm2 describe pathplus-api >/dev/null 2>&1; then

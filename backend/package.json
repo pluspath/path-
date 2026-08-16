@@ -10,11 +10,13 @@
     "typecheck": "tsc --noEmit",
     "seed:admin": "bun run scripts/seed-admin.ts",
     "migrate:admin": "bun run scripts/apply-admin-migration.ts",
+    "admin:install": "bun install --cwd admin",
     "admin:dev": "bun --cwd admin run dev",
-    "admin:build": "bun --cwd admin run build",
+    "admin:build": "bun install --cwd admin && bun --cwd admin run build",
     "admin:start": "bun --cwd admin run start",
     "pm2:setup": "bash deploy/pm2-setup.sh",
-    "pm2:restart": "pm2 restart ecosystem.config.cjs --update-env && pm2 save"
+    "pm2:restart": "pm2 restart ecosystem.config.cjs --update-env && pm2 save",
+    "nginx:setup": "bash deploy/nginx-setup.sh"
   },
   "devDependencies": {
     "@types/bcryptjs": "^3.0.0",

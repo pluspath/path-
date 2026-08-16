@@ -157,21 +157,34 @@ pm2 status
 pm2 logs --lines 50
 ```
 
-## 5. Nginx
+## 5. Nginx + domains (api + admin)
 
-Use `deploy/nginx.pathplus.conf` as a template.
+See **`deploy/DOMAINS.md`** for the full checklist.
 
-Point:
+DNS A records:
+
+- `api.pathplus.store` → VPS IP
+- `admin.pathplus.store` → VPS IP
+
+Then on the VPS:
+
+```bash
+cd /path/to/backend
+sudo bash deploy/nginx-setup.sh
+# after DNS works:
+# sudo bash deploy/nginx-setup.sh --ssl
+```
+
+Nginx routes:
 
 - `api.pathplus.store` → `127.0.0.1:3000`
 - `admin.pathplus.store` → `127.0.0.1:3001`
 
-Enable TLS with Certbot.
-
-Update `ADMIN_CORS_ORIGIN` and `NEXT_PUBLIC_API_URL` accordingly, then restart:
+Update `ADMIN_CORS_ORIGIN` / `NEXT_PUBLIC_API_URL` if needed, then:
 
 ```bash
-pm2 restart pathplus-api pathplus-admin
+pm2 restart all --update-env
+pm2 save
 ```
 
 ## 6. Verify mobile compatibility
