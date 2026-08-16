@@ -51,7 +51,7 @@ module.exports = {
       env: {
         NODE_ENV: "production",
         PORT: 3001,
-        // Browser uses NEXT_PUBLIC_API_URL=http://api.pathplus.store (admin/.env.local at build time)
+        // Browser uses NEXT_PUBLIC_API_URL=https://api.pathplus.store (admin/.env.local at build time)
         API_INTERNAL_URL: "http://127.0.0.1:3000",
       },
       time: true,

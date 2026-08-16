@@ -2,7 +2,7 @@
  * End-to-end sign-up test (same flow as the mobile app).
  * Usage: bun run scripts/test-signup.ts
  */
-const BACKEND = process.env.BACKEND_URL ?? "http://api.pathplus.store";
+const BACKEND = process.env.BACKEND_URL ?? "https://api.pathplus.store";
 const ts = Date.now();
 const testUser = {
   fullName: "Test User",

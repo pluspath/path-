@@ -2,8 +2,6 @@
 # Connect api.pathplus.store + admin.pathplus.store via Nginx.
 # Run on the VPS as root (or with sudo):
 #   sudo bash deploy/nginx-setup.sh
-#
-# Optional HTTPS after DNS works:
 #   sudo bash deploy/nginx-setup.sh --ssl
 
 set -euo pipefail
@@ -37,17 +35,19 @@ if [[ ! -f "$CONF_SRC" ]]; then
 fi
 
 echo "==> Installing Nginx site for:"
-echo "    http://api.pathplus.store   → :3000"
-echo "    http://admin.pathplus.store → :3001"
+echo "    https://api.pathplus.store   → :3000"
+echo "    https://admin.pathplus.store → :3001"
 
 cp "$CONF_SRC" "$AVAILABLE"
 ln -sfn "$AVAILABLE" "$ENABLED"
 
-# Avoid default site stealing Host headers when present
-if [[ -L /etc/nginx/sites-enabled/default ]]; then
-  echo "==> Disabling default Nginx site"
-  rm -f /etc/nginx/sites-enabled/default
-fi
+# Remove older duplicate site configs that also claim api/admin (causes "conflicting server name")
+for old in pathplus-api pathplus-admin default; do
+  if [[ -e "/etc/nginx/sites-enabled/$old" ]]; then
+    echo "==> Removing duplicate site: $old"
+    rm -f "/etc/nginx/sites-enabled/$old"
+  fi
+done
 
 echo "==> Testing Nginx config"
 nginx -t
@@ -61,20 +61,21 @@ if [[ "$ENABLE_SSL" -eq 1 ]]; then
     echo "Certbot not found. Install with: apt install -y certbot python3-certbot-nginx"
     exit 1
   fi
-  echo "==> Requesting TLS certificates"
+  echo "==> Requesting / expanding TLS certificates"
   certbot --nginx \
     -d api.pathplus.store \
     -d admin.pathplus.store \
+    --expand \
     --non-interactive --agree-tos --redirect \
     --register-unsafely-without-email || \
-  certbot --nginx -d api.pathplus.store -d admin.pathplus.store --redirect
+  certbot --nginx -d api.pathplus.store -d admin.pathplus.store --expand --redirect
 fi
 
 echo ""
-echo "Done. Verify DNS A records first, then test:"
-echo "  curl -I http://api.pathplus.store/health"
-echo "  curl -I http://admin.pathplus.store/"
+echo "Done. Test with HTTPS:"
+echo "  curl https://api.pathplus.store/health"
+echo "  curl -I https://admin.pathplus.store/"
 echo ""
-echo "DNS (at your domain registrar):"
-echo "  A   api.pathplus.store     →  YOUR_VPS_IP"
-echo "  A   admin.pathplus.store   →  YOUR_VPS_IP"
+echo "Links:"
+echo "  API:   https://api.pathplus.store"
+echo "  Admin: https://admin.pathplus.store"

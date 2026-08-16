@@ -19,9 +19,9 @@
         "EXPO_PUBLIC_SUPABASE_URL": "https://mxdgwftyvupxmlyzsvqk.supabase.co",
         "EXPO_PUBLIC_EXAMPLE_ENV_VAR": "test",
         "EXPO_PUBLIC_GOOGLE_PLACES_API_KEY": "AIzaSyC7gUIOmkjn4BV0zKx6GfYmpGssTZ91uDQ",
-        "BACKEND_URL": "http://api.pathplus.store",
-        "EXPO_PUBLIC_BACKEND_URL": "http://api.pathplus.store",
-        "EXPO_PUBLIC_VIBECODE_BACKEND_URL": "http://api.pathplus.store"
+        "BACKEND_URL": "https://api.pathplus.store",
+        "EXPO_PUBLIC_BACKEND_URL": "https://api.pathplus.store",
+        "EXPO_PUBLIC_VIBECODE_BACKEND_URL": "https://api.pathplus.store"
       },
       "ios": {
         "distribution": "store"

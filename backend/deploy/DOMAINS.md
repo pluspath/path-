@@ -1,25 +1,21 @@
 # Path+ domains
 
-| Host | Points to | App |
-|------|-----------|-----|
-| **api.pathplus.store** | VPS → Nginx → `127.0.0.1:3000` | Hono API |
-| **admin.pathplus.store** | VPS → Nginx → `127.0.0.1:3001` | Admin dashboard |
+| Host | URL |
+|------|-----|
+| **API** | https://api.pathplus.store |
+| **Admin** | https://admin.pathplus.store |
 
-## 1. DNS (registrar)
+Nginx proxies:
 
-Create two **A** records for `pathplus.store`:
+- `api.pathplus.store` → `127.0.0.1:3000`
+- `admin.pathplus.store` → `127.0.0.1:3001`
+
+## 1. DNS
 
 | Type | Name | Value |
 |------|------|--------|
 | A | `api` | your VPS public IP |
 | A | `admin` | your VPS public IP |
-
-Wait until they resolve:
-
-```bash
-dig +short api.pathplus.store
-dig +short admin.pathplus.store
-```
 
 ## 2. Apps (PM2)
 
@@ -28,30 +24,33 @@ cd /path/to/backend
 bash deploy/pm2-setup.sh
 ```
 
-## 3. Nginx
+## 3. Nginx + SSL
 
 ```bash
-cd /path/to/backend
 sudo bash deploy/nginx-setup.sh
+sudo bash deploy/nginx-setup.sh --ssl
 ```
 
-HTTPS (after DNS works):
+If you see `conflicting server name "api.pathplus.store"`, remove the old duplicate and reload:
 
 ```bash
-sudo bash deploy/nginx-setup.sh --ssl
+sudo rm -f /etc/nginx/sites-enabled/pathplus-api
+sudo nginx -t && sudo systemctl reload nginx
 ```
 
 ## 4. Check
 
 ```bash
-curl http://api.pathplus.store/health
+curl https://api.pathplus.store/health
 # {"status":"ok"}
 
-curl -I http://admin.pathplus.store/
+curl -I https://admin.pathplus.store/
 # HTTP 200
 ```
 
-Open in browser:
+After SSL, rebuild admin so it uses HTTPS:
 
-- API health: http://api.pathplus.store/health
-- Dashboard: http://admin.pathplus.store
+```bash
+cd admin && bun run build && cd ..
+pm2 restart all --update-env && pm2 save
+```

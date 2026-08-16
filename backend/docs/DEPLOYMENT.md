@@ -45,8 +45,8 @@ Backend `.env` must include existing production vars plus:
 ```env
 ADMIN_JWT_SECRET=<openssl rand -hex 48>
 ADMIN_JWT_EXPIRES_IN=8h
-ADMIN_CORS_ORIGIN=http://admin.pathplus.store,https://admin.pathplus.store,http://localhost:3001,http://127.0.0.1:3001
-BACKEND_URL=http://api.pathplus.store
+ADMIN_CORS_ORIGIN=https://admin.pathplus.store,http://admin.pathplus.store,http://localhost:3001,http://127.0.0.1:3001
+BACKEND_URL=https://api.pathplus.store
 ```
 
 Admin frontend `admin/.env.local` / production env:
@@ -66,8 +66,8 @@ API_INTERNAL_URL=http://127.0.0.1:3000
 If admin and API use **separate domains**, set the public API URL instead:
 
 ```env
-NEXT_PUBLIC_API_URL=http://api.pathplus.store
-ADMIN_CORS_ORIGIN=http://admin.pathplus.store,https://admin.pathplus.store
+NEXT_PUBLIC_API_URL=https://api.pathplus.store
+ADMIN_CORS_ORIGIN=https://admin.pathplus.store,http://admin.pathplus.store
 ```
 
 **Important:** `NEXT_PUBLIC_*` is baked in at `bun run build`. After changing it, rebuild the admin app.
