@@ -32,7 +32,7 @@ module.exports = {
       env: {
         NODE_ENV: "production",
         PORT: 3001,
-        // Next.js server-side proxy target (browser uses same-origin /api/admin)
+        // Browser uses NEXT_PUBLIC_API_URL=http://api.pathplus.store (set in admin/.env.local at build time)
         API_INTERNAL_URL: "http://127.0.0.1:3000",
       },
       max_memory_restart: "512M",

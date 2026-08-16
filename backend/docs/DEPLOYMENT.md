@@ -45,7 +45,8 @@ Backend `.env` must include existing production vars plus:
 ```env
 ADMIN_JWT_SECRET=<openssl rand -hex 48>
 ADMIN_JWT_EXPIRES_IN=8h
-ADMIN_CORS_ORIGIN=https://admin.yourdomain.com
+ADMIN_CORS_ORIGIN=http://localhost:3001,http://127.0.0.1:3001,http://admin.pathplus.store,https://admin.pathplus.store,http://187.55.230.171:3001
+BACKEND_URL=http://api.pathplus.store
 ```
 
 Admin frontend `admin/.env.local` / production env:
@@ -55,6 +56,9 @@ Admin frontend `admin/.env.local` / production env:
 # and Next.js proxies to the API on 127.0.0.1:3000.
 # NEXT_PUBLIC_API_URL=
 
+# Or point the browser at the public API domain:
+NEXT_PUBLIC_API_URL=http://api.pathplus.store
+
 NEXT_PUBLIC_APP_NAME=Path+ Admin
 API_INTERNAL_URL=http://127.0.0.1:3000
 ```
@@ -62,8 +66,8 @@ API_INTERNAL_URL=http://127.0.0.1:3000
 If admin and API use **separate domains**, set the public API URL instead:
 
 ```env
-NEXT_PUBLIC_API_URL=https://api.yourdomain.com
-ADMIN_CORS_ORIGIN=https://admin.yourdomain.com
+NEXT_PUBLIC_API_URL=http://api.pathplus.store
+ADMIN_CORS_ORIGIN=http://admin.pathplus.store,https://admin.pathplus.store
 ```
 
 **Important:** `NEXT_PUBLIC_*` is baked in at `bun run build`. After changing it, rebuild the admin app.
@@ -134,8 +138,8 @@ Use `deploy/nginx.pathplus.conf` as a template.
 
 Point:
 
-- `api.yourdomain.com` → `127.0.0.1:3000`
-- `admin.yourdomain.com` → `127.0.0.1:3001`
+- `api.pathplus.store` → `127.0.0.1:3000`
+- `admin.pathplus.store` → `127.0.0.1:3001`
 
 Enable TLS with Certbot.
 

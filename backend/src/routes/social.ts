@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { createUserClient, supabaseAdmin } from "../supabase";
 import { formatPost } from "./users";
 import { sanitizeSearchQuery } from "../lib/auth-helpers";
+import { env } from "../env";
 import type { HonoVariables } from "../types";
 
 const socialRouter = new Hono<{ Variables: HonoVariables }>();
@@ -178,7 +179,7 @@ socialRouter.post("/posts/:id/share", async (c) => {
     platform,
   });
 
-  const shareUrl = `${process.env.BACKEND_URL || ""}/share/post/${postId}`;
+  const shareUrl = `${env.BACKEND_URL}/share/post/${postId}`;
   const shareText = post.content
     ? `Check out this moment on Path+: ${String(post.content).slice(0, 120)}`
     : "Check out this moment on Path+";

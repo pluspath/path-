@@ -9,7 +9,7 @@ Next.js admin console for the Path+ Hono API.
 bun install
 cd admin
 bun install
-cp .env.local.example .env.local
+cp .env.example .env.local
 bun run dev
 ```
 

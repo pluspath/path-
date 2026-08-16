@@ -22,6 +22,7 @@ function applyEnvFileOverrides() {
     "ADMIN_JWT_SECRET",
     "ADMIN_JWT_EXPIRES_IN",
     "ADMIN_DEFAULT_PASSWORD",
+    "ADMIN_CORS_ORIGIN",
     "RESEND_API_KEY",
     "RESEND_FROM_EMAIL",
   ]);
