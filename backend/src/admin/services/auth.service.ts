@@ -66,11 +66,25 @@ export const authService = {
       throw new AuthError("Invalid username or password", 401);
     }
 
-    const { token, jti, expiresAt } = await signAdminToken({
-      id: user.id,
-      username: user.username,
-      role: user.role,
-    });
+    let token: string;
+    let jti: string;
+    let expiresAt: Date;
+    try {
+      ({ token, jti, expiresAt } = await signAdminToken({
+        id: user.id,
+        username: user.username,
+        role: user.role,
+      }));
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      if (message.includes("ADMIN_JWT_SECRET")) {
+        throw new AuthError(
+          "Admin JWT is not configured on the server. Set ADMIN_JWT_SECRET (min 32 chars) and restart.",
+          503
+        );
+      }
+      throw e;
+    }
 
     await adminUserRepository.update(user.id, { last_login_at: new Date().toISOString() });
     await logRepository.create({

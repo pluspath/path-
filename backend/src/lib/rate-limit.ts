@@ -2,8 +2,9 @@ import { rateLimiter } from "hono-rate-limiter";
 
 function clientKey(c: { req: { header: (name: string) => string | undefined } }): string {
   return (
-    c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ||
+    c.req.header("cf-connecting-ip") ||
     c.req.header("x-real-ip") ||
+    c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ||
     "unknown"
   );
 }
@@ -32,3 +33,5 @@ export const uploadLimiter = rateLimiter({
   keyGenerator: (c) =>
     c.req.header("authorization")?.slice(0, 48) || clientKey(c),
 });
+
+export { clientKey };

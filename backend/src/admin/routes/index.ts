@@ -15,6 +15,7 @@ import { logsRoutes } from "./logs.routes";
 import { adminsRoutes } from "./admins.routes";
 import { healthRoutes } from "./health.routes";
 import { logRepository } from "../repositories/log.repository";
+import { clientKey } from "../../lib/rate-limit";
 import type { AdminEnv } from "../middlewares/admin-auth";
 
 const adminRouter = new Hono<AdminEnv>();
@@ -26,9 +27,7 @@ const adminApiLimiter = rateLimiter({
   limit: 180,
   standardHeaders: "draft-6",
   keyGenerator: (c) =>
-    c.req.header("authorization")?.slice(0, 40) ||
-    c.req.header("x-forwarded-for") ||
-    "admin-anon",
+    c.req.header("authorization")?.slice(0, 40) || clientKey(c),
 });
 
 adminRouter.use("*", adminApiLimiter);
@@ -39,18 +38,41 @@ adminRouter.use("*", async (c, next) => {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error("[admin] unhandled error:", message);
-    await logRepository.create({
-      category: "unhandled_exception",
-      action: "admin_route_error",
-      actor_type: "system",
-      metadata: {
-        path: c.req.path,
-        method: c.req.method,
-        message,
-      },
-      ip_address: c.req.header("x-forwarded-for") ?? null,
-      user_agent: c.req.header("user-agent") ?? null,
-    });
+    try {
+      await logRepository.create({
+        category: "unhandled_exception",
+        action: "admin_route_error",
+        actor_type: "system",
+        metadata: {
+          path: c.req.path,
+          method: c.req.method,
+          message,
+        },
+        ip_address: clientKey(c),
+        user_agent: c.req.header("user-agent") ?? null,
+      });
+    } catch {
+      // ignore secondary log failures
+    }
+
+    if (message.includes("ADMIN_JWT_SECRET")) {
+      return c.json(
+        { error: { message: "Admin JWT is not configured. Set ADMIN_JWT_SECRET and restart the API." } },
+        503
+      );
+    }
+    if (message.includes("admin_users") || message.includes("schema cache")) {
+      return c.json(
+        {
+          error: {
+            message:
+              "Admin tables are missing. Run migrations/001_admin_system.sql in the Supabase SQL Editor.",
+          },
+        },
+        503
+      );
+    }
+
     return c.json({ error: { message: "Internal server error" } }, 500);
   }
 });
