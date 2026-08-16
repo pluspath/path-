@@ -1,8 +1,14 @@
 /**
  * PM2 process file for Path+ API + Admin Dashboard on the same VPS.
  *
- * Usage:
+ * First-time setup (on the VPS):
+ *   bun run admin:build
  *   pm2 start ecosystem.config.cjs
+ *   pm2 save
+ *   pm2 startup    # run the command it prints (enables boot on reboot)
+ *
+ * Later:
+ *   pm2 restart ecosystem.config.cjs --update-env
  *   pm2 save
  */
 module.exports = {
@@ -14,11 +20,17 @@ module.exports = {
       interpreter: "bun",
       instances: 1,
       exec_mode: "fork",
+      autorestart: true,
+      watch: false,
+      max_memory_restart: "512M",
+      min_uptime: "10s",
+      max_restarts: 50,
+      exp_backoff_restart_delay: 200,
+      kill_timeout: 5000,
       env: {
         NODE_ENV: "production",
         PORT: 3000,
       },
-      max_memory_restart: "512M",
       time: true,
     },
     {
@@ -29,13 +41,19 @@ module.exports = {
       interpreter: "bun",
       instances: 1,
       exec_mode: "fork",
+      autorestart: true,
+      watch: false,
+      max_memory_restart: "512M",
+      min_uptime: "10s",
+      max_restarts: 50,
+      exp_backoff_restart_delay: 200,
+      kill_timeout: 5000,
       env: {
         NODE_ENV: "production",
         PORT: 3001,
-        // Browser uses NEXT_PUBLIC_API_URL=http://api.pathplus.store (set in admin/.env.local at build time)
+        // Browser uses NEXT_PUBLIC_API_URL=http://api.pathplus.store (admin/.env.local at build time)
         API_INTERNAL_URL: "http://127.0.0.1:3000",
       },
-      max_memory_restart: "512M",
       time: true,
     },
   ],

@@ -118,19 +118,44 @@ curl -X POST "http://127.0.0.1:3001/api/admin/auth/login" \
   -d '{"username":"admin","password":"Admin@PathPlus2026!"}'
 ```
 
-## 4. Start with PM2
+## 4. Start with PM2 (keeps running continuously)
+
+PM2 auto-restarts on crash and can start again after a server reboot.
 
 ```bash
 cd /path/to/backend
+bash deploy/pm2-setup.sh
+```
+
+Or manually:
+
+```bash
+cd /path/to/backend
+bun run admin:build
 pm2 start ecosystem.config.cjs
 pm2 save
+pm2 startup          # copy/run the command it prints (once)
 pm2 status
 ```
 
 Processes:
 
-- `pathplus-api` → port **3000**
-- `pathplus-admin` → port **3001**
+- `pathplus-api` → port **3000** → http://api.pathplus.store
+- `pathplus-admin` → port **3001** → http://admin.pathplus.store
+
+After code or `.env` changes:
+
+```bash
+pm2 restart all --update-env
+pm2 save
+```
+
+Check they stay up:
+
+```bash
+pm2 status
+pm2 logs --lines 50
+```
 
 ## 5. Nginx
 

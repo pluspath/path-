@@ -12,7 +12,9 @@
     "migrate:admin": "bun run scripts/apply-admin-migration.ts",
     "admin:dev": "bun --cwd admin run dev",
     "admin:build": "bun --cwd admin run build",
-    "admin:start": "bun --cwd admin run start"
+    "admin:start": "bun --cwd admin run start",
+    "pm2:setup": "bash deploy/pm2-setup.sh",
+    "pm2:restart": "pm2 restart ecosystem.config.cjs --update-env && pm2 save"
   },
   "devDependencies": {
     "@types/bcryptjs": "^3.0.0",
