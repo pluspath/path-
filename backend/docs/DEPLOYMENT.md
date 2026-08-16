@@ -45,7 +45,7 @@ Backend `.env` must include existing production vars plus:
 ```env
 ADMIN_JWT_SECRET=<openssl rand -hex 48>
 ADMIN_JWT_EXPIRES_IN=8h
-ADMIN_CORS_ORIGIN=http://localhost:3001,http://127.0.0.1:3001,http://admin.pathplus.store,https://admin.pathplus.store,http://187.55.230.171:3001
+ADMIN_CORS_ORIGIN=http://admin.pathplus.store,https://admin.pathplus.store,http://localhost:3001,http://127.0.0.1:3001
 BACKEND_URL=http://api.pathplus.store
 ```
 

@@ -21,6 +21,9 @@ API:
 
 ## Production
 
+- API: http://api.pathplus.store
+- Dashboard: http://admin.pathplus.store
+
 ```bash
 bun run build
 bun run start
