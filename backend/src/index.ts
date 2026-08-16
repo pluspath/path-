@@ -184,41 +184,52 @@ app.use("*", async (c, next) => {
   await next();
 });
 
-app.get("/health", (c) => c.json({ status: "ok" }));
-
-/** Instant admin login diagnostics (no nested routers, no dynamic import). */
-app.get("/admin-ready", async (c) => {
-  let adminTablesOk = false;
-  let adminUserCount: number | null = null;
-  let tablesMessage = "ok";
-  try {
-    const { count, error } = await supabaseAdmin
-      .from("admin_users")
-      .select("id", { count: "exact", head: true });
-    if (error) tablesMessage = error.message;
-    else {
-      adminTablesOk = true;
-      adminUserCount = count ?? 0;
+app.get("/health", async (c) => {
+  // /health?ready=1 → admin login diagnostics (same handler as /health so it cannot 404)
+  if (c.req.query("ready") === "1") {
+    let adminTablesOk = false;
+    let adminUserCount: number | null = null;
+    let tablesMessage = "ok";
+    try {
+      const { count, error } = await supabaseAdmin
+        .from("admin_users")
+        .select("id", { count: "exact", head: true });
+      if (error) tablesMessage = error.message;
+      else {
+        adminTablesOk = true;
+        adminUserCount = count ?? 0;
+      }
+    } catch (e) {
+      tablesMessage = e instanceof Error ? e.message : String(e);
     }
-  } catch (e) {
-    tablesMessage = e instanceof Error ? e.message : String(e);
+
+    const jwtConfigured = Boolean(env.ADMIN_JWT_SECRET && env.ADMIN_JWT_SECRET.length >= 32);
+    const serviceRoleConfigured = Boolean(env.SUPABASE_SERVICE_ROLE_KEY);
+
+    return c.json({
+      status: "ok",
+      data: {
+        jwtConfigured,
+        serviceRoleConfigured,
+        adminTablesOk,
+        adminUserCount,
+        tablesMessage,
+        backendUrl: env.BACKEND_URL,
+        canLogin:
+          jwtConfigured && serviceRoleConfigured && adminTablesOk && (adminUserCount ?? 0) > 0,
+      },
+    });
   }
 
-  const jwtConfigured = Boolean(env.ADMIN_JWT_SECRET && env.ADMIN_JWT_SECRET.length >= 32);
-  const serviceRoleConfigured = Boolean(env.SUPABASE_SERVICE_ROLE_KEY);
+  return c.json({ status: "ok" });
+});
 
-  return c.json({
-    data: {
-      jwtConfigured,
-      serviceRoleConfigured,
-      adminTablesOk,
-      adminUserCount,
-      tablesMessage,
-      backendUrl: env.BACKEND_URL,
-      canLogin:
-        jwtConfigured && serviceRoleConfigured && adminTablesOk && (adminUserCount ?? 0) > 0,
-    },
-  });
+app.get("/admin-ready", async (c) => {
+  // Keep alias; primary diagnostics live at /health?ready=1
+  const url = new URL(c.req.url);
+  url.pathname = "/health";
+  url.searchParams.set("ready", "1");
+  return app.fetch(new Request(url.toString(), c.req.raw));
 });
 
 app.get("/health/supabase", async (c) => {
@@ -246,13 +257,11 @@ app.get("/health/supabase", async (c) => {
   }
 });
 
-// Alias under /api/admin for the dashboard/scripts
 app.get("/api/admin/auth/ready", async (c) => {
-  const res = await app.request("/admin-ready");
-  return new Response(res.body, {
-    status: res.status,
-    headers: res.headers,
-  });
+  const url = new URL(c.req.url);
+  url.pathname = "/health";
+  url.searchParams.set("ready", "1");
+  return app.fetch(new Request(url.toString(), c.req.raw));
 });
 
 app.route("/api/config", configRouter);
@@ -271,4 +280,10 @@ app.route("/api", usersRouter);
 
 const port = Number(process.env.PORT) || 3000;
 
-export default { port, fetch: app.fetch };
+console.log(`[boot] Path+ API on :${port} | admin diagnostics: GET /health?ready=1`);
+
+export default {
+  port,
+  hostname: "0.0.0.0",
+  fetch: app.fetch,
+};
