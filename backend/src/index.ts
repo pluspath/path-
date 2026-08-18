@@ -131,8 +131,16 @@ app.use("*", cors({
     // Native mobile clients often omit Origin; allow those requests (no browser CORS).
     if (!origin) return "*";
     if (extraAdminOrigins.includes(origin)) return origin;
+    if (
+      /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin) ||
+      /^https?:\/\/(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})(:\d+)?$/.test(origin) ||
+      /\.expo\.dev$/.test(origin) ||
+      origin.includes("exp.direct")
+    ) {
+      return origin;
+    }
     // Production: only explicitly configured admin origins
-    if (isProd) return null;
+    if (isProd) return extraAdminOrigins.includes(origin) ? origin : null;
     return allowed.some((re) => re.test(origin)) ? origin : null;
   },
   credentials: true,
@@ -144,7 +152,7 @@ bootstrapAdminSystem().catch((err) => {
 });
 
 app.use("*", logger());
-app.use("*", secureHeadersMiddleware);
+app.use("/api/admin/*", secureHeadersMiddleware);
 app.use("/api/*", apiLimiter);
 
 app.use("*", async (c, next) => {
