@@ -2,10 +2,14 @@ import { Hono } from "hono";
 import { createUserClient, supabaseAdmin } from "../supabase";
 import { formatPost } from "./users";
 import { sanitizeSearchQuery } from "../lib/auth-helpers";
+import { getBlockedIds } from "../lib/blocks";
 import { env } from "../env";
 import type { HonoVariables } from "../types";
 
 const socialRouter = new Hono<{ Variables: HonoVariables }>();
+
+const POST_SELECT =
+  "*, profiles(*), reactions(user_id, type, profiles:user_id(avatar_url))";
 
 /** GET /api/social/trending — posts ranked by recent engagement */
 socialRouter.get("/trending", async (c) => {
@@ -99,6 +103,43 @@ socialRouter.get("/saved", async (c) => {
     .map((p: any) => ({ ...formatPost(p), isSaved: true }));
 
   return c.json({ data: ordered });
+});
+
+/** GET /api/social/liked-moments — current user's posts that others have reacted to or commented on */
+socialRouter.get("/liked-moments", async (c) => {
+  const user = c.get("user");
+  const userId = c.get("userId");
+  const token = c.get("accessToken");
+  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const userClient = createUserClient(token);
+  const blockedIds = await getBlockedIds(userId);
+  const blockedSet = new Set(blockedIds);
+
+  const { data: posts, error } = await userClient
+    .from("posts")
+    .select(POST_SELECT)
+    .eq("user_id", userId)
+    .order("created_at", { ascending: false })
+    .limit(100);
+
+  if (error) {
+    console.warn("[social/liked-moments]", error.message);
+    return c.json({ data: [] });
+  }
+
+  const interacted = (posts ?? []).filter((p: any) => {
+    const reactions = Array.isArray(p.reactions) ? p.reactions : [];
+    const othersReacted = reactions.some(
+      (r: any) => r.user_id !== userId && !blockedSet.has(r.user_id)
+    );
+    const hasComments = Number(p.comment_count ?? 0) > 0;
+    return othersReacted || hasComments;
+  });
+
+  return c.json({
+    data: interacted.map((p: any) => formatPost(p, userId, blockedIds)),
+  });
 });
 
 /** POST /api/social/posts/:id/save */
