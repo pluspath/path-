@@ -28,6 +28,12 @@ import type { HonoVariables } from "./types";
 
 const app = new Hono<{ Variables: HonoVariables }>();
 
+// Register public HTML pages immediately (before middleware) so they cannot be missed.
+registerMarketingPages(app);
+app.get("/__marketing", (c) =>
+  c.json({ ok: true, service: "pathplus-api", pages: ["/", "/support", "/privacy", "/terms"] })
+);
+
 // Attempt to add profile columns + ensure core RLS policies (graceful if exec_sql missing)
 (async () => {
   try {
@@ -250,7 +256,7 @@ app.get("/health", async (c) => {
     });
   }
 
-  return c.json({ status: "ok" });
+  return c.json({ status: "ok", service: "pathplus-api", marketing: true });
 });
 
 app.get("/admin-ready", async (c) => {
@@ -293,7 +299,6 @@ app.get("/api/admin/auth/ready", async (c) => {
   return app.fetch(new Request(url.toString(), c.req.raw));
 });
 
-registerMarketingPages(app);
 app.route("/api/content", contentRouter);
 app.route("/api/config", configRouter);
 app.route("/api/auth", authRouter);
@@ -312,10 +317,23 @@ app.route("/api", usersRouter);
 
 const port = Number(process.env.PORT) || 3000;
 
-console.log(`[boot] Path+ API on :${port} | admin diagnostics: GET /health?ready=1`);
+let server: ReturnType<typeof Bun.serve>;
+try {
+  server = Bun.serve({
+    port,
+    hostname: "0.0.0.0",
+    fetch: (req) => app.fetch(req),
+  });
+} catch (err) {
+  const message = err instanceof Error ? err.message : String(err);
+  console.error(`[boot] FATAL: cannot bind :${port} — ${message}`);
+  console.error("[boot] Another process is probably still holding the port. Run: bash deploy/restart-api-clean.sh");
+  process.exit(1);
+}
 
-export default {
-  port,
-  hostname: "0.0.0.0",
-  fetch: app.fetch,
-};
+console.log(
+  `[boot] Path+ API listening on http://${server.hostname}:${server.port} (pid ${process.pid}) | GET /__marketing`
+);
+
+// Named export only — do NOT `export default app` (Bun would try to serve it again).
+export { app, server };
