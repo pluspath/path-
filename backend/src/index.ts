@@ -9,16 +9,16 @@ import { notificationsRouter } from "./routes/notifications";
 import { conversationsRouter } from "./routes/conversations";
 import { placesRouter } from "./routes/places";
 import { uploadRouter } from "./routes/upload";
+import { moderationRouter } from "./routes/moderation";
 import { authRouter } from "./routes/auth";
 import { configRouter } from "./routes/config";
 import { socialRouter } from "./routes/social";
-import { reportsRouter } from "./routes/reports";
-import { blocksRouter } from "./routes/blocks";
 import { contentRouter, legalPagesRouter, seedLegalContent } from "./routes/content";
 import { adminRouter } from "./admin/routes";
 import { bootstrapAdminSystem } from "./admin/bootstrap";
 import { apiLimiter } from "./lib/rate-limit";
 import { secureHeadersMiddleware } from "./admin/middlewares/secure-headers";
+import { backfillJoinedPosts } from "./lib/joined";
 import { env, supabaseProjectRef } from "./env";
 import type { HonoVariables } from "./types";
 
@@ -33,6 +33,8 @@ const app = new Hono<{ Variables: HonoVariables }>();
       const statements = [
         "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS push_token TEXT;",
         "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS birthday TEXT;",
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS gender TEXT;",
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS show_age BOOLEAN DEFAULT FALSE;",
         "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS show_zodiac BOOLEAN DEFAULT FALSE;",
         "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS username_changed BOOLEAN DEFAULT FALSE;",
         "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS post_visibility TEXT NOT NULL DEFAULT 'friends';",
@@ -90,6 +92,10 @@ const app = new Hono<{ Variables: HonoVariables }>();
       "[migration] column/RLS migrations may not have run — run: bun run migrate:admin (see migrations/004_rls_policies.sql)."
     );
   }
+
+  // One-time idempotent backfill: ensure every existing user has a "Joined
+  // Path+" moment as the oldest item on their timeline.
+  await backfillJoinedPosts();
 })();
 
 // Surface Supabase connectivity problems immediately in logs (no secrets).
@@ -120,6 +126,11 @@ const allowed = [
   /^http:\/\/127\.0\.0\.1(:\d+)?$/,
   // Private LAN only (dev) — not public internet IPs
   /^http:\/\/(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})(:\d+)?$/,
+  /^https:\/\/[a-z0-9-]+\.dev\.vibecode\.run$/,
+  /^https:\/\/[a-z0-9-]+\.vibecode\.run$/,
+  /^https:\/\/[a-z0-9-]+\.vibecodeapp\.com$/,
+  /^https:\/\/[a-z0-9-]+\.vibecode\.dev$/,
+  /^https:\/\/vibecode\.dev$/,
 ];
 
 const extraAdminOrigins = (env.ADMIN_CORS_ORIGIN || "")
@@ -136,13 +147,14 @@ app.use("*", cors({
       /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin) ||
       /^https?:\/\/(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})(:\d+)?$/.test(origin) ||
       /\.expo\.dev$/.test(origin) ||
-      origin.includes("exp.direct")
+      origin.includes("exp.direct") ||
+      allowed.some((re) => re.test(origin))
     ) {
       return origin;
     }
     // Production: only explicitly configured admin origins
     if (isProd) return extraAdminOrigins.includes(origin) ? origin : null;
-    return allowed.some((re) => re.test(origin)) ? origin : null;
+    return null;
   },
   credentials: true,
 }));
@@ -286,9 +298,10 @@ app.route("/api/conversations", conversationsRouter);
 app.route("/api/places", placesRouter);
 app.route("/api/upload", uploadRouter);
 app.route("/api/social", socialRouter);
-app.route("/api/reports", reportsRouter);
-app.route("/api/blocks", blocksRouter);
 app.route("/api/admin", adminRouter);
+// Moderation (/api/reports, /api/blocks) must be mounted BEFORE usersRouter so
+// its concrete paths aren't captured by usersRouter's "/:id".
+app.route("/api", moderationRouter);
 app.route("/api", usersRouter);
 
 const port = Number(process.env.PORT) || 3000;

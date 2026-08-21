@@ -9,14 +9,11 @@ const placesRouter = new Hono<{ Variables: HonoVariables }>();
 placesRouter.post(
   "/nearby",
   zValidator("json", z.object({
-    latitude: z.number().min(-90).max(90),
-    longitude: z.number().min(-180).max(180),
-    radius: z.number().min(1).max(50000).optional().default(500),
+    latitude: z.number(),
+    longitude: z.number(),
+    radius: z.number().optional().default(500),
   })),
   async (c) => {
-    const userId = c.get("userId");
-    if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
-
     const { latitude, longitude, radius } = c.req.valid("json");
 
     const body = {
@@ -40,8 +37,8 @@ placesRouter.post(
     });
 
     if (!response.ok) {
-      console.error("[places] Google Places API error:", response.status);
-      return c.json({ error: { message: "Places lookup failed. Please try again." } }, 502);
+      const errText = await response.text();
+      return c.json({ error: { message: `Places API error: ${errText}` } }, 502);
     }
 
     const data = await response.json() as { places?: any[] };
