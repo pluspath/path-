@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Privacy Policy · Path+</title>
+  <meta name="description" content="Path+ Privacy Policy" />
+  <meta name="theme-color" content="#0A1F44" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,600;0,9..40,700;1,9..40,400&family=Fraunces:opsz,wght@9..144,500;9..144,600&display=swap" rel="stylesheet" />
+  <style>
+  :root {
+    --navy: #071933;
+    --navy-2: #0A1F44;
+    --ink: #13233f;
+    --muted: #5d6d88;
+    --line: rgba(10, 31, 68, 0.1);
+    --sand: #f3efe6;
+    --cream: #faf8f4;
+    --gold: #c9a84c;
+    --gold-soft: #e8d7a2;
+    --white: #ffffff;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    color: var(--ink);
+    background: var(--cream);
+    font-family: "DM Sans", system-ui, -apple-system, sans-serif;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: inherit; text-decoration: none; }
+  img { max-width: 100%; display: block; }
+  .container { width: min(1120px, calc(100% - 2.5rem)); margin: 0 auto; }
+  .site-header {
+    position: sticky; top: 0; z-index: 40;
+    backdrop-filter: blur(14px);
+    background: rgba(250, 248, 244, 0.86);
+    border-bottom: 1px solid var(--line);
+  }
+  .nav {
+    display: flex; align-items: center; justify-content: space-between;
+    min-height: 72px; gap: 1rem;
+  }
+  .brand {
+    display: inline-flex; align-items: center; gap: 0.7rem;
+    font-family: "Fraunces", Georgia, serif;
+    font-weight: 600; font-size: 1.35rem; letter-spacing: -0.03em;
+    color: var(--navy);
+  }
+  .brand-mark {
+    width: 34px; height: 34px; border-radius: 10px;
+    background: linear-gradient(145deg, var(--navy-2), #163a73);
+    color: var(--gold-soft);
+    display: inline-flex; align-items: center; justify-content: center;
+    font-family: "DM Sans", sans-serif; font-size: 0.78rem; font-weight: 700;
+  }
+  .nav-links { display: flex; align-items: center; gap: 0.35rem; flex-wrap: wrap; }
+  .nav-links a {
+    padding: 0.55rem 0.85rem; border-radius: 999px;
+    color: var(--muted); font-size: 0.92rem; font-weight: 600;
+  }
+  .nav-links a:hover, .nav-links a.active { color: var(--navy); background: rgba(10,31,68,0.05); }
+  .nav-cta {
+    background: var(--navy) !important; color: #fff !important;
+    margin-left: 0.35rem;
+  }
+  .nav-cta:hover { background: #12305f !important; }
+
+  .hero {
+    position: relative; min-height: min(92vh, 820px);
+    display: grid; align-items: end;
+    overflow: hidden;
+    background:
+      linear-gradient(180deg, rgba(7,25,51,0.18) 0%, rgba(7,25,51,0.72) 58%, rgba(7,25,51,0.92) 100%),
+      url("https://images.unsplash.com/photo-1529156069898-49953e39b3ac?auto=format&fit=crop&w=2000&q=80")
+      center/cover no-repeat;
+    color: #fff;
+  }
+  .hero-inner { padding: 5.5rem 0 4rem; }
+  .hero-kicker {
+    display: inline-block; margin-bottom: 1rem;
+    font-size: 0.78rem; font-weight: 700; letter-spacing: 0.16em; text-transform: uppercase;
+    color: var(--gold-soft);
+  }
+  .hero h1 {
+    margin: 0; max-width: 11ch;
+    font-family: "Fraunces", Georgia, serif;
+    font-size: clamp(3rem, 8vw, 5.4rem);
+    line-height: 0.95; letter-spacing: -0.04em; font-weight: 600;
+  }
+  .hero-lead {
+    margin: 1.25rem 0 0; max-width: 34rem;
+    font-size: 1.12rem; color: rgba(255,255,255,0.86);
+  }
+  .hero-actions { display: flex; flex-wrap: wrap; gap: 0.75rem; margin-top: 1.85rem; }
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-height: 48px; padding: 0.75rem 1.25rem; border-radius: 999px;
+    font-weight: 700; font-size: 0.95rem; border: 1px solid transparent;
+  }
+  .btn-primary { background: var(--gold); color: var(--navy); }
+  .btn-primary:hover { filter: brightness(1.05); }
+  .btn-ghost { background: transparent; color: #fff; border-color: rgba(255,255,255,0.35); }
+  .btn-ghost:hover { background: rgba(255,255,255,0.08); }
+  .btn-dark { background: var(--navy); color: #fff; }
+  .btn-outline {
+    background: transparent; color: var(--navy);
+    border-color: rgba(10,31,68,0.2);
+  }
+
+  .section { padding: 5rem 0; }
+  .section-tight { padding: 3.5rem 0; }
+  .eyebrow {
+    margin: 0 0 0.75rem;
+    font-size: 0.78rem; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--gold);
+  }
+  .section h2 {
+    margin: 0; font-family: "Fraunces", Georgia, serif;
+    font-size: clamp(1.9rem, 4vw, 2.8rem); letter-spacing: -0.03em; line-height: 1.1;
+    color: var(--navy);
+  }
+  .section-lead { margin: 0.9rem 0 0; max-width: 36rem; color: var(--muted); font-size: 1.05rem; }
+
+  .feature-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.25rem;
+    margin-top: 2.5rem;
+  }
+  .feature {
+    padding: 1.5rem 1.35rem 1.6rem;
+    border-top: 2px solid var(--navy);
+    background: linear-gradient(180deg, rgba(10,31,68,0.03), transparent);
+  }
+  .feature h3 {
+    margin: 0 0 0.55rem; font-family: "Fraunces", Georgia, serif;
+    font-size: 1.35rem; color: var(--navy); letter-spacing: -0.02em;
+  }
+  .feature p { margin: 0; color: var(--muted); }
+
+  .band {
+    background: var(--navy);
+    color: rgba(255,255,255,0.88);
+  }
+  .band h2 { color: #fff; }
+  .band .section-lead { color: rgba(255,255,255,0.7); }
+  .band-grid {
+    display: grid; grid-template-columns: 1.2fr 1fr; gap: 2rem; align-items: center;
+    margin-top: 1.5rem;
+  }
+  .band-points { display: grid; gap: 0.85rem; margin: 0; padding: 0; list-style: none; }
+  .band-points li {
+    padding-left: 1.4rem; position: relative;
+  }
+  .band-points li::before {
+    content: ""; position: absolute; left: 0; top: 0.55rem;
+    width: 0.55rem; height: 0.55rem; border-radius: 50%; background: var(--gold);
+  }
+
+  .page-hero {
+    padding: 3.5rem 0 2rem;
+    background:
+      radial-gradient(circle at 90% 10%, rgba(201,168,76,0.18), transparent 40%),
+      linear-gradient(180deg, #ebe6dc, var(--cream));
+  }
+  .page-hero h1 {
+    margin: 0.35rem 0 0;
+    font-family: "Fraunces", Georgia, serif;
+    font-size: clamp(2.2rem, 5vw, 3.4rem);
+    letter-spacing: -0.03em; color: var(--navy); line-height: 1.05;
+  }
+  .page-hero p { margin: 0.9rem 0 0; max-width: 40rem; color: var(--muted); font-size: 1.05rem; }
+
+  .tabs {
+    display: flex; gap: 0.4rem; flex-wrap: wrap; margin: 1.5rem 0 0;
+  }
+  .tabs a {
+    padding: 0.55rem 0.95rem; border-radius: 999px; font-weight: 700; font-size: 0.9rem;
+    color: var(--muted); background: rgba(10,31,68,0.04);
+  }
+  .tabs a.active { background: var(--navy); color: #fff; }
+
+  .legal-article, .support-panel {
+    background: var(--white);
+    border: 1px solid var(--line);
+    border-radius: 22px;
+    padding: clamp(1.4rem, 3vw, 2.4rem);
+    box-shadow: 0 18px 50px rgba(7, 25, 51, 0.05);
+  }
+  .legal-article h1 { display: none; }
+  .legal-article h2 {
+    margin: 1.7em 0 0.55em; font-family: "Fraunces", Georgia, serif;
+    font-size: 1.25rem; color: var(--navy); letter-spacing: -0.02em;
+  }
+  .legal-article h2:first-of-type { margin-top: 0.2em; }
+  .legal-article h3 { margin: 1.2em 0 0.4em; font-size: 1.02rem; color: var(--ink); }
+  .legal-article p { margin: 0.7em 0; }
+  .legal-article ul { margin: 0.5em 0 0.95em; padding-left: 1.2em; }
+  .legal-article li { margin: 0.35em 0; }
+  .legal-article a { color: #1a5fd0; text-decoration: underline; }
+
+  .support-grid {
+    display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 1.25rem;
+  }
+  .support-card {
+    padding: 1.35rem 1.3rem; border-radius: 18px;
+    border: 1px solid var(--line); background: #fff;
+  }
+  .support-card h3 {
+    margin: 0 0 0.45rem; font-family: "Fraunces", Georgia, serif;
+    font-size: 1.25rem; color: var(--navy);
+  }
+  .support-card p { margin: 0; color: var(--muted); }
+  .support-email {
+    display: inline-block; margin-top: 1rem;
+    font-size: 1.15rem; font-weight: 700; color: var(--navy);
+  }
+  .faq { margin-top: 1.5rem; display: grid; gap: 0.85rem; }
+  .faq details {
+    border: 1px solid var(--line); border-radius: 14px; padding: 0.95rem 1.05rem; background: #fff;
+  }
+  .faq summary {
+    cursor: pointer; font-weight: 700; color: var(--navy); list-style: none;
+  }
+  .faq summary::-webkit-details-marker { display: none; }
+  .faq details p { margin: 0.65rem 0 0; color: var(--muted); }
+
+  .site-footer {
+    margin-top: 3rem; padding: 2.5rem 0 2rem;
+    border-top: 1px solid var(--line); background: #efebe2;
+  }
+  .footer-grid {
+    display: grid; grid-template-columns: 1.4fr 1fr 1fr; gap: 1.5rem;
+  }
+  .footer-brand {
+    font-family: "Fraunces", Georgia, serif; font-size: 1.4rem; color: var(--navy);
+  }
+  .footer-copy { margin: 0.55rem 0 0; color: var(--muted); max-width: 28rem; }
+  .footer-col h4 {
+    margin: 0 0 0.7rem; font-size: 0.78rem; letter-spacing: 0.12em;
+    text-transform: uppercase; color: var(--muted);
+  }
+  .footer-col a { display: block; margin: 0.35rem 0; color: var(--navy); font-weight: 600; }
+  .footer-bottom {
+    margin-top: 1.75rem; padding-top: 1rem; border-top: 1px solid var(--line);
+    color: var(--muted); font-size: 0.88rem;
+    display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap;
+  }
+
+  @media (max-width: 900px) {
+    .feature-grid, .band-grid, .support-grid, .footer-grid { grid-template-columns: 1fr; }
+    .hero-inner { padding-top: 4.5rem; }
+  }
+</style>
+</head>
+<body>
+  <header class="site-header">
+    <div class="container nav">
+      <a class="brand" href="./index.html"><span class="brand-mark">P+</span> Path+</a>
+      <nav class="nav-links" aria-label="Primary">
+        <a href="./index.html" class="">Home</a>
+        <a href="./support.html" class="">Support</a>
+        <a href="./privacy.html" class="active">Privacy</a>
+        <a href="./terms.html" class="">Terms</a>
+        <a class="nav-cta" href="mailto:dev@pathplus.store">Contact</a>
+      </nav>
+    </div>
+  </header>
+  
+    <section class="page-hero">
+      <div class="container">
+        <p class="eyebrow">Legal Center</p>
+        <h1>Privacy Policy</h1>
+        <p>Managed from the Path+ control panel. Questions? <a href="mailto:dev@pathplus.store">dev@pathplus.store</a></p>
+        <nav class="tabs" aria-label="Legal pages">
+          <a href="./privacy.html" class="active">Privacy Policy</a>
+          <a href="./terms.html" class="">Terms of Service</a>
+          <a href="./support.html">Support</a>
+        </nav>
+      </div>
+    </section>
+    <section class="section-tight">
+      <div class="container">
+        <article class="legal-article">
+          <h1>Privacy Policy</h1>
+<p><strong>Effective date:</strong> June 2026 · <strong>Last updated:</strong> June 2026</p>
+<p>Path+ is a social app for sharing life moments with a close circle of friends. We care about your privacy and collect only what we need to run the app. This policy explains what we collect, how we use it, and the choices and rights you have — including how to delete your account and data at any time.</p>
+<h2>1. Who we are</h2>
+<p>Path+ (&quot;Path+&quot;, &quot;we&quot;, &quot;us&quot;, or &quot;our&quot;) is the data controller for the information described in this policy. Path+ is operated from the Kingdom of Saudi Arabia. If you have any questions about this policy or your data, contact us at <a href="mailto:privacy@pathplus.store">privacy@pathplus.store</a>.</p>
+<h2>2. Information we collect</h2>
+<p>We collect the following categories of information:</p>
+<h3>Information you provide</h3>
+<ul>
+<li><strong>Account details:</strong> your email address (used to sign in via a one-time code), your name, and your date of birth.</li>
+<li><strong>Profile content:</strong> your profile photo, cover photo, and any bio or details you add.</li>
+<li><strong>Content you post:</strong> photos, videos, text moments, reactions, comments, and messages you send to other users.</li>
+</ul>
+<h3>Information collected as you use Path+</h3>
+<ul>
+<li><strong>Location (only when you choose to):</strong> when you add a check-in to a moment, we use your device location to find nearby places and to save the location of the place you select. Location is used only for the check-in feature and only when you actively use it. You can deny or revoke location permission at any time in your device settings.</li>
+<li><strong>Friends and social graph:</strong> your friend connections, friend requests, and close-friends list.</li>
+<li><strong>Usage and device data:</strong> basic technical information needed to operate the app reliably, such as device type, app version, and diagnostic logs.</li>
+<li><strong>Notifications:</strong> a push notification token, if you enable notifications, so we can deliver alerts to your device.</li>
+</ul>
+<p><strong>What we do not collect:</strong> Path+ does not sell your personal data. We do not access your phone's contacts, and we do not run third-party advertising trackers inside the app.</p>
+<h2>3. How we use your information</h2>
+<p>We use your information to:</p>
+<ul>
+<li>Create and secure your account and sign you in.</li>
+<li>Show your moments, profile, and timeline to you and the friends you share them with.</li>
+<li>Deliver messages, friend requests, reactions, and notifications.</li>
+<li>Provide the check-in feature and show the correct place on the map.</li>
+<li>Keep Path+ safe — including reviewing reports, enforcing our rules, and preventing abuse.</li>
+<li>Fix bugs, improve performance, and understand how features are used.</li>
+<li>Comply with legal obligations.</li>
+</ul>
+<h2>4. How your information is shared</h2>
+<ul>
+<li><strong>With other users:</strong> content you post is shared with the audience you choose (your friends, your close friends, or the specific people a conversation includes). Your profile and moments are visible according to your settings.</li>
+<li><strong>With service providers:</strong> we use trusted third parties to run the app — for example, Supabase (database, authentication, and media storage), Resend (sending sign-in emails), and Google Places (finding locations for check-ins). These providers process data only to provide their service to us.</li>
+<li><strong>For legal reasons:</strong> we may disclose information if required by law, or to protect the rights, safety, and security of our users and Path+.</li>
+</ul>
+<h2>5. Data storage and security</h2>
+<p>We use industry-standard measures to protect your information, including encryption in transit, access controls, and database-level security rules that restrict data access to authorized requests only. No method of transmission or storage is completely secure, but we work continuously to protect your data and to limit what we store to what the app needs.</p>
+<h2>6. Your rights</h2>
+<p>In line with the Saudi Personal Data Protection Law (PDPL) and applicable regulations, you have the right to:</p>
+<ul>
+<li>Access the personal data we hold about you.</li>
+<li>Correct inaccurate or incomplete data (you can edit most details in the app).</li>
+<li>Delete your account and associated data (see section 7).</li>
+<li>Withdraw permissions you previously granted, such as location or notifications.</li>
+<li>Object to or restrict certain processing, where applicable.</li>
+</ul>
+<p>To exercise any of these rights, contact <a href="mailto:privacy@pathplus.store">privacy@pathplus.store</a>.</p>
+<h2>7. Account and data deletion</h2>
+<p>You can delete your Path+ account at any time directly in the app: go to <strong>Settings → Delete Account</strong>. Deleting your account permanently removes your profile, moments, messages, friend connections, and associated personal data from our systems. This action cannot be undone.</p>
+<p>If you are unable to access the app, you can request deletion by emailing <a href="mailto:privacy@pathplus.store">privacy@pathplus.store</a> from your registered email address, and we will process your request. Some limited information may be retained where required by law, and backups are cleared on a rolling schedule.</p>
+<h2>8. Children</h2>
+<p>Path+ is not intended for children under 13, and you must meet the minimum age required in your country to use the app. We do not knowingly collect personal data from children under this age. If we learn that we have, we will delete it. If you believe a child has provided us data, contact us at <a href="mailto:privacy@pathplus.store">privacy@pathplus.store</a>.</p>
+<h2>9. Changes to this policy</h2>
+<p>We may update this policy from time to time. When we make material changes, we will update the &quot;Last updated&quot; date above and, where appropriate, notify you in the app. Your continued use of Path+ after an update means you accept the revised policy.</p>
+<h2>10. Contact us</h2>
+<p>For any privacy question or request, email <a href="mailto:privacy@pathplus.store">privacy@pathplus.store</a>.</p>
+        </article>
+      </div>
+    </section>
+    
+  <footer class="site-footer">
+    <div class="container">
+      <div class="footer-grid">
+        <div>
+          <div class="footer-brand">Path+</div>
+          <p class="footer-copy">A private social space for sharing life moments with the people who matter most.</p>
+        </div>
+        <div class="footer-col">
+          <h4>Product</h4>
+          <a href="./index.html">Home</a>
+          <a href="./support.html">Support</a>
+        </div>
+        <div class="footer-col">
+          <h4>Legal</h4>
+          <a href="./privacy.html">Privacy Policy</a>
+          <a href="./terms.html">Terms of Service</a>
+        </div>
+      </div>
+      <div class="footer-bottom">
+        <span>© 2026 Path+. All rights reserved.</span>
+        <span>Support: <a href="mailto:dev@pathplus.store">dev@pathplus.store</a></span>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>
