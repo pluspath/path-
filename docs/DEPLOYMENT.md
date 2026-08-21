@@ -45,7 +45,8 @@ Backend `.env` must include existing production vars plus:
 ```env
 ADMIN_JWT_SECRET=<openssl rand -hex 48>
 ADMIN_JWT_EXPIRES_IN=8h
-ADMIN_CORS_ORIGIN=https://admin.yourdomain.com
+ADMIN_CORS_ORIGIN=https://admin.pathplus.store,http://admin.pathplus.store,http://localhost:3001,http://127.0.0.1:3001
+BACKEND_URL=https://api.pathplus.store
 ```
 
 Admin frontend `admin/.env.local` / production env:
@@ -55,6 +56,9 @@ Admin frontend `admin/.env.local` / production env:
 # and Next.js proxies to the API on 127.0.0.1:3000.
 # NEXT_PUBLIC_API_URL=
 
+# Or point the browser at the public API domain:
+NEXT_PUBLIC_API_URL=http://api.pathplus.store
+
 NEXT_PUBLIC_APP_NAME=Path+ Admin
 API_INTERNAL_URL=http://127.0.0.1:3000
 ```
@@ -62,8 +66,8 @@ API_INTERNAL_URL=http://127.0.0.1:3000
 If admin and API use **separate domains**, set the public API URL instead:
 
 ```env
-NEXT_PUBLIC_API_URL=https://api.yourdomain.com
-ADMIN_CORS_ORIGIN=https://admin.yourdomain.com
+NEXT_PUBLIC_API_URL=https://api.pathplus.store
+ADMIN_CORS_ORIGIN=https://admin.pathplus.store,http://admin.pathplus.store
 ```
 
 **Important:** `NEXT_PUBLIC_*` is baked in at `bun run build`. After changing it, rebuild the admin app.
@@ -114,35 +118,73 @@ curl -X POST "http://127.0.0.1:3001/api/admin/auth/login" \
   -d '{"username":"admin","password":"Admin@PathPlus2026!"}'
 ```
 
-## 4. Start with PM2
+## 4. Start with PM2 (keeps running continuously)
+
+PM2 auto-restarts on crash and can start again after a server reboot.
 
 ```bash
 cd /path/to/backend
+bash deploy/pm2-setup.sh
+```
+
+Or manually:
+
+```bash
+cd /path/to/backend
+bun run admin:build
 pm2 start ecosystem.config.cjs
 pm2 save
+pm2 startup          # copy/run the command it prints (once)
 pm2 status
 ```
 
 Processes:
 
-- `pathplus-api` → port **3000**
-- `pathplus-admin` → port **3001**
+- `pathplus-api` → port **3000** → http://api.pathplus.store
+- `pathplus-admin` → port **3001** → http://admin.pathplus.store
 
-## 5. Nginx
-
-Use `deploy/nginx.pathplus.conf` as a template.
-
-Point:
-
-- `api.yourdomain.com` → `127.0.0.1:3000`
-- `admin.yourdomain.com` → `127.0.0.1:3001`
-
-Enable TLS with Certbot.
-
-Update `ADMIN_CORS_ORIGIN` and `NEXT_PUBLIC_API_URL` accordingly, then restart:
+After code or `.env` changes:
 
 ```bash
-pm2 restart pathplus-api pathplus-admin
+pm2 restart all --update-env
+pm2 save
+```
+
+Check they stay up:
+
+```bash
+pm2 status
+pm2 logs --lines 50
+```
+
+## 5. Nginx + domains (api + admin)
+
+See **`deploy/DOMAINS.md`** for the full checklist.
+
+DNS A records:
+
+- `api.pathplus.store` → VPS IP
+- `admin.pathplus.store` → VPS IP
+
+Then on the VPS:
+
+```bash
+cd /path/to/backend
+sudo bash deploy/nginx-setup.sh
+# after DNS works:
+# sudo bash deploy/nginx-setup.sh --ssl
+```
+
+Nginx routes:
+
+- `api.pathplus.store` → `127.0.0.1:3000`
+- `admin.pathplus.store` → `127.0.0.1:3001`
+
+Update `ADMIN_CORS_ORIGIN` / `NEXT_PUBLIC_API_URL` if needed, then:
+
+```bash
+pm2 restart all --update-env
+pm2 save
 ```
 
 ## 6. Verify mobile compatibility

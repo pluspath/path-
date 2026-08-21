@@ -18,6 +18,8 @@ const files = [
   "migrations/003_posts_location_coords.sql",
   "migrations/004_rls_policies.sql",
   "migrations/005_storage_buckets.sql",
+  "migrations/006_social_features.sql",
+  "migrations/007_messages_columns.sql",
 ];
 
 async function applyViaDatabaseUrl(databaseUrl: string) {

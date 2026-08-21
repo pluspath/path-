@@ -3,11 +3,11 @@ import { zValidator } from "@hono/zod-validator";
 import { z } from "zod";
 import { Resend } from "resend";
 import { supabase, supabaseAdmin } from "../supabase";
+import { ensureJoinedPost } from "../lib/joined";
+import { isAdult } from "../lib/profileMeta";
 import { env } from "../env";
-import { authLimiter } from "../lib/rate-limit";
 
 const authRouter = new Hono();
-authRouter.use("*", authLimiter);
 
 // In-memory OTP store: email → { otp, expiry, username, fullName, password }
 const otpStore = new Map<string, { otp: string; expiry: number; username: string; fullName: string; password: string }>();
@@ -47,9 +47,16 @@ authRouter.post(
     password: z.string().min(6),
     username: z.string().min(3),
     fullName: z.string().min(1),
+    gender: z.enum(["Male", "Female"]),
+    birthday: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Invalid birthday"),
   })),
   async (c) => {
-    const { email, password, username, fullName } = c.req.valid("json");
+    const { email, password, username, fullName, gender, birthday } = c.req.valid("json");
+
+    // Age gate — must be 18 or older.
+    if (!isAdult(birthday)) {
+      return c.json({ error: { message: "You must be 18 or older to use Path+" } }, 400);
+    }
 
     // Create user in Supabase with email already confirmed (bypasses SMTP)
     const { data: userData, error: createError } = await supabaseAdmin.auth.admin.createUser({
@@ -84,19 +91,20 @@ authRouter.post(
     }
 
     // Upsert profile directly via supabaseAdmin (skip Prisma/SQLite entirely)
-    if (!userId) {
-      return c.json({ error: { message: "Account creation failed. Please try again." } }, 500);
-    }
+    if (userId) {
+      const { error: profileError } = await supabaseAdmin
+        .from("profiles")
+        .upsert(
+          { id: userId, username: username.toLowerCase().trim(), full_name: fullName, gender, birthday },
+          { onConflict: "id" }
+        );
+      if (profileError) {
+        console.error("[auth/signup] Failed to upsert profile:", profileError.message, profileError);
+      }
 
-    const { error: profileError } = await supabaseAdmin
-      .from("profiles")
-      .upsert(
-        { id: userId, username: username.toLowerCase().trim(), full_name: fullName },
-        { onConflict: "id" }
-      );
-    if (profileError) {
-      console.error("[auth/signup] Failed to upsert profile:", profileError.message, profileError);
-      return c.json({ error: { message: "Failed to create profile. Please try again." } }, 500);
+      // Give the new user their "Joined Path+" moment (the first/oldest item on
+      // their timeline), timestamped to now. Idempotent — never duplicates.
+      await ensureJoinedPost(userId, new Date().toISOString());
     }
 
     const otp = generateOTP();
@@ -178,22 +186,16 @@ authRouter.post(
     const key = email.toLowerCase();
     const existing = otpStore.get(key);
 
-    if (!existing) {
-      return c.json({ error: { message: "No signup in progress for this email. Please sign up first." } }, 400);
-    }
+    const fullName = existing?.fullName ?? "there";
+    const username = existing?.username ?? "";
+    const password = existing?.password ?? "";
 
     const otp = generateOTP();
     const expiry = Date.now() + 10 * 60 * 1000;
-    otpStore.set(key, {
-      otp,
-      expiry,
-      username: existing.username,
-      fullName: existing.fullName,
-      password: existing.password,
-    });
+    otpStore.set(key, { otp, expiry, username, fullName, password });
 
     try {
-      await sendOTPEmail(email, otp, existing.fullName);
+      await sendOTPEmail(email, otp, fullName);
     } catch (err: any) {
       console.error("[auth/resend-otp] Failed to send OTP email:", err.message);
       return c.json({ error: { message: "Failed to send verification email. Please try again." } }, 500);

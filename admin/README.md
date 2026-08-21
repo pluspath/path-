@@ -9,7 +9,7 @@ Next.js admin console for the Path+ Hono API.
 bun install
 cd admin
 bun install
-cp .env.local.example .env.local
+cp .env.example .env.local
 bun run dev
 ```
 
@@ -20,6 +20,9 @@ API:
 - Optional cross-origin: set `NEXT_PUBLIC_API_URL` to the public API base (rebuild required)
 
 ## Production
+
+- API: https://api.pathplus.store
+- Dashboard: https://admin.pathplus.store
 
 ```bash
 bun run build

@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { createUserClient } from "../supabase";
+import { getBlockedIds } from "../lib/blocks";
 import type { HonoVariables } from "../types";
 
 const notificationsRouter = new Hono<{ Variables: HonoVariables }>();
@@ -11,12 +12,18 @@ notificationsRouter.get("/", async (c) => {
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const userClient = createUserClient(token);
-  const { data: notifications } = await userClient
+  const { data: rawNotifications } = await userClient
     .from("notifications")
     .select("*")
     .eq("user_id", userId)
     .order("created_at", { ascending: false })
     .limit(50);
+
+  // Hide notifications originating from a blocked user (either direction).
+  const blockedSet = new Set(await getBlockedIds(userId));
+  const notifications = (rawNotifications ?? []).filter(
+    (n: any) => !n.from_user_id || !blockedSet.has(n.from_user_id)
+  );
 
   const fromUserIds = [...new Set((notifications ?? []).map((n: any) => n.from_user_id).filter(Boolean))];
   let profileMap: Record<string, any> = {};
@@ -63,7 +70,8 @@ notificationsRouter.get("/", async (c) => {
   });
 });
 
-/** POST /api/notifications/read-all — mark every notification as read */
+// Mark every unread notification for the current user as read (called when the
+// notifications screen/panel is opened, clearing the bell badge).
 notificationsRouter.post("/read-all", async (c) => {
   const user = c.get("user");
   const userId = c.get("userId");
@@ -71,37 +79,8 @@ notificationsRouter.post("/read-all", async (c) => {
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const userClient = createUserClient(token);
-  const { error } = await userClient
-    .from("notifications")
-    .update({ read: true })
-    .eq("user_id", userId)
-    .eq("read", false);
-
-  if (error) {
-    console.error("[notifications] read-all error:", error.message);
-    return c.json({ error: { message: "Failed to mark notifications as read" } }, 500);
-  }
-  return c.json({ data: { ok: true } });
-});
-
-/** GET /api/notifications/unread-count */
-notificationsRouter.get("/unread-count", async (c) => {
-  const user = c.get("user");
-  const userId = c.get("userId");
-  const token = c.get("accessToken");
-  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
-
-  const userClient = createUserClient(token);
-  const { count, error } = await userClient
-    .from("notifications")
-    .select("id", { count: "exact", head: true })
-    .eq("user_id", userId)
-    .eq("read", false);
-
-  if (error) {
-    return c.json({ data: { count: 0 } });
-  }
-  return c.json({ data: { count: count ?? 0 } });
+  await userClient.from("notifications").update({ read: true }).eq("user_id", userId).eq("read", false);
+  return c.body(null, 204);
 });
 
 notificationsRouter.post("/:id/read", async (c) => {
@@ -112,42 +91,7 @@ notificationsRouter.post("/:id/read", async (c) => {
 
   const { id } = c.req.param();
   const userClient = createUserClient(token);
-  const { data: updated, error } = await userClient
-    .from("notifications")
-    .update({ read: true })
-    .eq("id", id)
-    .eq("user_id", userId)
-    .select("id")
-    .maybeSingle();
-
-  if (error) {
-    console.error("[notifications] mark read error:", error.message);
-    return c.json({ error: { message: "Failed to mark notification as read" } }, 500);
-  }
-  if (!updated) {
-    return c.json({ error: { message: "Notification not found" } }, 404);
-  }
-  return c.body(null, 204);
-});
-
-/** DELETE /api/notifications/:id — dismiss notification */
-notificationsRouter.delete("/:id", async (c) => {
-  const user = c.get("user");
-  const userId = c.get("userId");
-  const token = c.get("accessToken");
-  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
-
-  const { id } = c.req.param();
-  const userClient = createUserClient(token);
-  const { error } = await userClient
-    .from("notifications")
-    .delete()
-    .eq("id", id)
-    .eq("user_id", userId);
-
-  if (error) {
-    return c.json({ error: { message: "Failed to dismiss notification" } }, 500);
-  }
+  await userClient.from("notifications").update({ read: true }).eq("id", id).eq("user_id", userId);
   return c.body(null, 204);
 });
 

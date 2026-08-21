@@ -6,7 +6,7 @@ import type { AdminJwtPayload } from "../types";
 
 function getSecret() {
   const secret = env.ADMIN_JWT_SECRET;
-  if (!secret) {
+  if (!secret || secret.length < 32) {
     throw new Error("ADMIN_JWT_SECRET is not configured");
   }
   return new TextEncoder().encode(secret);

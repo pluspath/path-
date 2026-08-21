@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { createUserClient, supabaseAdmin } from "../supabase";
 import { formatPost } from "./users";
 import { sanitizeSearchQuery } from "../lib/auth-helpers";
+import { env } from "../env";
 import type { HonoVariables } from "../types";
 
 const socialRouter = new Hono<{ Variables: HonoVariables }>();
@@ -113,13 +114,20 @@ socialRouter.post("/posts/:id/save", async (c) => {
   const { data: post } = await userClient.from("posts").select("id").eq("id", postId).maybeSingle();
   if (!post) return c.json({ error: { message: "Post not found" } }, 404);
 
+  // Prefer insert; treat unique conflict as already-saved success (avoids UPDATE RLS on upsert)
   const { error } = await userClient
     .from("saved_posts")
-    .upsert({ user_id: userId, post_id: postId }, { onConflict: "user_id,post_id" });
+    .insert({ user_id: userId, post_id: postId });
 
   if (error) {
-    console.error("[social] save error:", error.message);
-    return c.json({ error: { message: "Failed to save post" } }, 500);
+    const alreadySaved =
+      error.code === "23505" ||
+      error.message?.toLowerCase().includes("duplicate") ||
+      error.message?.toLowerCase().includes("unique");
+    if (!alreadySaved) {
+      console.error("[social] save error:", error.message);
+      return c.json({ error: { message: "Failed to save post" } }, 500);
+    }
   }
 
   return c.json({ data: { saved: true } });
@@ -171,7 +179,7 @@ socialRouter.post("/posts/:id/share", async (c) => {
     platform,
   });
 
-  const shareUrl = `${process.env.BACKEND_URL || ""}/share/post/${postId}`;
+  const shareUrl = `${env.BACKEND_URL}/share/post/${postId}`;
   const shareText = post.content
     ? `Check out this moment on Path+: ${String(post.content).slice(0, 120)}`
     : "Check out this moment on Path+";

@@ -1,9 +1,29 @@
 import { Hono } from "hono";
 import { createUserClient, supabaseAdmin } from "../supabase";
 import { sendPushNotification, getPushToken } from "../lib/push";
+import { ensureFriendshipMoments } from "../lib/systemMoments";
+import { getBlockedIds, isBlocked } from "../lib/blocks";
 import type { HonoVariables } from "../types";
 
 const friendsRouter = new Hono<{ Variables: HonoVariables }>();
+
+// Close friends ("starred" friends) are PRIVATE to the owner: a row in
+// `close_friends` means owner_id has starred friend_id. RLS restricts every
+// row to its owner, so the starred person is never notified and can't see it.
+// The table may not exist yet (the one-line SQL hasn't been run) — every read
+// here tolerates that and degrades to "no close friends".
+async function getCloseFriendIds(userClient: any, ownerId: string): Promise<Set<string>> {
+  try {
+    const { data, error } = await userClient
+      .from("close_friends")
+      .select("friend_id")
+      .eq("owner_id", ownerId);
+    if (error || !data) return new Set();
+    return new Set(data.map((r: any) => r.friend_id));
+  } catch {
+    return new Set();
+  }
+}
 
 function formatProfile(p: any) {
   return {
@@ -13,7 +33,9 @@ function formatProfile(p: any) {
     avatar: p.avatar_url ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${p.id}`,
     bio: p.bio ?? "",
     location: p.location ?? "",
-    birthday: p.birthday ?? "",
+    // Raw birthday is private — never exposed in friend lists / suggestions.
+    birthday: "",
+    gender: p.gender ?? "",
     coverPhoto: p.cover_url ?? "https://images.unsplash.com/photo-1519638399535-1b036603ac77?w=800",
     joinDate: p.created_at ?? new Date().toISOString(),
     friendCount: 0,
@@ -30,15 +52,29 @@ friendsRouter.get("/", async (c) => {
 
   const userClient = createUserClient(token);
 
+  // Blocked-in-either-direction ids are hidden from friends, requests, and
+  // suggestions throughout this response.
+  const blockedSet = new Set(await getBlockedIds(userId));
+
   const { data: acceptedFriendships } = await userClient
     .from("friendships")
     .select("id, requester_id, receiver_id")
     .eq("status", "accepted")
     .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`);
 
-  const friendIds = (acceptedFriendships ?? []).map((f: any) =>
-    f.requester_id === userId ? f.receiver_id : f.requester_id
-  );
+  const friendIds = (acceptedFriendships ?? [])
+    .map((f: any) => (f.requester_id === userId ? f.receiver_id : f.requester_id))
+    .filter((id: string) => !blockedSet.has(id));
+
+  // Map each friend's id -> the friendship row id, so the client can unfriend.
+  const friendshipIdByFriend: Record<string, string> = {};
+  for (const f of acceptedFriendships ?? []) {
+    const otherId = f.requester_id === userId ? f.receiver_id : f.requester_id;
+    friendshipIdByFriend[otherId] = f.id;
+  }
+
+  // Which of my friends I've privately starred as close friends.
+  const closeFriendSet = await getCloseFriendIds(userClient, userId);
 
   const { data: pendingFriendships } = await userClient
     .from("friendships")
@@ -46,7 +82,9 @@ friendsRouter.get("/", async (c) => {
     .eq("receiver_id", userId)
     .eq("status", "pending");
 
-  const pendingRequesterIds = (pendingFriendships ?? []).map((f: any) => f.requester_id);
+  const pendingRequesterIds = (pendingFriendships ?? [])
+    .map((f: any) => f.requester_id)
+    .filter((id: string) => !blockedSet.has(id));
 
   const { data: pendingSentFriendships } = await userClient
     .from("friendships")
@@ -64,105 +102,33 @@ friendsRouter.get("/", async (c) => {
     for (const p of profiles ?? []) profileMap[p.id] = p;
   }
 
-  const friends = friendIds.map((id: string) => profileMap[id]).filter(Boolean).map(formatProfile);
-  const requests = (pendingFriendships ?? []).map((f: any) => ({
-    id: f.id,
-    user: profileMap[f.requester_id] ? formatProfile(profileMap[f.requester_id]) : { id: f.requester_id, name: "Unknown" },
-    mutualFriends: 0,
-    createdAt: f.created_at,
-  }));
+  const friends = friendIds
+    .map((id: string) => profileMap[id])
+    .filter(Boolean)
+    .map((p: any) => ({
+      ...formatProfile(p),
+      friendshipStatus: "friends" as const,
+      friendshipId: friendshipIdByFriend[p.id],
+      // The star state — single source of truth, read from `close_friends`.
+      isCloseFriend: closeFriendSet.has(p.id),
+    }));
+  const requests = (pendingFriendships ?? [])
+    .filter((f: any) => !blockedSet.has(f.requester_id))
+    .map((f: any) => ({
+      id: f.id,
+      user: profileMap[f.requester_id] ? formatProfile(profileMap[f.requester_id]) : { id: f.requester_id, name: "Unknown" },
+      mutualFriends: 0,
+      createdAt: f.created_at,
+    }));
 
-  const { data: blocks } = await userClient
-    .from("user_blocks")
-    .select("blocked_id")
-    .eq("blocker_id", userId);
-  const blockedIds = (blocks ?? []).map((b: any) => b.blocked_id);
+  const excludeIds = [userId, ...friendIds, ...pendingRequesterIds, ...pendingSentIds, ...blockedSet];
+  const { data: suggested } = await userClient
+    .from("profiles")
+    .select("*")
+    .not("id", "in", `(${excludeIds.join(",")})`)
+    .limit(5);
 
-  const excludeIds = [userId, ...friendIds, ...pendingRequesterIds, ...pendingSentIds, ...blockedIds];
-
-  // Prefer suggestions who share mutual friends
-  let suggestedProfiles: any[] = [];
-  if (friendIds.length > 0) {
-    const { data: friendOfFriends } = await supabaseAdmin
-      .from("friendships")
-      .select("requester_id, receiver_id")
-      .eq("status", "accepted")
-      .or(friendIds.map((id) => `requester_id.eq.${id},receiver_id.eq.${id}`).join(","))
-      .limit(200);
-
-    const mutualCount: Record<string, number> = {};
-    const excludeSet = new Set(excludeIds);
-    for (const f of friendOfFriends ?? []) {
-      for (const candidate of [f.requester_id, f.receiver_id]) {
-        if (excludeSet.has(candidate) || friendIds.includes(candidate)) continue;
-        mutualCount[candidate] = (mutualCount[candidate] ?? 0) + 1;
-      }
-    }
-    const ranked = Object.entries(mutualCount)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 8)
-      .map(([id, count]) => ({ id, count }));
-
-    if (ranked.length > 0) {
-      const { data: profiles } = await userClient
-        .from("profiles")
-        .select("*")
-        .in(
-          "id",
-          ranked.map((r) => r.id)
-        );
-      const countMap = Object.fromEntries(ranked.map((r) => [r.id, r.count]));
-      suggestedProfiles = (profiles ?? [])
-        .map((p: any) => ({ ...formatProfile(p), mutualFriends: countMap[p.id] ?? 0 }))
-        .sort((a: any, b: any) => (b.mutualFriends ?? 0) - (a.mutualFriends ?? 0));
-    }
-  }
-
-  if (suggestedProfiles.length < 5) {
-    const already = new Set([
-      ...excludeIds,
-      ...suggestedProfiles.map((p: any) => p.id),
-    ]);
-    const { data: fallback } = await userClient
-      .from("profiles")
-      .select("*")
-      .not("id", "in", `(${[...already].join(",")})`)
-      .limit(8);
-    for (const p of fallback ?? []) {
-      if (suggestedProfiles.length >= 8) break;
-      suggestedProfiles.push({ ...formatProfile(p), mutualFriends: 0 });
-    }
-  }
-
-  // Enrich friend requests with mutual friend counts
-  const requestsWithMutual = await Promise.all(
-    requests.map(async (req: any) => {
-      try {
-        const { data: theirFriends } = await supabaseAdmin
-          .from("friendships")
-          .select("requester_id, receiver_id")
-          .eq("status", "accepted")
-          .or(`requester_id.eq.${req.user.id},receiver_id.eq.${req.user.id}`);
-        const theirIds = new Set(
-          (theirFriends ?? []).map((f: any) =>
-            f.requester_id === req.user.id ? f.receiver_id : f.requester_id
-          )
-        );
-        const mutualFriends = friendIds.filter((id) => theirIds.has(id)).length;
-        return { ...req, mutualFriends };
-      } catch {
-        return req;
-      }
-    })
-  );
-
-  return c.json({
-    data: {
-      friends,
-      requests: requestsWithMutual,
-      suggested: suggestedProfiles.slice(0, 8),
-    },
-  });
+  return c.json({ data: { friends, requests, suggested: (suggested ?? []).map(formatProfile) } });
 });
 
 friendsRouter.post("/request/:userId", async (c) => {
@@ -173,6 +139,11 @@ friendsRouter.post("/request/:userId", async (c) => {
 
   const { userId: targetId } = c.req.param();
   if (targetId === userId) return c.json({ error: { message: "Cannot friend yourself" } }, 400);
+
+  // Can't send a request to (or from) someone in a block relationship.
+  if (await isBlocked(userId, targetId)) {
+    return c.json({ error: { message: "Unable to send request" } }, 403);
+  }
 
   const userClient = createUserClient(token);
 
@@ -192,16 +163,18 @@ friendsRouter.post("/request/:userId", async (c) => {
 
   if (error) return c.json({ error: { message: "Failed to send request" } }, 500);
 
-  // Cross-user notification row — use service role (RLS targets recipient's user_id)
-  const { error: notifError } = await supabaseAdmin.from("notifications").insert({
-    user_id: targetId,
-    from_user_id: userId,
-    type: "friend_request",
-    message: `${user.full_name} sent you a friend request`,
-    read: false,
-  });
-  if (notifError) {
-    console.error("[notifications] friend_request insert error:", notifError.message);
+  // Insert the in-app notification with the admin client: the sender is
+  // writing a row owned by the recipient, which RLS on userClient blocks.
+  try {
+    await supabaseAdmin.from("notifications").insert({
+      user_id: targetId,
+      from_user_id: userId,
+      type: "friend_request",
+      message: `${user.full_name} sent you a friend request`,
+      read: false,
+    });
+  } catch (e) {
+    console.error("[notifications] friend_request insert error:", e);
   }
 
   // Send push notification to target user
@@ -229,36 +202,55 @@ friendsRouter.post("/accept/:id", async (c) => {
   const { id } = c.req.param();
   const userClient = createUserClient(token);
 
-  const { data: friendship } = await userClient.from("friendships").select("*").eq("id", id).maybeSingle();
+  const { data: friendship } = await userClient.from("friendships").select("*").eq("id", id).single();
   if (!friendship || friendship.receiver_id !== userId) {
     return c.json({ error: { message: "Not found" } }, 404);
   }
-  if (friendship.status !== "pending") {
-    return c.json({ error: { message: "Friend request is not pending" } }, 400);
-  }
 
-  const { data: updated, error: acceptError } = await userClient
+  const { data: updated } = await userClient
     .from("friendships")
     .update({ status: "accepted" })
     .eq("id", id)
-    .eq("status", "pending")
     .select()
     .single();
 
-  if (acceptError || !updated) {
-    console.error("[friends] accept error:", acceptError?.message);
-    return c.json({ error: { message: "Failed to accept request" } }, 500);
+  // Create the reciprocal "Became friends with X" system moments for both
+  // users, timestamped to this accept. Idempotent per pair.
+  await ensureFriendshipMoments(friendship.requester_id, userId);
+
+  // Notify the requester that their friend request was accepted. Use the
+  // admin client since this row is owned by the requester, not the accepter,
+  // and RLS on userClient would silently block the insert.
+  try {
+    await supabaseAdmin.from("notifications").insert({
+      user_id: friendship.requester_id,
+      from_user_id: userId,
+      type: "friend_accepted",
+      message: `${user.full_name} accepted your friend request`,
+      read: false,
+    });
+  } catch (e) {
+    console.error("[notifications] friend_accepted insert error:", e);
   }
 
-  const { error: notifError } = await supabaseAdmin.from("notifications").insert({
-    user_id: friendship.requester_id,
-    from_user_id: userId,
-    type: "friend_accepted",
-    message: `${user.full_name} accepted your friend request`,
-    read: false,
-  });
-  if (notifError) {
-    console.error("[notifications] friend_accepted insert error:", notifError.message);
+  // Also notify the ACCEPTER (this user) so BOTH people get a Notifications
+  // entry the moment the friendship forms — not just the requester.
+  try {
+    const { data: requesterProfile } = await supabaseAdmin
+      .from("profiles")
+      .select("full_name")
+      .eq("id", friendship.requester_id)
+      .maybeSingle();
+    const requesterName = requesterProfile?.full_name ?? "Someone";
+    await supabaseAdmin.from("notifications").insert({
+      user_id: userId,
+      from_user_id: friendship.requester_id,
+      type: "now_friends",
+      message: `You are now friends with ${requesterName}`,
+      read: false,
+    });
+  } catch (e) {
+    console.error("[notifications] now_friends insert error:", e);
   }
 
   try {
@@ -303,14 +295,13 @@ friendsRouter.get("/status/:userId", async (c) => {
     }
   }
 
-  // Target's full friend list requires service role (RLS only exposes caller's rows)
   const [currentUserFriendships, targetUserFriendships] = await Promise.all([
     userClient
       .from("friendships")
       .select("requester_id, receiver_id")
       .eq("status", "accepted")
       .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
-    supabaseAdmin
+    userClient
       .from("friendships")
       .select("requester_id, receiver_id")
       .eq("status", "accepted")
@@ -346,12 +337,65 @@ friendsRouter.delete("/:id", async (c) => {
     return c.json({ error: { message: "Unauthorized" } }, 403);
   }
 
-  const { error: deleteError } = await userClient.from("friendships").delete().eq("id", id);
-  if (deleteError) {
-    console.error("[friends] delete error:", deleteError.message);
-    return c.json({ error: { message: "Failed to remove friendship" } }, 500);
-  }
+  await userClient.from("friendships").delete().eq("id", id);
   return c.body(null, 204);
+});
+
+// GET /api/friends/close-ids — the ids of friends I've starred as close
+// friends. Single source of truth for the home timeline's STAR filter.
+// Returns [] (never errors) if the close_friends table isn't set up yet.
+friendsRouter.get("/close-ids", async (c) => {
+  const user = c.get("user");
+  const userId = c.get("userId");
+  const token = c.get("accessToken");
+  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const userClient = createUserClient(token);
+  const set = await getCloseFriendIds(userClient, userId);
+  return c.json({ data: Array.from(set) });
+});
+
+// POST /api/friends/close/:userId — privately star a friend as a close friend.
+// Idempotent (upsert). No notification is ever sent; the other person can't see it.
+friendsRouter.post("/close/:userId", async (c) => {
+  const user = c.get("user");
+  const userId = c.get("userId");
+  const token = c.get("accessToken");
+  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const { userId: targetId } = c.req.param();
+  if (targetId === userId) return c.json({ error: { message: "Cannot star yourself" } }, 400);
+
+  const userClient = createUserClient(token);
+  const { error } = await userClient
+    .from("close_friends")
+    .upsert({ owner_id: userId, friend_id: targetId }, { onConflict: "owner_id,friend_id" });
+
+  if (error) {
+    // Most likely the table hasn't been created yet — tell the client clearly.
+    if (/close_friends|relation|table|schema/i.test(error.message ?? "")) {
+      return c.json({ error: { message: "Close Friends isn't set up yet. Run the one-line SQL to enable it." } }, 400);
+    }
+    return c.json({ error: { message: "Failed to update close friend" } }, 500);
+  }
+  return c.json({ data: { isCloseFriend: true } });
+});
+
+// DELETE /api/friends/close/:userId — remove the private star.
+friendsRouter.delete("/close/:userId", async (c) => {
+  const user = c.get("user");
+  const userId = c.get("userId");
+  const token = c.get("accessToken");
+  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const { userId: targetId } = c.req.param();
+  const userClient = createUserClient(token);
+  await userClient
+    .from("close_friends")
+    .delete()
+    .eq("owner_id", userId)
+    .eq("friend_id", targetId);
+  return c.json({ data: { isCloseFriend: false } });
 });
 
 export { friendsRouter };

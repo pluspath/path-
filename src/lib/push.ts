@@ -36,10 +36,9 @@ export async function getPushToken(supabaseAdmin: any, userId: string): Promise<
   try {
     const { data } = await supabaseAdmin
       .from('profiles')
-      .select('push_token, push_notifications_enabled')
+      .select('push_token')
       .eq('id', userId)
       .single();
-    if (data?.push_notifications_enabled === false) return null;
     return data?.push_token ?? null;
   } catch {
     return null;

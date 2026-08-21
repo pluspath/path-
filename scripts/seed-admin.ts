@@ -1,15 +1,22 @@
 /**
  * Ensures the default Super Admin exists.
- * Usage: bun run scripts/seed-admin.ts
+ * Usage: ADMIN_DEFAULT_PASSWORD='...' bun run scripts/seed-admin.ts
  *
- * Password is read from ADMIN_DEFAULT_PASSWORD or the known default.
+ * Password must come from ADMIN_DEFAULT_PASSWORD (min 12 chars).
  * Only the bcrypt hash is stored in the database.
  */
 import { hashPassword } from "../src/admin/utils/password";
 import { adminUserRepository } from "../src/admin/repositories/admin-user.repository";
 
 const username = "admin";
-const password = process.env.ADMIN_DEFAULT_PASSWORD || "Admin@PathPlus2026!";
+const password = process.env.ADMIN_DEFAULT_PASSWORD;
+
+if (!password || password.length < 12) {
+  console.error(
+    "[seed-admin] Set ADMIN_DEFAULT_PASSWORD (min 12 characters) before seeding."
+  );
+  process.exit(1);
+}
 
 const hash = await hashPassword(password);
 const existing = await adminUserRepository.findByUsername(username);

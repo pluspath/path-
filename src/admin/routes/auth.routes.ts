@@ -10,6 +10,8 @@ import {
 import { authService, AuthError } from "../services/auth.service";
 import { adminAuthMiddleware, type AdminEnv } from "../middlewares/admin-auth";
 import { fail, ok } from "../utils/response";
+import { clientKey } from "../../lib/rate-limit";
+import { getAdminAuthReady } from "../services/ready.service";
 
 const authRoutes = new Hono<AdminEnv>();
 
@@ -17,20 +19,34 @@ const loginLimiter = rateLimiter({
   windowMs: 15 * 60 * 1000,
   limit: 20,
   standardHeaders: "draft-6",
-  keyGenerator: (c) => c.req.header("x-forwarded-for") ?? c.req.header("x-real-ip") ?? "anon",
+  keyGenerator: clientKey,
 });
+
+authRoutes.get("/ready", async (c) => ok(c, await getAdminAuthReady()));
 
 authRoutes.post("/login", loginLimiter, zValidator("json", loginSchema), async (c) => {
   try {
     const body = c.req.valid("json");
     const result = await authService.login(body.username, body.password, {
-      ip: c.req.header("x-forwarded-for") ?? undefined,
+      ip: clientKey(c),
       userAgent: c.req.header("user-agent") ?? undefined,
     });
     return ok(c, result);
   } catch (e) {
     if (e instanceof AuthError) return fail(c, e.message, e.status);
-    throw e;
+    const message = e instanceof Error ? e.message : String(e);
+    console.error("[admin] login failed:", message);
+    if (message.includes("ADMIN_JWT_SECRET")) {
+      return fail(c, "Admin JWT is not configured on the server. Set ADMIN_JWT_SECRET and restart.", 503);
+    }
+    if (message.includes("admin_users") || message.includes("schema cache")) {
+      return fail(
+        c,
+        "Admin tables are missing. Run migrations/001_admin_system.sql in the Supabase SQL Editor.",
+        503
+      );
+    }
+    return fail(c, "Login failed due to a server error. Check API logs.", 500);
   }
 });
 
