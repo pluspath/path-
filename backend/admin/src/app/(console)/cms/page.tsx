@@ -92,7 +92,7 @@ export default function CmsPage() {
       <PageHeader
         eyebrow="Content"
         title="CMS"
-        description="Edit published pages and legal content. Public site: www.pathplus.store (Privacy, Terms, Support)."
+        description="Edit published pages and legal content. Public site: site.pathplus.store (Privacy, Terms, Support)."
       />
 
       {loading ? (
@@ -120,11 +120,11 @@ export default function CmsPage() {
                     Public URL:{" "}
                     <a
                       className="font-medium text-blue-600 underline"
-                      href={`https://www.pathplus.store/${item.slug}`}
+                      href={`https://site.pathplus.store/${item.slug}`}
                       target="_blank"
                       rel="noreferrer"
                     >
-                      https://www.pathplus.store/{item.slug}
+                      https://site.pathplus.store/{item.slug}
                     </a>
                   </p>
                 ) : null}

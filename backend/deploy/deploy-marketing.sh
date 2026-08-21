@@ -75,8 +75,8 @@ if [[ "$fail" -ne 0 ]]; then
 fi
 
 echo "Done. Public URLs:"
-echo "  https://www.pathplus.store/"
-echo "  https://www.pathplus.store/support"
-echo "  https://www.pathplus.store/privacy"
-echo "  https://www.pathplus.store/terms"
+echo "  https://site.pathplus.store/"
+echo "  https://site.pathplus.store/support"
+echo "  https://site.pathplus.store/privacy"
+echo "  https://site.pathplus.store/terms"
 echo "  (fallback) https://api.pathplus.store/support"

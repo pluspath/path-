@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Connect marketing (www) + api + admin via Nginx.
+# Connect marketing (site) + api + admin via Nginx.
 # Run on the VPS as root (or with sudo):
 #   sudo bash deploy/nginx-setup.sh
 #   sudo bash deploy/nginx-setup.sh --ssl
@@ -35,7 +35,7 @@ if [[ ! -f "$CONF_SRC" ]]; then
 fi
 
 echo "==> Installing Nginx site for:"
-echo "    https://www.pathplus.store   → :3000 (marketing)"
+echo "    https://site.pathplus.store  → :3000 (marketing)"
 echo "    https://api.pathplus.store   → :3000"
 echo "    https://admin.pathplus.store → :3001"
 
@@ -66,6 +66,7 @@ if [[ "$ENABLE_SSL" -eq 1 ]]; then
   certbot --nginx \
     -d api.pathplus.store \
     -d admin.pathplus.store \
+    -d site.pathplus.store \
     -d www.pathplus.store \
     -d pathplus.store \
     --expand \
@@ -74,6 +75,7 @@ if [[ "$ENABLE_SSL" -eq 1 ]]; then
   certbot --nginx \
     -d api.pathplus.store \
     -d admin.pathplus.store \
+    -d site.pathplus.store \
     -d www.pathplus.store \
     -d pathplus.store \
     --expand --redirect
@@ -82,14 +84,14 @@ fi
 echo ""
 echo "Done. Test with HTTPS:"
 echo "  curl https://api.pathplus.store/health"
-echo "  curl -I https://www.pathplus.store/"
-echo "  curl -I https://www.pathplus.store/support"
+echo "  curl -I https://site.pathplus.store/"
+echo "  curl -I https://site.pathplus.store/support"
 echo "  curl -I https://admin.pathplus.store/"
 echo ""
 echo "Links:"
-echo "  Marketing: https://www.pathplus.store"
-echo "  Support:   https://www.pathplus.store/support"
-echo "  Privacy:   https://www.pathplus.store/privacy"
-echo "  Terms:     https://www.pathplus.store/terms"
+echo "  Marketing: https://site.pathplus.store"
+echo "  Support:   https://site.pathplus.store/support"
+echo "  Privacy:   https://site.pathplus.store/privacy"
+echo "  Terms:     https://site.pathplus.store/terms"
 echo "  API:       https://api.pathplus.store"
 echo "  Admin:     https://admin.pathplus.store"

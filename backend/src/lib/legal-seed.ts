@@ -160,7 +160,7 @@ These Terms are governed by the laws of the Kingdom of Saudi Arabia. Any dispute
 
 Questions about these Terms or safety on Path+? Email **dev@pathplus.store**.
 
-Published support page: https://www.pathplus.store/support
+Published support page: https://site.pathplus.store/support
 `;
 
 export const LEGAL_PAGES = [

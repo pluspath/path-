@@ -2,16 +2,17 @@
 
 | Host | URL | Purpose |
 |------|-----|---------|
-| **Marketing** | https://www.pathplus.store | App Store marketing site |
-| **Support** | https://www.pathplus.store/support | App Store Support URL |
-| **Privacy** | https://www.pathplus.store/privacy | App Store Privacy Policy URL |
-| **Terms** | https://www.pathplus.store/terms | Terms of Service / EULA |
+| **Marketing** | https://site.pathplus.store | App Store marketing site |
+| **Support** | https://site.pathplus.store/support | App Store Support URL |
+| **Privacy** | https://site.pathplus.store/privacy | App Store Privacy Policy URL |
+| **Terms** | https://site.pathplus.store/terms | Terms of Service / EULA |
 | **API** | https://api.pathplus.store | Mobile API |
 | **Admin** | https://admin.pathplus.store | Control panel |
 
 Nginx proxies:
 
-- `pathplus.store` / `www.pathplus.store` → `127.0.0.1:3000` (marketing + legal pages + API)
+- `site.pathplus.store` → `127.0.0.1:3000` (marketing + legal pages)
+- `pathplus.store` / `www.pathplus.store` → redirect to `site.pathplus.store`
 - `api.pathplus.store` → `127.0.0.1:3000`
 - `admin.pathplus.store` → `127.0.0.1:3001`
 
@@ -21,6 +22,7 @@ Nginx proxies:
 |------|------|--------|
 | A | `@` (apex) | your VPS public IP |
 | A | `www` | your VPS public IP |
+| A | `site` | your VPS public IP |
 | A | `api` | your VPS public IP |
 | A | `admin` | your VPS public IP |
 
@@ -37,7 +39,7 @@ bash deploy/pm2-setup.sh
 sudo bash deploy/nginx-setup.sh
 sudo bash deploy/nginx-setup.sh --ssl
 # Expand cert to include marketing hosts:
-sudo certbot --nginx -d api.pathplus.store -d admin.pathplus.store -d www.pathplus.store -d pathplus.store
+sudo certbot --nginx -d api.pathplus.store -d admin.pathplus.store -d site.pathplus.store -d www.pathplus.store -d pathplus.store
 ```
 
 If you see `conflicting server name "api.pathplus.store"`, remove the old duplicate and reload:
@@ -51,11 +53,11 @@ sudo nginx -t && sudo systemctl reload nginx
 
 Use these in App Store Connect:
 
-- **Marketing URL:** `https://www.pathplus.store`
-- **Support URL:** `https://www.pathplus.store/support`
-- **Privacy Policy URL:** `https://www.pathplus.store/privacy`
+- **Marketing URL:** `https://site.pathplus.store`
+- **Support URL:** `https://site.pathplus.store/support`
+- **Privacy Policy URL:** `https://site.pathplus.store/privacy`
 
-Until DNS/nginx for `www` is live, the same pages are also available on the API host:
+Until DNS/nginx for `site` is live, the same pages are also available on the API host:
 
 - https://api.pathplus.store/
 - https://api.pathplus.store/support
@@ -68,10 +70,10 @@ Until DNS/nginx for `www` is live, the same pages are also available on the API 
 curl https://api.pathplus.store/health
 # {"status":"ok"}
 
-curl -I https://www.pathplus.store/
+curl -I https://site.pathplus.store/
 # HTTP 200
 
-curl -I https://www.pathplus.store/support
+curl -I https://site.pathplus.store/support
 # HTTP 200
 
 curl -I https://admin.pathplus.store/
