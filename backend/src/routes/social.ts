@@ -105,7 +105,7 @@ socialRouter.get("/saved", async (c) => {
   return c.json({ data: ordered });
 });
 
-/** GET /api/social/liked-moments — current user's posts that others have reacted to or commented on */
+/** GET /api/social/liked-moments — moments the current user has reacted to */
 socialRouter.get("/liked-moments", async (c) => {
   const user = c.get("user");
   const userId = c.get("userId");
@@ -113,32 +113,53 @@ socialRouter.get("/liked-moments", async (c) => {
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const userClient = createUserClient(token);
+
+  // Every post this user reacted to, most-recent reaction first.
+  const { data: myReactions } = await supabaseAdmin
+    .from("reactions")
+    .select("post_id, created_at")
+    .eq("user_id", userId)
+    .order("created_at", { ascending: false });
+
+  const orderedPostIds: string[] = [];
+  const seen = new Set<string>();
+  for (const r of myReactions ?? []) {
+    const pid = (r as any).post_id as string | undefined;
+    if (pid && !seen.has(pid)) {
+      seen.add(pid);
+      orderedPostIds.push(pid);
+    }
+  }
+  if (orderedPostIds.length === 0) return c.json({ data: [] });
+
+  // Same privacy boundary as the home feed: self + accepted friends, minus blocked.
   const blockedIds = await getBlockedIds(userId);
   const blockedSet = new Set(blockedIds);
 
-  const { data: posts, error } = await userClient
+  const { data: friendships } = await userClient
+    .from("friendships")
+    .select("requester_id, receiver_id")
+    .eq("status", "accepted")
+    .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`);
+
+  const friendIds = (friendships ?? []).map((f: any) =>
+    f.requester_id === userId ? f.receiver_id : f.requester_id
+  );
+  const allowedUserIds = Array.from(new Set([userId, ...friendIds])).filter(
+    (id) => id === userId || !blockedSet.has(id)
+  );
+
+  const { data: posts } = await userClient
     .from("posts")
     .select(POST_SELECT)
-    .eq("user_id", userId)
-    .order("created_at", { ascending: false })
-    .limit(100);
+    .in("id", orderedPostIds)
+    .in("user_id", allowedUserIds);
 
-  if (error) {
-    console.warn("[social/liked-moments]", error.message);
-    return c.json({ data: [] });
-  }
-
-  const interacted = (posts ?? []).filter((p: any) => {
-    const reactions = Array.isArray(p.reactions) ? p.reactions : [];
-    const othersReacted = reactions.some(
-      (r: any) => r.user_id !== userId && !blockedSet.has(r.user_id)
-    );
-    const hasComments = Number(p.comment_count ?? 0) > 0;
-    return othersReacted || hasComments;
-  });
+  const byId = new Map((posts ?? []).map((p: any) => [p.id, p]));
+  const ordered = orderedPostIds.map((id) => byId.get(id)).filter(Boolean);
 
   return c.json({
-    data: interacted.map((p: any) => formatPost(p, userId, blockedIds)),
+    data: ordered.map((p: any) => formatPost(p, userId, blockedIds)),
   });
 });
 
