@@ -11,7 +11,11 @@ configRouter.get("/", (c) => {
   return c.json({
     data: {
       appName: "Path+",
-      supportEmail: "support@pathplus.store",
+      supportEmail: "dev@pathplus.store",
+      supportUrl: "https://www.pathplus.store/support",
+      marketingUrl: "https://www.pathplus.store",
+      privacyUrl: "https://www.pathplus.store/privacy",
+      termsUrl: "https://www.pathplus.store/terms",
       minAppVersion: "1.0.0",
       supabaseUrl: env.SUPABASE_URL,
       supabaseAnonKey: env.SUPABASE_ANON_KEY,

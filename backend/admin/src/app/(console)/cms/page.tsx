@@ -89,7 +89,11 @@ export default function CmsPage() {
 
   return (
     <div className="space-y-6 animate-fade-up">
-      <PageHeader eyebrow="Content" title="CMS" description="Edit published pages and legal content" />
+      <PageHeader
+        eyebrow="Content"
+        title="CMS"
+        description="Edit published pages and legal content. Public site: www.pathplus.store (Privacy, Terms, Support)."
+      />
 
       {loading ? (
         <LoadingState />
@@ -111,6 +115,19 @@ export default function CmsPage() {
               <CardContent className="space-y-3">
                 <p className="line-clamp-3 text-sm text-slate-500">{item.body || "No body yet."}</p>
                 <p className="text-xs text-slate-400">Updated {formatDate(item.updated_at || item.created_at)}</p>
+                {(item.slug === "privacy" || item.slug === "terms") && item.is_published ? (
+                  <p className="break-all text-xs text-slate-500">
+                    Public URL:{" "}
+                    <a
+                      className="font-medium text-blue-600 underline"
+                      href={`https://www.pathplus.store/${item.slug}`}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      https://www.pathplus.store/{item.slug}
+                    </a>
+                  </p>
+                ) : null}
                 {hasPermission("cms:write") && (
                   <Button size="sm" variant="outline" onClick={() => void openEdit(item.slug)}>
                     Edit
@@ -133,7 +150,7 @@ export default function CmsPage() {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => setSelectedSlug(null)}>
           <Card className="max-h-[90vh] w-full max-w-2xl overflow-y-auto" onClick={(e) => e.stopPropagation()}>
             <CardHeader>
-              <CardTitle>Edit آ· {selectedSlug}</CardTitle>
+              <CardTitle>Edit · {selectedSlug}</CardTitle>
             </CardHeader>
             <CardContent className="space-y-3">
               <div className="space-y-1.5">

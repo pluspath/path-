@@ -14,6 +14,7 @@ import { configRouter } from "./routes/config";
 import { socialRouter } from "./routes/social";
 import { reportsRouter } from "./routes/reports";
 import { blocksRouter } from "./routes/blocks";
+import { contentRouter, legalPagesRouter, seedLegalContent } from "./routes/content";
 import { adminRouter } from "./admin/routes";
 import { bootstrapAdminSystem } from "./admin/bootstrap";
 import { apiLimiter } from "./lib/rate-limit";
@@ -147,9 +148,11 @@ app.use("*", cors({
 }));
 
 // Bootstrap admin tables/seed (idempotent; never touches mobile auth)
-bootstrapAdminSystem().catch((err) => {
-  console.warn("[admin] bootstrap error:", err instanceof Error ? err.message : err);
-});
+bootstrapAdminSystem()
+  .then(() => seedLegalContent())
+  .catch((err) => {
+    console.warn("[admin] bootstrap error:", err instanceof Error ? err.message : err);
+  });
 
 app.use("*", logger());
 app.use("/api/admin/*", secureHeadersMiddleware);
@@ -272,6 +275,8 @@ app.get("/api/admin/auth/ready", async (c) => {
   return app.fetch(new Request(url.toString(), c.req.raw));
 });
 
+app.route("/", legalPagesRouter);
+app.route("/api/content", contentRouter);
 app.route("/api/config", configRouter);
 app.route("/api/auth", authRouter);
 app.route("/api/posts", postsRouter);
