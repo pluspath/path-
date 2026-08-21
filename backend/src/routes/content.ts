@@ -55,34 +55,44 @@ async function serveLegalHtml(slug: "privacy" | "terms") {
   });
 }
 
-/** Public marketing + legal HTML pages (App Store URLs). */
+/**
+ * Register marketing HTML pages directly on the main app.
+ * Prefer this over `app.route("/", legalPagesRouter)` — nested `/` mounts
+ * can silently 404 on some Bun/Hono production setups.
+ */
+export function registerMarketingPages(app: Hono) {
+  app.get("/", (c) => c.html(renderMarketingHome()));
+
+  app.get("/support", (c) => c.html(renderSupportPage()));
+
+  app.get("/privacy", async (c) => {
+    const html = await serveLegalHtml("privacy");
+    if (!html) return c.text("Privacy Policy is not published yet.", 404);
+    return c.html(html);
+  });
+
+  app.get("/terms", async (c) => {
+    const html = await serveLegalHtml("terms");
+    if (!html) return c.text("Terms of Service are not published yet.", 404);
+    return c.html(html);
+  });
+
+  app.get("/legal", (c) => c.redirect("/privacy", 302));
+
+  app.get("/legal/:slug", (c) => {
+    const slug = c.req.param("slug");
+    if (!PUBLIC_LEGAL_SLUGS.has(slug)) {
+      return c.text("Not found", 404);
+    }
+    return c.redirect(`/${slug}`, 302);
+  });
+
+  console.log("[marketing] pages registered: / /support /privacy /terms");
+}
+
+/** @deprecated Prefer registerMarketingPages(app) — kept for older deploy scripts. */
 export const legalPagesRouter = new Hono();
-
-legalPagesRouter.get("/", (c) => c.html(renderMarketingHome()));
-
-legalPagesRouter.get("/support", (c) => c.html(renderSupportPage()));
-
-legalPagesRouter.get("/privacy", async (c) => {
-  const html = await serveLegalHtml("privacy");
-  if (!html) return c.text("Privacy Policy is not published yet.", 404);
-  return c.html(html);
-});
-
-legalPagesRouter.get("/terms", async (c) => {
-  const html = await serveLegalHtml("terms");
-  if (!html) return c.text("Terms of Service are not published yet.", 404);
-  return c.html(html);
-});
-
-legalPagesRouter.get("/legal", async (c) => c.redirect("/privacy", 302));
-
-legalPagesRouter.get("/legal/:slug", async (c) => {
-  const slug = c.req.param("slug");
-  if (!PUBLIC_LEGAL_SLUGS.has(slug)) {
-    return c.text("Not found", 404);
-  }
-  return c.redirect(`/${slug}`, 302);
-});
+registerMarketingPages(legalPagesRouter);
 
 /**
  * Upserts full legal copy into CMS when rows are missing or still placeholders.

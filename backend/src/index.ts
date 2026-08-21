@@ -13,7 +13,11 @@ import { moderationRouter } from "./routes/moderation";
 import { authRouter } from "./routes/auth";
 import { configRouter } from "./routes/config";
 import { socialRouter } from "./routes/social";
-import { contentRouter, legalPagesRouter, seedLegalContent } from "./routes/content";
+import {
+  contentRouter,
+  registerMarketingPages,
+  seedLegalContent,
+} from "./routes/content";
 import { adminRouter } from "./admin/routes";
 import { bootstrapAdminSystem } from "./admin/bootstrap";
 import { apiLimiter } from "./lib/rate-limit";
@@ -289,7 +293,7 @@ app.get("/api/admin/auth/ready", async (c) => {
   return app.fetch(new Request(url.toString(), c.req.raw));
 });
 
-app.route("/", legalPagesRouter);
+registerMarketingPages(app);
 app.route("/api/content", contentRouter);
 app.route("/api/config", configRouter);
 app.route("/api/auth", authRouter);
