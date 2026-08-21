@@ -114,12 +114,17 @@ socialRouter.get("/liked-moments", async (c) => {
 
   const userClient = createUserClient(token);
 
-  // Every post this user reacted to, most-recent reaction first.
-  const { data: myReactions } = await supabaseAdmin
+  // Do not select/order reactions.created_at — older DBs may lack that column,
+  // which made PostgREST fail and the Liked tab show nothing.
+  const { data: myReactions, error: reactionsError } = await supabaseAdmin
     .from("reactions")
-    .select("post_id, created_at")
-    .eq("user_id", userId)
-    .order("created_at", { ascending: false });
+    .select("post_id")
+    .eq("user_id", userId);
+
+  if (reactionsError) {
+    console.error("[social/liked-moments] reactions query failed:", reactionsError.message);
+    return c.json({ error: { message: "Failed to load liked moments" } }, 500);
+  }
 
   const orderedPostIds: string[] = [];
   const seen = new Set<string>();
@@ -145,21 +150,30 @@ socialRouter.get("/liked-moments", async (c) => {
   const friendIds = (friendships ?? []).map((f: any) =>
     f.requester_id === userId ? f.receiver_id : f.requester_id
   );
-  const allowedUserIds = Array.from(new Set([userId, ...friendIds])).filter(
-    (id) => id === userId || !blockedSet.has(id)
+  const allowedUserIds = new Set(
+    Array.from(new Set([userId, ...friendIds])).filter(
+      (id) => id === userId || !blockedSet.has(id)
+    )
   );
 
-  const { data: posts } = await userClient
+  const { data: posts, error: postsError } = await supabaseAdmin
     .from("posts")
     .select(POST_SELECT)
-    .in("id", orderedPostIds)
-    .in("user_id", allowedUserIds);
+    .in("id", orderedPostIds);
 
-  const byId = new Map((posts ?? []).map((p: any) => [p.id, p]));
-  const ordered = orderedPostIds.map((id) => byId.get(id)).filter(Boolean);
+  if (postsError) {
+    console.error("[social/liked-moments] posts query failed:", postsError.message);
+    return c.json({ error: { message: "Failed to load liked moments" } }, 500);
+  }
+
+  const visible = (posts ?? []).filter((p: any) => allowedUserIds.has(p.user_id));
+  visible.sort(
+    (a: any, b: any) =>
+      new Date(b.created_at ?? 0).getTime() - new Date(a.created_at ?? 0).getTime()
+  );
 
   return c.json({
-    data: ordered.map((p: any) => formatPost(p, userId, blockedIds)),
+    data: visible.map((p: any) => formatPost(p, userId, blockedIds)),
   });
 });
 

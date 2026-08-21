@@ -220,10 +220,12 @@ postsRouter.get("/hashtag/:tag", async (c) => {
 });
 
 // GET /api/posts/reacted — moments the CURRENT user has reacted to (any
-// reaction they themselves gave), newest-reaction-first. Respects the SAME
-// privacy boundary as the home feed: only moments the viewer can still access
-// (their own + accepted friends'). Declared before "/:id" so it isn't captured
-// as an id.
+// reaction they themselves gave). Respects the SAME privacy boundary as the
+// home feed: only moments the viewer can still access (their own + accepted
+// friends'). Declared before "/:id" so it isn't captured as an id.
+//
+// IMPORTANT: do NOT order/select reactions.created_at — older DBs never had
+// that column, and PostgREST then returns an error (silent empty Liked tab).
 postsRouter.get("/reacted", async (c) => {
   const user = c.get("user");
   const userId = c.get("userId");
@@ -232,18 +234,22 @@ postsRouter.get("/reacted", async (c) => {
 
   const userClient = createUserClient(token);
 
-  // Every post this user reacted to, most-recent reaction first.
-  const { data: myReactions } = await supabaseAdmin
+  const { data: myReactions, error: reactionsError } = await supabaseAdmin
     .from("reactions")
-    .select("post_id, created_at")
-    .eq("user_id", userId)
-    .order("created_at", { ascending: false });
+    .select("post_id")
+    .eq("user_id", userId);
 
-  // Distinct post ids, preserving reaction-recency order.
+  if (reactionsError) {
+    console.error("[posts/reacted] reactions query failed:", reactionsError.message);
+    return c.json({ error: { message: "Failed to load liked moments" } }, 500);
+  }
+
+  // Distinct post ids (stable order — reaction table has no reliable timestamp
+  // on older schemas; we sort by post.created_at below).
   const orderedPostIds: string[] = [];
   const seen = new Set<string>();
   for (const r of myReactions ?? []) {
-    const pid = (r as any).post_id;
+    const pid = (r as any).post_id as string | undefined;
     if (pid && !seen.has(pid)) {
       seen.add(pid);
       orderedPostIds.push(pid);
@@ -254,23 +260,34 @@ postsRouter.get("/reacted", async (c) => {
   // Same privacy boundary as the feed (self + accepted friends), minus blocked.
   const blockedIds = await getBlockedIds(userId);
   const blockedSet = new Set(blockedIds);
-  const allowedUserIds = (await getAllowedAuthorIds(userClient, userId)).filter(
-    (id) => id === userId || !blockedSet.has(id)
+  const allowedUserIds = new Set(
+    (await getAllowedAuthorIds(userClient, userId)).filter(
+      (id) => id === userId || !blockedSet.has(id)
+    )
   );
 
-  const { data: posts } = await userClient
+  // Fetch by id via service role so a missing/partial posts RLS policy can't
+  // silently drop liked moments; privacy is enforced in JS below.
+  const { data: posts, error: postsError } = await supabaseAdmin
     .from("posts")
     .select(POST_SELECT)
-    .in("id", orderedPostIds)
-    .in("user_id", allowedUserIds);
+    .in("id", orderedPostIds);
 
-  await attachOriginals(userClient, posts ?? []);
+  if (postsError) {
+    console.error("[posts/reacted] posts query failed:", postsError.message);
+    return c.json({ error: { message: "Failed to load liked moments" } }, 500);
+  }
 
-  // Re-order the fetched posts to match reaction recency.
-  const byId = new Map((posts ?? []).map((p: any) => [p.id, p]));
-  const ordered = orderedPostIds.map((id) => byId.get(id)).filter(Boolean);
+  const visible = (posts ?? []).filter((p: any) => allowedUserIds.has(p.user_id));
+  await attachOriginals(userClient, visible);
 
-  return c.json({ data: ordered.map((p) => formatPost(p, userId, blockedIds)) });
+  // Newest moments first (post time — reliable across schemas).
+  visible.sort(
+    (a: any, b: any) =>
+      new Date(b.created_at ?? 0).getTime() - new Date(a.created_at ?? 0).getTime()
+  );
+
+  return c.json({ data: visible.map((p: any) => formatPost(p, userId, blockedIds)) });
 });
 
 postsRouter.get("/:id", async (c) => {
@@ -516,13 +533,13 @@ postsRouter.post("/:id/reactions", async (c) => {
   // The client always sends a plain emoji; normalize defensively.
   const incoming = baseReactionType(type);
 
-  // Use admin client to bypass RLS and safely handle any existing duplicates
+  // Use admin client to bypass RLS and safely handle any existing duplicates.
+  // Avoid ordering by created_at — that column is missing on older schemas.
   const { data: existing } = await supabaseAdmin
     .from("reactions")
     .select("id, type")
     .eq("post_id", id)
     .eq("user_id", userId)
-    .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
 

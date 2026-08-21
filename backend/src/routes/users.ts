@@ -378,14 +378,24 @@ usersRouter.put("/me", async (c) => {
   if (body.avatar !== undefined) updateData.avatar_url = body.avatar;
   if (body.push_token !== undefined) updateData.push_token = body.push_token;
 
-  const { data: updated, error } = await userClient
+  if (Object.keys(updateData).length === 0) {
+    return c.json({ error: { message: "No fields to update" } }, 400);
+  }
+
+  // Use service role for profile writes so missing/strict UPDATE policies (and
+  // newly-added columns like show_age / show_zodiac) cannot silently block the
+  // age & zodiac visibility toggles after the caller is already authenticated.
+  const { data: updated, error } = await supabaseAdmin
     .from("profiles")
     .update(updateData)
     .eq("id", userId)
     .select()
     .single();
 
-  if (error) return c.json({ error: { message: "Update failed" } }, 500);
+  if (error) {
+    console.error("[users] PUT /me failed:", error.message, error.code);
+    return c.json({ error: { message: "Update failed" } }, 500);
+  }
 
   // Auto-create system moments when the avatar / cover photo ACTUALLY changes.
   // We compare against the values the profile had before this update.

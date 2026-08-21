@@ -42,6 +42,8 @@ const app = new Hono<{ Variables: HonoVariables }>();
         "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS email_notifications_enabled BOOLEAN NOT NULL DEFAULT FALSE;",
         "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS location_lat DOUBLE PRECISION;",
         "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS location_lng DOUBLE PRECISION;",
+        // Liked Moments queries / reaction toggles — optional timestamp (older DBs lacked it)
+        "ALTER TABLE public.reactions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();",
         // Messages: align API fields (content/image_url/type) with legacy text/image schema
         "ALTER TABLE public.messages ADD COLUMN IF NOT EXISTS content TEXT;",
         "ALTER TABLE public.messages ADD COLUMN IF NOT EXISTS image_url TEXT;",
