@@ -327,15 +327,19 @@ usersRouter.post("/set-gender", async (c) => {
     return c.json({ error: { message: "Gender already set" } }, 409);
   }
 
-  const userClient = createUserClient(token);
-  const { data: updated, error } = await userClient
+  // Use service role so a missing/strict profiles UPDATE policy cannot block
+  // this one-time write after we have already authenticated the caller.
+  const { data: updated, error } = await supabaseAdmin
     .from("profiles")
     .update({ gender })
     .eq("id", userId)
     .select()
     .single();
 
-  if (error) return c.json({ error: { message: "Failed to set gender" } }, 500);
+  if (error) {
+    console.error("[users] set-gender failed:", error.message);
+    return c.json({ error: { message: "Failed to set gender" } }, 500);
+  }
   return c.json({ data: formatProfile(updated, 0, 0, userId) });
 });
 
