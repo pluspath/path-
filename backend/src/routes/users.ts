@@ -19,6 +19,17 @@ function formatProfile(p: any, postCount = 0, friendCount = 0, viewerId?: string
   const showZodiac = p.show_zodiac ?? false;
   const age = computeAge(p.birthday);
   const zodiac = computeZodiac(p.birthday);
+
+  // Profile section privacy (friends list / posts / moments).
+  const privacy = {
+    showFriendsToFriends: p.show_friends_to_friends ?? true,
+    showFriendsToOthers: p.show_friends_to_others ?? false,
+    showPostsToFriends: p.show_posts_to_friends ?? true,
+    showPostsToOthers: p.show_posts_to_others ?? true,
+    showMomentsToFriends: p.show_moments_to_friends ?? true,
+    showMomentsToOthers: p.show_moments_to_others ?? true,
+  };
+
   return {
     id: p.id,
     name: p.full_name ?? "",
@@ -43,7 +54,19 @@ function formatProfile(p: any, postCount = 0, friendCount = 0, viewerId?: string
     usernameChanged: p.username_changed ?? false,
     pushNotificationsEnabled: p.push_notifications_enabled ?? true,
     emailNotificationsEnabled: p.email_notifications_enabled ?? false,
+    preferredLanguage: p.preferred_language === "ar" ? "ar" : "en",
+    ...privacy,
   };
+}
+
+function canViewSection(
+  isOwner: boolean,
+  isFriend: boolean,
+  toFriends: boolean,
+  toOthers: boolean
+): boolean {
+  if (isOwner) return true;
+  return isFriend ? toFriends : toOthers;
 }
 
 // ─── Reaction privacy lock ────────────────────────────────────────
@@ -388,6 +411,15 @@ usersRouter.put("/me", async (c) => {
   if (body.emailNotificationsEnabled !== undefined) {
     updateData.email_notifications_enabled = Boolean(body.emailNotificationsEnabled);
   }
+  if (body.preferredLanguage !== undefined) {
+    updateData.preferred_language = body.preferredLanguage === "ar" ? "ar" : "en";
+  }
+  if (body.showFriendsToFriends !== undefined) updateData.show_friends_to_friends = !!body.showFriendsToFriends;
+  if (body.showFriendsToOthers !== undefined) updateData.show_friends_to_others = !!body.showFriendsToOthers;
+  if (body.showPostsToFriends !== undefined) updateData.show_posts_to_friends = !!body.showPostsToFriends;
+  if (body.showPostsToOthers !== undefined) updateData.show_posts_to_others = !!body.showPostsToOthers;
+  if (body.showMomentsToFriends !== undefined) updateData.show_moments_to_friends = !!body.showMomentsToFriends;
+  if (body.showMomentsToOthers !== undefined) updateData.show_moments_to_others = !!body.showMomentsToOthers;
 
   if (Object.keys(updateData).length === 0) {
     return c.json({ error: { message: "No fields to update" } }, 400);
@@ -427,13 +459,66 @@ usersRouter.put("/me", async (c) => {
   return c.json({ data: formatProfile(updated, postsResult.count ?? 0, friendsResult.count ?? 0, userId) });
 });
 
+// POST /api/me/deletion-request — queue account deletion for admin approval.
+usersRouter.post("/me/deletion-request", async (c) => {
+  const userId = c.get("userId");
+  if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const body = await c.req.json().catch(() => ({}));
+  const reason = body?.reason ? String(body.reason).trim().slice(0, 1000) : null;
+
+  const { data: existing } = await supabaseAdmin
+    .from("account_deletion_requests")
+    .select("id, status, created_at")
+    .eq("user_id", userId)
+    .eq("status", "pending")
+    .maybeSingle();
+
+  if (existing) {
+    return c.json({ data: { id: existing.id, status: existing.status, createdAt: existing.created_at } });
+  }
+
+  const { data, error } = await supabaseAdmin
+    .from("account_deletion_requests")
+    .insert({ user_id: userId, reason, status: "pending" })
+    .select("id, status, created_at")
+    .single();
+
+  if (error) {
+    console.error("[users] deletion-request failed:", error.message);
+    return c.json({ error: { message: "Failed to submit deletion request" } }, 500);
+  }
+
+  return c.json({ data: { id: data.id, status: data.status, createdAt: data.created_at } }, 201);
+});
+
+usersRouter.get("/me/deletion-request", async (c) => {
+  const userId = c.get("userId");
+  if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const { data } = await supabaseAdmin
+    .from("account_deletion_requests")
+    .select("id, status, created_at, reason")
+    .eq("user_id", userId)
+    .in("status", ["pending", "approved"])
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  return c.json({
+    data: data
+      ? { id: data.id, status: data.status, createdAt: data.created_at, reason: data.reason }
+      : null,
+  });
+});
+
 // DELETE /api/me — permanently delete the signed-in account and auth user.
+// Prefer admin-approved deletion-request flow; this remains for service use.
 usersRouter.delete("/me", async (c) => {
   const userId = c.get("userId");
   if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   try {
-    // Best-effort cleanup of user-owned rows that may not CASCADE from profiles.
     await Promise.allSettled([
       supabaseAdmin.from("notifications").delete().eq("user_id", userId),
       supabaseAdmin.from("notifications").delete().eq("from_user_id", userId),
@@ -448,6 +533,7 @@ usersRouter.delete("/me", async (c) => {
       supabaseAdmin.from("conversation_participants").delete().eq("user_id", userId),
       supabaseAdmin.from("messages").delete().eq("sender_id", userId),
       supabaseAdmin.from("reports").delete().eq("reporter_user_id", userId),
+      supabaseAdmin.from("account_deletion_requests").delete().eq("user_id", userId),
       supabaseAdmin.from("profiles").delete().eq("id", userId),
     ]);
 
@@ -495,6 +581,68 @@ usersRouter.get("/:id", async (c) => {
   return c.json({ data: formatProfile(targetProfile, postsResult.count ?? 0, friendsResult.count ?? 0, userId ?? undefined) });
 });
 
+async function areFriends(a: string, b: string): Promise<boolean> {
+  const { data } = await supabaseAdmin
+    .from("friendships")
+    .select("id")
+    .eq("status", "accepted")
+    .or(`and(requester_id.eq.${a},receiver_id.eq.${b}),and(requester_id.eq.${b},receiver_id.eq.${a})`)
+    .maybeSingle();
+  return !!data;
+}
+
+// GET /api/:id/friends — list this user's friends (gated by privacy settings).
+usersRouter.get("/:id/friends", async (c) => {
+  const userId = c.get("userId");
+  const token = c.get("accessToken");
+  if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const { id } = c.req.param();
+  if (await getBlockedIds(userId).then((ids) => ids.includes(id))) {
+    return c.json({ error: { message: "User not found" } }, 404);
+  }
+
+  const { data: profile } = await supabaseAdmin.from("profiles").select("*").eq("id", id).single();
+  if (!profile) return c.json({ error: { message: "User not found" } }, 404);
+
+  const isOwner = userId === id;
+  const isFriend = isOwner ? true : await areFriends(userId, id);
+  const allowed = canViewSection(
+    isOwner,
+    isFriend,
+    profile.show_friends_to_friends ?? true,
+    profile.show_friends_to_others ?? false
+  );
+  if (!allowed) {
+    return c.json({ error: { message: "This friends list is private" } }, 403);
+  }
+
+  const { data: friendships } = await supabaseAdmin
+    .from("friendships")
+    .select("requester_id, receiver_id")
+    .eq("status", "accepted")
+    .or(`requester_id.eq.${id},receiver_id.eq.${id}`);
+
+  const friendIds = (friendships ?? []).map((f: any) =>
+    f.requester_id === id ? f.receiver_id : f.requester_id
+  );
+
+  if (friendIds.length === 0) return c.json({ data: [] });
+
+  const blocked = new Set(await getBlockedIds(userId));
+  const visibleIds = friendIds.filter((fid: string) => !blocked.has(fid));
+  if (visibleIds.length === 0) return c.json({ data: [] });
+
+  const { data: profiles } = await supabaseAdmin
+    .from("profiles")
+    .select("*")
+    .in("id", visibleIds);
+
+  return c.json({
+    data: (profiles ?? []).map((p: any) => formatProfile(p, 0, 0, userId)),
+  });
+});
+
 // GET /api/:id/posts
 usersRouter.get("/:id/posts", async (c) => {
   const user = c.get("user");
@@ -503,10 +651,35 @@ usersRouter.get("/:id/posts", async (c) => {
   if (!user || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const { id } = c.req.param();
+  const section = (c.req.query("section") ?? "moments").toLowerCase(); // posts | moments
 
   // If this profile is blocked (either direction), don't expose their moments.
   const blockedIds = userId ? await getBlockedIds(userId) : [];
   if (blockedIds.includes(id)) return c.json({ data: [] });
+
+  const { data: ownerProfile } = await supabaseAdmin.from("profiles").select("*").eq("id", id).single();
+  if (!ownerProfile) return c.json({ data: [] });
+
+  const isOwner = !!userId && userId === id;
+  const isFriend = isOwner ? true : userId ? await areFriends(userId, id) : false;
+
+  if (section === "posts") {
+    const allowed = canViewSection(
+      isOwner,
+      isFriend,
+      ownerProfile.show_posts_to_friends ?? true,
+      ownerProfile.show_posts_to_others ?? true
+    );
+    if (!allowed) return c.json({ error: { message: "Posts are private" } }, 403);
+  } else {
+    const allowed = canViewSection(
+      isOwner,
+      isFriend,
+      ownerProfile.show_moments_to_friends ?? true,
+      ownerProfile.show_moments_to_others ?? true
+    );
+    if (!allowed) return c.json({ error: { message: "Moments are private" } }, 403);
+  }
 
   const userClient = createUserClient(token);
   const { data: posts } = await userClient
@@ -517,26 +690,8 @@ usersRouter.get("/:id/posts", async (c) => {
 
   const all = posts ?? [];
 
-  // Per-post audience enforcement when someone views ANOTHER user's profile.
-  // The owner viewing their own profile sees everything (no filtering).
-  //   public  → visible to everyone, including non-friends
-  //   friends → only accepted friends
-  //   close   → only friends the owner has starred as close friends
-  //   private → owner only
-  // (A missing `audience` column behaves as 'friends'.)
   let visible = all;
   if (userId && userId !== id) {
-    // Accepted friendship between the viewer and the profile owner? Use the
-    // admin client so RLS doesn't hide the relationship row.
-    const { data: friendship } = await supabaseAdmin
-      .from("friendships")
-      .select("id")
-      .eq("status", "accepted")
-      .or(`and(requester_id.eq.${userId},receiver_id.eq.${id}),and(requester_id.eq.${id},receiver_id.eq.${userId})`)
-      .maybeSingle();
-    const isFriend = !!friendship;
-
-    // Has the owner privately starred the viewer as a close friend?
     let isClose = false;
     if (isFriend) {
       let { data: star } = await supabaseAdmin
@@ -561,12 +716,19 @@ usersRouter.get("/:id/posts", async (c) => {
       if (audience === "public") return true;
       if (audience === "private") return false;
       if (audience === "close") return isClose;
-      return isFriend; // 'friends' | unknown
+      return isFriend;
     });
   }
 
+  // "Posts" = moments that include media or written content; "Moments" = full timeline.
+  if (section === "posts") {
+    visible = visible.filter(
+      (p: any) => !!(p.content || p.image_url || p.location || p.type === "location")
+    );
+  }
+
   const formatted = visible.map((p) => formatPost(p, userId ?? undefined, blockedIds));
-  await refreshFriendshipAvatars(formatted); // always show friends' CURRENT avatars
+  await refreshFriendshipAvatars(formatted);
   return c.json({ data: formatted });
 });
 

@@ -105,6 +105,24 @@ app.get("/__marketing", (c) =>
         // Service-role inserts already bypass RLS; also allow SELECT of blocks involving me (either side)
         'DROP POLICY IF EXISTS "Users can view blocks involving them" ON public.user_blocks;',
         `CREATE POLICY "Users can view blocks involving them" ON public.user_blocks FOR SELECT TO authenticated USING (auth.uid() = blocker_id OR auth.uid() = blocked_id);`,
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS preferred_language TEXT DEFAULT 'en';",
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS show_friends_to_friends BOOLEAN DEFAULT TRUE;",
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS show_friends_to_others BOOLEAN DEFAULT FALSE;",
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS show_posts_to_friends BOOLEAN DEFAULT TRUE;",
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS show_posts_to_others BOOLEAN DEFAULT TRUE;",
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS show_moments_to_friends BOOLEAN DEFAULT TRUE;",
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS show_moments_to_others BOOLEAN DEFAULT TRUE;",
+        `CREATE TABLE IF NOT EXISTS public.account_deletion_requests (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+          reason TEXT,
+          status TEXT NOT NULL DEFAULT 'pending',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          processed_at TIMESTAMPTZ,
+          processed_by UUID,
+          admin_note TEXT
+        );`,
+        "CREATE INDEX IF NOT EXISTS idx_account_deletion_status ON public.account_deletion_requests (status, created_at DESC);",
         // Hot-path indexes for messaging performance
         "CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON public.messages (conversation_id, created_at DESC);",
         "CREATE INDEX IF NOT EXISTS idx_conversation_participants_user ON public.conversation_participants (user_id);",

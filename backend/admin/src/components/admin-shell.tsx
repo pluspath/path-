@@ -23,6 +23,7 @@ import {
   Server,
   UserCog,
   X,
+  Trash2,
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { useAuth } from "@/lib/auth";
@@ -44,6 +45,7 @@ const navGroups = [
       { href: "/friendships", label: "Friendships", icon: HeartHandshake, permission: "friendships:read" },
       { href: "/notifications", label: "Notifications", icon: Bell, permission: "notifications:read" },
       { href: "/reports", label: "Reports", icon: ClipboardList, permission: "reports:read" },
+      { href: "/deletion-requests", label: "Deletions", icon: Trash2, permission: "users:read" },
     ],
   },
   {
