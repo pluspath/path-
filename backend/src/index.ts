@@ -62,6 +62,43 @@ app.get("/__marketing", (c) =>
         "UPDATE public.messages SET image_url = image WHERE image_url IS NULL AND image IS NOT NULL;",
         "UPDATE public.messages SET text = content WHERE (text IS NULL OR text = '') AND content IS NOT NULL;",
         "UPDATE public.messages SET image = image_url WHERE image IS NULL AND image_url IS NOT NULL;",
+        // Read receipts / unread counts
+        "ALTER TABLE public.conversation_participants ADD COLUMN IF NOT EXISTS last_read_at TIMESTAMPTZ;",
+        // User blocks table (block/report features)
+        `CREATE TABLE IF NOT EXISTS public.user_blocks (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          blocker_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+          blocked_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE (blocker_id, blocked_id),
+          CHECK (blocker_id <> blocked_id)
+        );`,
+        "CREATE INDEX IF NOT EXISTS idx_user_blocks_blocker ON public.user_blocks (blocker_id);",
+        "CREATE INDEX IF NOT EXISTS idx_user_blocks_blocked ON public.user_blocks (blocked_id);",
+        "ALTER TABLE public.user_blocks ENABLE ROW LEVEL SECURITY;",
+        'DROP POLICY IF EXISTS "Users can view own blocks" ON public.user_blocks;',
+        `CREATE POLICY "Users can view own blocks" ON public.user_blocks FOR SELECT TO authenticated USING (auth.uid() = blocker_id);`,
+        'DROP POLICY IF EXISTS "Users can create own blocks" ON public.user_blocks;',
+        `CREATE POLICY "Users can create own blocks" ON public.user_blocks FOR INSERT TO authenticated WITH CHECK (auth.uid() = blocker_id);`,
+        'DROP POLICY IF EXISTS "Users can delete own blocks" ON public.user_blocks;',
+        `CREATE POLICY "Users can delete own blocks" ON public.user_blocks FOR DELETE TO authenticated USING (auth.uid() = blocker_id);`,
+        // Fix participants RLS without recursion (SECURITY DEFINER helper)
+        `CREATE OR REPLACE FUNCTION public.is_conversation_participant(conv_id uuid)
+          RETURNS boolean
+          LANGUAGE sql
+          SECURITY DEFINER
+          SET search_path = public
+          STABLE
+          AS $$ SELECT EXISTS (
+            SELECT 1 FROM public.conversation_participants
+            WHERE conversation_id = conv_id AND user_id = auth.uid()
+          ); $$;`,
+        'DROP POLICY IF EXISTS "Participants can view participants" ON public.conversation_participants;',
+        `CREATE POLICY "Participants can view participants" ON public.conversation_participants FOR SELECT TO authenticated USING (public.is_conversation_participant(conversation_id));`,
+        'DROP POLICY IF EXISTS "Participants can update own row" ON public.conversation_participants;',
+        `CREATE POLICY "Participants can update own row" ON public.conversation_participants FOR UPDATE TO authenticated USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);`,
+        // Posts bucket should accept videos
+        `UPDATE storage.buckets SET file_size_limit = 52428800, allowed_mime_types = ARRAY['image/jpeg','image/png','image/webp','image/gif','video/mp4','video/quicktime','video/webm'] WHERE id = 'Posts';`,
         // Critical posts RLS — fixes 42501 on POST /api/posts when policies were never applied
         "ALTER TABLE public.posts ENABLE ROW LEVEL SECURITY;",
         'DROP POLICY IF EXISTS "Anyone can view posts" ON public.posts;',

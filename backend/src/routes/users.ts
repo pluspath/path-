@@ -41,6 +41,8 @@ function formatProfile(p: any, postCount = 0, friendCount = 0, viewerId?: string
     showAge,
     showZodiac,
     usernameChanged: p.username_changed ?? false,
+    pushNotificationsEnabled: p.push_notifications_enabled ?? true,
+    emailNotificationsEnabled: p.email_notifications_enabled ?? false,
   };
 }
 
@@ -377,6 +379,15 @@ usersRouter.put("/me", async (c) => {
   if (body.coverPhoto !== undefined) updateData.cover_url = body.coverPhoto;
   if (body.avatar !== undefined) updateData.avatar_url = body.avatar;
   if (body.push_token !== undefined) updateData.push_token = body.push_token;
+  if (body.pushNotificationsEnabled !== undefined) {
+    updateData.push_notifications_enabled = Boolean(body.pushNotificationsEnabled);
+    if (body.pushNotificationsEnabled === false) {
+      updateData.push_token = null;
+    }
+  }
+  if (body.emailNotificationsEnabled !== undefined) {
+    updateData.email_notifications_enabled = Boolean(body.emailNotificationsEnabled);
+  }
 
   if (Object.keys(updateData).length === 0) {
     return c.json({ error: { message: "No fields to update" } }, 400);
@@ -414,6 +425,40 @@ usersRouter.put("/me", async (c) => {
   ]);
 
   return c.json({ data: formatProfile(updated, postsResult.count ?? 0, friendsResult.count ?? 0, userId) });
+});
+
+// DELETE /api/me — permanently delete the signed-in account and auth user.
+usersRouter.delete("/me", async (c) => {
+  const user = c.get("user");
+  const userId = c.get("userId");
+  if (!user || !userId) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  try {
+    // Best-effort cleanup of user-owned rows that may not CASCADE from profiles.
+    await Promise.allSettled([
+      supabaseAdmin.from("notifications").delete().eq("user_id", userId),
+      supabaseAdmin.from("notifications").delete().eq("from_user_id", userId),
+      supabaseAdmin.from("user_blocks").delete().or(`blocker_id.eq.${userId},blocked_id.eq.${userId}`),
+      supabaseAdmin.from("friendships").delete().or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
+      supabaseAdmin.from("reactions").delete().eq("user_id", userId),
+      supabaseAdmin.from("comments").delete().eq("user_id", userId),
+      supabaseAdmin.from("posts").delete().eq("user_id", userId),
+      supabaseAdmin.from("conversation_participants").delete().eq("user_id", userId),
+      supabaseAdmin.from("messages").delete().eq("sender_id", userId),
+      supabaseAdmin.from("profiles").delete().eq("id", userId),
+    ]);
+
+    const { error } = await supabaseAdmin.auth.admin.deleteUser(userId);
+    if (error) {
+      console.error("[users] DELETE /me auth delete failed:", error.message);
+      return c.json({ error: { message: "Failed to delete account" } }, 500);
+    }
+
+    return c.body(null, 204);
+  } catch (err) {
+    console.error("[users] DELETE /me unexpected:", err);
+    return c.json({ error: { message: "Failed to delete account" } }, 500);
+  }
 });
 
 // GET /api/:id

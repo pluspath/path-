@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { adminOrUser } from "../supabase";
+import { adminOrUser, supabaseAdmin } from "../supabase";
 import { sendPushNotification, getPushToken } from "../lib/push";
 import { encodeImages, decodeImages } from "../lib/images";
 import { getBlockedIds, isBlocked } from "../lib/blocks";
@@ -49,10 +49,12 @@ function mapMessage(m: any) {
     }
   }
   // image_url may hold a single URL (legacy) or a JSON array (multi-image).
-  const images = decodeImages(m.image_url);
+  // Also fall back to legacy `image` column.
+  const images = decodeImages(m.image_url ?? m.image);
   return {
     ...base,
-    text: m.content ?? "",
+    // Prefer content; fall back to legacy `text` column for older rows.
+    text: m.content ?? m.text ?? "",
     image: images[0] ?? undefined,
     images: images.length > 0 ? images : undefined,
   };
@@ -376,13 +378,25 @@ conversationsRouter.post("/:id/messages", async (c) => {
   // Accept a single `image` (legacy) or an `images` array (up to 6).
   const imageUrl = type === "location" ? null : encodeImages(images, image);
 
+  // Dual-write content/text + image_url/image so both modern and legacy schemas work.
   const { data: message, error } = await db
     .from("messages")
-    .insert({ conversation_id: id, sender_id: userId, content, image_url: imageUrl, type })
+    .insert({
+      conversation_id: id,
+      sender_id: userId,
+      content,
+      text: content,
+      image_url: imageUrl,
+      image: imageUrl,
+      type,
+    })
     .select()
     .single();
 
-  if (error) return c.json({ error: { message: "Failed to send message" } }, 500);
+  if (error) {
+    console.error("[conversations] send message error:", error.message);
+    return c.json({ error: { message: "Failed to send message" } }, 500);
+  }
 
   await db.from("conversations").update({ updated_at: new Date().toISOString() }).eq("id", id);
 
@@ -402,10 +416,16 @@ conversationsRouter.post("/start/:userId", async (c) => {
   const token = c.get("accessToken");
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
-  const db = adminOrUser(token);
+  // Force service-role for conversation creation so BOTH participant rows are
+  // always written (user JWT + RLS often only allows inserting yourself).
+  const db = supabaseAdmin;
 
   const { userId: targetId } = c.req.param();
   console.log(`[conversations/start] userId=${userId} targetId=${targetId}`);
+
+  if (!targetId || targetId === userId) {
+    return c.json({ error: { message: "Cannot start a conversation with yourself" } }, 400);
+  }
 
   // No messaging across a block (either direction).
   if (await isBlocked(userId, targetId, db)) {
@@ -523,11 +543,22 @@ conversationsRouter.post("/:id/ping", async (c) => {
 
   if (!participation) return c.json({ error: { message: "Unauthorized" } }, 403);
 
-  const { data: message } = await db
+  const { data: message, error: pingError } = await db
     .from("messages")
-    .insert({ conversation_id: id, sender_id: userId, content: "Ping!", type: "ping" })
+    .insert({
+      conversation_id: id,
+      sender_id: userId,
+      content: "Ping!",
+      text: "Ping!",
+      type: "ping",
+    })
     .select()
     .single();
+
+  if (pingError || !message) {
+    console.error("[conversations] ping error:", pingError?.message);
+    return c.json({ error: { message: "Failed to send ping" } }, 500);
+  }
 
   await db.from("conversations").update({ updated_at: new Date().toISOString() }).eq("id", id);
 

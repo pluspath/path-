@@ -1,13 +1,10 @@
 import { supabaseAdmin } from "../supabase";
 
-// Returns the BIDIRECTIONAL block set for `userId`: the distinct ids of every
-// other user that is on either side of a block row with this user (rows where
-// blocker_id = userId OR blocked_id = userId). For each such row we keep "the
-// other user's id" (the one that isn't userId). This is the set the app should
-// hide from `userId` in BOTH directions. Returns [] on any error.
+// Returns the BIDIRECTIONAL block set for `userId`: every other user on either
+// side of a `user_blocks` row with this user. Returns [] on any error.
 export async function getBlockedIds(userId: string, client: any = supabaseAdmin): Promise<string[]> {
   const { data, error } = await client
-    .from("blocks")
+    .from("user_blocks")
     .select("blocker_id, blocked_id")
     .or(`blocker_id.eq.${userId},blocked_id.eq.${userId}`);
 
@@ -25,7 +22,7 @@ export async function getBlockedIds(userId: string, client: any = supabaseAdmin)
 export async function isBlocked(userId: string, otherId: string, client: any = supabaseAdmin): Promise<boolean> {
   if (!userId || !otherId) return false;
   const { data, error } = await client
-    .from("blocks")
+    .from("user_blocks")
     .select("id")
     .or(
       `and(blocker_id.eq.${userId},blocked_id.eq.${otherId}),and(blocker_id.eq.${otherId},blocked_id.eq.${userId})`

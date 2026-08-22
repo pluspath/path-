@@ -4,14 +4,16 @@
 -- Idempotent: safe to re-run.
 -- =====================================================
 
-INSERT INTO storage.buckets (id, name, public)
+INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
 VALUES
-  ('Avatars', 'Avatars', true),
-  ('Covers', 'Covers', true),
-  ('Posts', 'Posts', true)
+  ('Avatars', 'Avatars', true, 15728640, ARRAY['image/jpeg','image/png','image/webp','image/gif']),
+  ('Covers', 'Covers', true, 15728640, ARRAY['image/jpeg','image/png','image/webp','image/gif']),
+  ('Posts', 'Posts', true, 52428800, ARRAY['image/jpeg','image/png','image/webp','image/gif','video/mp4','video/quicktime','video/webm'])
 ON CONFLICT (id) DO UPDATE
 SET public = EXCLUDED.public,
-    name = EXCLUDED.name;
+    name = EXCLUDED.name,
+    file_size_limit = EXCLUDED.file_size_limit,
+    allowed_mime_types = EXCLUDED.allowed_mime_types;
 
 -- Public read for all app media buckets
 DROP POLICY IF EXISTS "Public read Avatars" ON storage.objects;

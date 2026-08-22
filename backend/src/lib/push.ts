@@ -6,40 +6,42 @@ export async function sendPushNotification(
   body: string,
   data?: Record<string, any>
 ): Promise<void> {
-  if (!pushToken || !pushToken.startsWith('ExponentPushToken')) return;
+  if (!pushToken || !pushToken.startsWith("ExponentPushToken")) return;
 
   try {
-    await fetch('https://exp.host/--/api/v2/push/send', {
-      method: 'POST',
+    await fetch("https://exp.host/--/api/v2/push/send", {
+      method: "POST",
       headers: {
-        'Accept': 'application/json',
-        'Content-Type': 'application/json',
+        Accept: "application/json",
+        "Content-Type": "application/json",
       },
       body: JSON.stringify({
         to: pushToken,
         title,
         body,
         data: data ?? {},
-        sound: 'default',
-        priority: 'high',
+        sound: "default",
+        priority: "high",
       }),
     });
   } catch (e) {
-    // Non-critical: log but don't crash
-    console.error('[push] Failed to send notification:', e);
+    console.error("[push] Failed to send notification:", e);
   }
 }
 
-// Lookup push token for a user by their userId
-// Uses supabaseAdmin to bypass RLS
+// Lookup push token for a user by their userId.
+// Respects push_notifications_enabled — returns null when the user opted out.
 export async function getPushToken(supabaseAdmin: any, userId: string): Promise<string | null> {
   try {
     const { data } = await supabaseAdmin
-      .from('profiles')
-      .select('push_token')
-      .eq('id', userId)
+      .from("profiles")
+      .select("push_token, push_notifications_enabled")
+      .eq("id", userId)
       .single();
-    return data?.push_token ?? null;
+
+    if (!data) return null;
+    if (data.push_notifications_enabled === false) return null;
+    return data.push_token ?? null;
   } catch {
     return null;
   }
