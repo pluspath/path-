@@ -144,7 +144,7 @@ export default function DeletionRequestsPage() {
       {loading ? (
         <LoadingState />
       ) : error ? (
-        <ErrorState message={error} onRetry={() => void load()} />
+        <ErrorState message={error} />
       ) : (
         <>
           <DataTable columns={columns} rows={rows} rowKey={(r) => r.id} />
