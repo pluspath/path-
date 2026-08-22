@@ -36,7 +36,7 @@ function mapMessage(m: any) {
   };
   if (m.type === "location") {
     try {
-      const loc = JSON.parse(m.content ?? "{}");
+      const loc = JSON.parse(m.content ?? m.text ?? "{}");
       return {
         ...base,
         text: loc.name ?? "Shared a location",
@@ -45,7 +45,7 @@ function mapMessage(m: any) {
         locationLng: typeof loc.lng === "number" ? loc.lng : undefined,
       };
     } catch {
-      return { ...base, text: m.content ?? "" };
+      return { ...base, text: m.content ?? m.text ?? "" };
     }
   }
   // image_url may hold a single URL (legacy) or a JSON array (multi-image).
@@ -90,6 +90,15 @@ function notifyParticipantsInBackground(
 
       await Promise.all(
         (otherParticipants ?? []).map(async (participant: any) => {
+          // In-app notification (bell) so alerts work even when push tokens are missing.
+          await db.from("notifications").insert({
+            user_id: participant.user_id,
+            from_user_id: senderId,
+            type: data?.type === "ping" ? "ping" : "message",
+            message: body,
+            read: false,
+          });
+
           const pushToken = await getPushToken(db, participant.user_id);
           await sendPushNotification(pushToken, senderName, body, data);
         })
@@ -116,10 +125,12 @@ const emptyUser = (id = "unknown") => ({
 });
 
 conversationsRouter.get("/", async (c) => {
-  const user = c.get("user");
+  // Auth is JWT-derived userId (set only after supabase.auth.getUser succeeds).
+  // Do NOT require the profiles row (`user`) — missing profiles previously made
+  // messaging fail for one side of a chat while the other side worked.
   const userId = c.get("userId");
   const token = c.get("accessToken");
-  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+  if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const db = adminOrUser(token);
 
@@ -131,96 +142,96 @@ conversationsRouter.get("/", async (c) => {
   const convIds = (participations ?? []).map((p: any) => p.conversation_id);
   if (convIds.length === 0) return c.json({ data: [] });
 
-  // Map each conversation to this user's server-side "last read" timestamp.
   const lastReadByConv: Record<string, string | null> = {};
   for (const p of participations ?? []) lastReadByConv[p.conversation_id] = p.last_read_at ?? null;
 
-  const { data: conversations } = await db
-    .from("conversations")
-    .select("*")
-    .in("id", convIds)
-    .order("updated_at", { ascending: false });
-
-  // Batch-fetch the "other participant" for every conversation in ONE query
-  // (was: one query per conversation), then resolve their profiles in ONE query.
-  const { data: allParticipants } = await db
-    .from("conversation_participants")
-    .select("conversation_id, user_id")
-    .in("conversation_id", convIds)
-    .neq("user_id", userId);
+  const [{ data: conversations }, { data: allParticipants }, blockedIds] = await Promise.all([
+    db.from("conversations").select("*").in("id", convIds).order("updated_at", { ascending: false }),
+    db
+      .from("conversation_participants")
+      .select("conversation_id, user_id")
+      .in("conversation_id", convIds)
+      .neq("user_id", userId),
+    getBlockedIds(userId, db),
+  ]);
 
   const otherUserIdByConv: Record<string, string> = {};
   for (const p of allParticipants ?? []) {
     if (!otherUserIdByConv[p.conversation_id]) otherUserIdByConv[p.conversation_id] = p.user_id;
   }
 
-  // Drop conversations whose other participant is blocked (either direction).
-  const blockedSet = new Set(await getBlockedIds(userId, db));
-
-  const otherUserIds = [...new Set(Object.values(otherUserIdByConv))];
-  const profilesById: Record<string, any> = {};
-  if (otherUserIds.length > 0) {
-    const { data: profiles } = await db.from("profiles").select("*").in("id", otherUserIds);
-    for (const p of profiles ?? []) profilesById[p.id] = formatProfile(p);
-  }
-
-  // Per-conversation last message + unread count still need their own queries,
-  // but run them all concurrently rather than sequentially.
+  const blockedSet = new Set(blockedIds);
   const visibleConversations = (conversations ?? []).filter((conv: any) => {
     const otherUserId = otherUserIdByConv[conv.id];
     return !otherUserId || !blockedSet.has(otherUserId);
   });
+  const visibleIds = visibleConversations.map((c: any) => c.id);
+  if (visibleIds.length === 0) return c.json({ data: [] });
 
-  const result = await Promise.all(visibleConversations.map(async (conv: any) => {
-    const otherUserId = otherUserIdByConv[conv.id];
-    const otherUser = otherUserId ? profilesById[otherUserId] ?? null : null;
+  const otherUserIds = [
+    ...new Set(visibleIds.map((id: string) => otherUserIdByConv[id]).filter(Boolean)),
+  ];
 
-    // Server-side unread: messages from the other user created after my last_read_at.
-    let unreadQuery = db
+  // Batch: profiles + recent messages for all visible conversations (kills N+1).
+  const [{ data: profiles }, { data: recentMsgs }] = await Promise.all([
+    otherUserIds.length > 0
+      ? db.from("profiles").select("*").in("id", otherUserIds)
+      : Promise.resolve({ data: [] as any[] }),
+    db
       .from("messages")
-      .select("*", { count: "exact", head: true })
-      .eq("conversation_id", conv.id)
-      .neq("sender_id", userId);
-    const lastRead = lastReadByConv[conv.id];
-    if (lastRead) unreadQuery = unreadQuery.gt("created_at", lastRead);
+      .select("id, conversation_id, content, text, created_at, sender_id, type")
+      .in("conversation_id", visibleIds)
+      .order("created_at", { ascending: false })
+      .limit(Math.min(visibleIds.length * 40, 800)),
+  ]);
 
-    const [{ data: lastMsgs }, { count: unreadCount }] = await Promise.all([
-      db
-        .from("messages")
-        .select("content, created_at, sender_id, type")
-        .eq("conversation_id", conv.id)
-        .order("created_at", { ascending: false })
-        .limit(1),
-      unreadQuery,
-    ]);
+  const profilesById: Record<string, any> = {};
+  for (const p of profiles ?? []) profilesById[p.id] = formatProfile(p);
 
-    const lastMsg = lastMsgs?.[0];
+  // First message per conversation (already sorted newest-first).
+  const lastMsgByConv: Record<string, any> = {};
+  const unreadByConv: Record<string, number> = {};
+  for (const id of visibleIds) unreadByConv[id] = 0;
 
+  for (const m of recentMsgs ?? []) {
+    if (!lastMsgByConv[m.conversation_id]) lastMsgByConv[m.conversation_id] = m;
+    if (m.sender_id === userId) continue;
+    const lastRead = lastReadByConv[m.conversation_id];
+    if (!lastRead || m.created_at > lastRead) {
+      unreadByConv[m.conversation_id] = (unreadByConv[m.conversation_id] ?? 0) + 1;
+    }
+  }
+
+  const result = visibleConversations.map((conv: any) => {
+    const otherUserId = otherUserIdByConv[conv.id];
+    const lastMsg = lastMsgByConv[conv.id];
+    const previewText = lastMsg?.content ?? lastMsg?.text ?? "";
     return {
       id: conv.id,
-      user: otherUser ?? emptyUser(),
-      lastMessage: lastMsg ? messagePreview(lastMsg.type, lastMsg.content) : "",
+      user: (otherUserId && profilesById[otherUserId]) || emptyUser(otherUserId),
+      lastMessage: lastMsg ? messagePreview(lastMsg.type, previewText) : "",
       lastMessageTime: lastMsg?.created_at ?? conv.created_at,
       lastMessageSenderId: lastMsg?.sender_id ?? null,
-      unreadCount: unreadCount ?? 0,
+      unreadCount: unreadByConv[conv.id] ?? 0,
       messages: [],
     };
-  }));
+  });
 
   return c.json({ data: result });
 });
 
 conversationsRouter.get("/:id", async (c) => {
-  const user = c.get("user");
   const userId = c.get("userId");
   const token = c.get("accessToken");
-  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+  if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
-  const db = adminOrUser(token);
+  // Always use service role for chat reads so both participants can open the
+  // same conversation even when RLS on participants is incomplete.
+  const db = supabaseAdmin;
 
   const { id } = c.req.param();
 
-  // Security check: verify user is a participant (manual, bypasses RLS)
+  // Security: caller must be a participant (based on JWT userId, not a profile row).
   const { data: participation } = await db
     .from("conversation_participants")
     .select("user_id")
@@ -282,10 +293,9 @@ conversationsRouter.get("/:id", async (c) => {
 // Per-conversation unread counts, computed server-side from
 // conversation_participants.last_read_at (consistent across devices).
 conversationsRouter.post("/unread-counts", async (c) => {
-  const user = c.get("user");
   const userId = c.get("userId");
   const token = c.get("accessToken");
-  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+  if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const db = adminOrUser(token);
 
@@ -317,10 +327,9 @@ conversationsRouter.post("/unread-counts", async (c) => {
 // Mark a conversation as read for the current user: set last_read_at = now().
 // Server-side so the read state is consistent across all the user's devices.
 conversationsRouter.post("/:id/read", async (c) => {
-  const user = c.get("user");
   const userId = c.get("userId");
   const token = c.get("accessToken");
-  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+  if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const db = adminOrUser(token);
 
@@ -341,9 +350,9 @@ conversationsRouter.post("/:id/messages", async (c) => {
   const user = c.get("user");
   const userId = c.get("userId");
   const token = c.get("accessToken");
-  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+  if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
-  const db = adminOrUser(token);
+  const db = supabaseAdmin;
 
   const { id } = c.req.param();
   const { text, image, images, type = "text", locationName, locationLat, locationLng } = await c.req.json();
@@ -411,16 +420,15 @@ conversationsRouter.post("/:id/messages", async (c) => {
 });
 
 conversationsRouter.post("/start/:userId", async (c) => {
-  const user = c.get("user");
   const userId = c.get("userId");
   const token = c.get("accessToken");
-  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+  if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   // Force service-role for conversation creation so BOTH participant rows are
   // always written (user JWT + RLS often only allows inserting yourself).
   const db = supabaseAdmin;
 
-  const { userId: targetId } = c.req.param();
+  const targetId = c.req.param("userId");
   console.log(`[conversations/start] userId=${userId} targetId=${targetId}`);
 
   if (!targetId || targetId === userId) {
@@ -455,11 +463,24 @@ conversationsRouter.post("/start/:userId", async (c) => {
 
   if (existingConvId) {
     console.log(`[conversations/start] existing conv found: ${existingConvId}`);
+    // Repair: ensure BOTH participants are present (fixes "only recipient can open").
+    const { data: parts } = await db
+      .from("conversation_participants")
+      .select("user_id")
+      .eq("conversation_id", existingConvId);
+    const present = new Set((parts ?? []).map((p: any) => p.user_id));
+    if (!present.has(userId)) {
+      await db.from("conversation_participants").insert({ conversation_id: existingConvId, user_id: userId });
+    }
+    if (!present.has(targetId)) {
+      await db.from("conversation_participants").insert({ conversation_id: existingConvId, user_id: targetId });
+    }
+
     const { data: conv } = await db.from("conversations").select("*").eq("id", existingConvId).single();
     const { data: targetProfile } = await db.from("profiles").select("*").eq("id", targetId).single();
     const { data: msgs } = await db
       .from("messages")
-      .select("content, created_at")
+      .select("content, text, created_at")
       .eq("conversation_id", existingConvId)
       .order("created_at", { ascending: false })
       .limit(1);
@@ -467,7 +488,7 @@ conversationsRouter.post("/start/:userId", async (c) => {
       data: {
         id: existingConvId,
         user: targetProfile ? formatProfile(targetProfile) : emptyUser(targetId),
-        lastMessage: msgs?.[0]?.content ?? "",
+        lastMessage: msgs?.[0]?.content ?? msgs?.[0]?.text ?? "",
         lastMessageTime: conv?.updated_at ?? new Date().toISOString(),
         unreadCount: 0,
         messages: [],
@@ -527,9 +548,9 @@ conversationsRouter.post("/:id/ping", async (c) => {
   const user = c.get("user");
   const userId = c.get("userId");
   const token = c.get("accessToken");
-  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+  if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
-  const db = adminOrUser(token);
+  const db = supabaseAdmin;
 
   const { id } = c.req.param();
 

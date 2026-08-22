@@ -67,8 +67,8 @@ app.get("/__marketing", (c) =>
         // User blocks table (block/report features)
         `CREATE TABLE IF NOT EXISTS public.user_blocks (
           id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-          blocker_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
-          blocked_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+          blocker_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+          blocked_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           UNIQUE (blocker_id, blocked_id),
           CHECK (blocker_id <> blocked_id)
@@ -82,6 +82,13 @@ app.get("/__marketing", (c) =>
         `CREATE POLICY "Users can create own blocks" ON public.user_blocks FOR INSERT TO authenticated WITH CHECK (auth.uid() = blocker_id);`,
         'DROP POLICY IF EXISTS "Users can delete own blocks" ON public.user_blocks;',
         `CREATE POLICY "Users can delete own blocks" ON public.user_blocks FOR DELETE TO authenticated USING (auth.uid() = blocker_id);`,
+        // Service-role inserts already bypass RLS; also allow SELECT of blocks involving me (either side)
+        'DROP POLICY IF EXISTS "Users can view blocks involving them" ON public.user_blocks;',
+        `CREATE POLICY "Users can view blocks involving them" ON public.user_blocks FOR SELECT TO authenticated USING (auth.uid() = blocker_id OR auth.uid() = blocked_id);`,
+        // Hot-path indexes for messaging performance
+        "CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON public.messages (conversation_id, created_at DESC);",
+        "CREATE INDEX IF NOT EXISTS idx_conversation_participants_user ON public.conversation_participants (user_id);",
+        "CREATE INDEX IF NOT EXISTS idx_notifications_user_created ON public.notifications (user_id, created_at DESC);",
         // Fix participants RLS without recursion (SECURITY DEFINER helper)
         `CREATE OR REPLACE FUNCTION public.is_conversation_participant(conv_id uuid)
           RETURNS boolean

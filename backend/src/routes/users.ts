@@ -429,9 +429,8 @@ usersRouter.put("/me", async (c) => {
 
 // DELETE /api/me — permanently delete the signed-in account and auth user.
 usersRouter.delete("/me", async (c) => {
-  const user = c.get("user");
   const userId = c.get("userId");
-  if (!user || !userId) return c.json({ error: { message: "Unauthorized" } }, 401);
+  if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   try {
     // Best-effort cleanup of user-owned rows that may not CASCADE from profiles.
@@ -440,11 +439,15 @@ usersRouter.delete("/me", async (c) => {
       supabaseAdmin.from("notifications").delete().eq("from_user_id", userId),
       supabaseAdmin.from("user_blocks").delete().or(`blocker_id.eq.${userId},blocked_id.eq.${userId}`),
       supabaseAdmin.from("friendships").delete().or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
+      supabaseAdmin.from("close_friends").delete().or(`user_id.eq.${userId},friend_id.eq.${userId}`),
+      supabaseAdmin.from("close_friends").delete().or(`owner_id.eq.${userId},friend_id.eq.${userId}`),
       supabaseAdmin.from("reactions").delete().eq("user_id", userId),
       supabaseAdmin.from("comments").delete().eq("user_id", userId),
+      supabaseAdmin.from("saved_posts").delete().eq("user_id", userId),
       supabaseAdmin.from("posts").delete().eq("user_id", userId),
       supabaseAdmin.from("conversation_participants").delete().eq("user_id", userId),
       supabaseAdmin.from("messages").delete().eq("sender_id", userId),
+      supabaseAdmin.from("reports").delete().eq("reporter_user_id", userId),
       supabaseAdmin.from("profiles").delete().eq("id", userId),
     ]);
 
@@ -463,12 +466,20 @@ usersRouter.delete("/me", async (c) => {
 
 // GET /api/:id
 usersRouter.get("/:id", async (c) => {
-  const user = c.get("user");
   const userId = c.get("userId");
   const token = c.get("accessToken");
-  if (!user || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+  if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const { id } = c.req.param();
+
+  // Hide profiles that are blocked in either direction.
+  if (userId && id !== userId) {
+    const blocked = await getBlockedIds(userId);
+    if (blocked.includes(id)) {
+      return c.json({ error: { message: "User not found" } }, 404);
+    }
+  }
+
   const userClient = createUserClient(token);
   const { data: targetProfile } = await userClient.from("profiles").select("*").eq("id", id).single();
   if (!targetProfile) return c.json({ error: { message: "User not found" } }, 404);

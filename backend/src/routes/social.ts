@@ -21,7 +21,7 @@ socialRouter.get("/trending", async (c) => {
   const userClient = createUserClient(token);
   const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
 
-  const [{ data: posts }, { data: friendships }, { data: blocks }] = await Promise.all([
+  const [{ data: posts }, { data: friendships }, blockedIds] = await Promise.all([
     userClient
       .from("posts")
       .select("*, profiles(*), reactions(user_id, type, profiles:user_id(avatar_url))")
@@ -33,18 +33,18 @@ socialRouter.get("/trending", async (c) => {
       .select("requester_id, receiver_id")
       .eq("status", "accepted")
       .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
-    userClient.from("user_blocks").select("blocked_id").eq("blocker_id", userId),
+    getBlockedIds(userId),
   ]);
 
   const friendIds = new Set<string>();
   for (const f of friendships ?? []) {
     friendIds.add(f.requester_id === userId ? f.receiver_id : f.requester_id);
   }
-  const blockedIds = new Set((blocks ?? []).map((b: any) => b.blocked_id));
+  const blockedIdsSet = new Set(blockedIds);
 
   const scored = (posts ?? [])
     .filter((p: any) => {
-      if (blockedIds.has(p.user_id)) return false;
+      if (blockedIdsSet.has(p.user_id)) return false;
       if (p.user_id === userId) return true;
       const visibility = p.profiles?.post_visibility === "everyone" ? "everyone" : "friends";
       if (visibility === "everyone") return true;
@@ -360,7 +360,7 @@ socialRouter.get("/search", async (c) => {
   let posts: any[] = [];
 
   if (type === "all" || type === "users") {
-    const [{ data: profiles }, { data: myFriendships }, { data: blocks }] = await Promise.all([
+    const [{ data: profiles }, { data: myFriendships }, blockedList] = await Promise.all([
       userClient
         .from("profiles")
         .select("*")
@@ -371,10 +371,10 @@ socialRouter.get("/search", async (c) => {
         .from("friendships")
         .select("id, requester_id, receiver_id, status")
         .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
-      userClient.from("user_blocks").select("blocked_id").eq("blocker_id", userId),
+      getBlockedIds(userId),
     ]);
 
-    const blocked = new Set((blocks ?? []).map((b: any) => b.blocked_id));
+    const blocked = new Set(blockedList);
     const friendshipByUser: Record<string, { id: string; status: string; isSender: boolean }> = {};
     for (const f of myFriendships ?? []) {
       const otherId = f.requester_id === userId ? f.receiver_id : f.requester_id;

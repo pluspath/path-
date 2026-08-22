@@ -59,12 +59,25 @@ async function handleUpload(
     }
 
     const blob = file as File;
-    const contentType = (blob.type || "image/jpeg").toLowerCase();
+    // RN FormData often omits MIME — sniff from the filename when missing.
+    const rawName = (blob as any).name ? String((blob as any).name).toLowerCase() : "";
+    let contentType = (blob.type || "").toLowerCase();
+    if (!contentType || contentType === "application/octet-stream") {
+      if (rawName.endsWith(".mov")) contentType = "video/quicktime";
+      else if (rawName.endsWith(".webm")) contentType = "video/webm";
+      else if (rawName.endsWith(".mp4") || rawName.endsWith(".m4v")) contentType = "video/mp4";
+      else if (rawName.endsWith(".png")) contentType = "image/png";
+      else if (rawName.endsWith(".webp")) contentType = "image/webp";
+      else if (rawName.endsWith(".gif")) contentType = "image/gif";
+      else if (opts.allowVideo) contentType = "video/mp4";
+      else contentType = "image/jpeg";
+    }
+
     const isVideo = ALLOWED_VIDEO_TYPES.has(contentType);
     const isImage = ALLOWED_IMAGE_TYPES.has(contentType);
 
     if (!isImage && !(opts.allowVideo && isVideo)) {
-      return c.json({ error: { message: "Unsupported file type" } }, 400);
+      return c.json({ error: { message: `Unsupported file type: ${contentType || "unknown"}` } }, 400);
     }
 
     const maxBytes = isVideo ? MAX_VIDEO_BYTES : MAX_IMAGE_BYTES;
