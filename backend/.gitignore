@@ -10,10 +10,10 @@ dist
 coverage
 *.lcov
 
-# logs
-logs
-_.log
-report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
+# logs (runtime output only — keep / so admin Logs page is not ignored)
+/logs
+*.log
+report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 server.log
 studio.log
 
