@@ -1,13 +1,67 @@
 import { Hono } from "hono";
+import { createUserClient, supabaseAdmin } from "../supabase";
 import { isUuid } from "../lib/auth-helpers";
 import { createBlock, removeBlock, listBlockedProfiles } from "../lib/blocks";
 import type { HonoVariables } from "../types";
 
 const moderationRouter = new Hono<{ Variables: HonoVariables }>();
 
-// ─── Reporting ───────────────────────────────────────────────────────────
+/**
+ * Persist a report using whichever reports-table shape this environment has.
+ * Production has drifted between two schemas; try both (admin, then user JWT).
+ */
+async function insertReport(opts: {
+  userId: string;
+  token: string | null;
+  reportedUserId: string | null;
+  reportedPostId: string | null;
+  reason: string;
+  details: string | null;
+}): Promise<{ ok: true } | { ok: false; message: string }> {
+  const targetType = opts.reportedPostId ? "post" : "user";
+  const targetId = (opts.reportedPostId ?? opts.reportedUserId) as string;
+
+  const payloads: Record<string, unknown>[] = [
+    {
+      reporter_user_id: opts.userId,
+      target_type: targetType,
+      target_id: targetId,
+      reason: opts.reason,
+      details: opts.details,
+      status: "open",
+    },
+    {
+      reporter_id: opts.userId,
+      reported_user_id: opts.reportedUserId,
+      reported_post_id: opts.reportedPostId,
+      reason: opts.reason,
+      details: opts.details,
+      status: "pending",
+    },
+  ];
+
+  const clients = [supabaseAdmin];
+  if (opts.token) clients.push(createUserClient(opts.token));
+
+  const errors: string[] = [];
+  for (const client of clients) {
+    for (const payload of payloads) {
+      const { error } = await client.from("reports").insert(payload);
+      if (!error) return { ok: true };
+      const msg = error.message ?? "insert failed";
+      // Duplicate / already reported → treat as success.
+      if (/duplicate|unique|already/i.test(msg)) return { ok: true };
+      errors.push(msg);
+    }
+  }
+
+  console.error("[moderation] report insert failed:", errors.join(" | "));
+  return { ok: false, message: errors[0] ?? "Failed to submit report" };
+}
+
 moderationRouter.post("/reports", async (c) => {
   const userId = c.get("userId");
+  const token = c.get("accessToken");
   if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const body = await c.req.json().catch(() => ({}));
@@ -24,55 +78,22 @@ moderationRouter.post("/reports", async (c) => {
     return c.json({ error: { message: "Cannot report yourself" } }, 400);
   }
 
-  // Lazy-import so block helpers stay the hot path; reports use admin client.
-  const { supabaseAdmin } = await import("../supabase");
-
-  const targetType = reportedPostId ? "post" : "user";
-  const targetId = (reportedPostId ?? reportedUserId) as string;
-
-  const { data: existing } = await supabaseAdmin
-    .from("reports")
-    .select("id")
-    .eq("reporter_user_id", userId)
-    .eq("target_type", targetType)
-    .eq("target_id", targetId)
-    .eq("status", "open")
-    .limit(1)
-    .maybeSingle();
-
-  if (existing) return c.json({ data: { ok: true } });
-
-  const { error } = await supabaseAdmin.from("reports").insert({
-    reporter_user_id: userId,
-    target_type: targetType,
-    target_id: targetId,
+  const result = await insertReport({
+    userId,
+    token,
+    reportedUserId,
+    reportedPostId,
     reason,
     details,
-    status: "open",
   });
 
-  if (error) {
-    console.error("[moderation] create report error:", error);
-    // Column-name drift across environments: retry with the alternate schema
-    // used by some older admin migrations (reporter_id / reported_*).
-    const { error: altError } = await supabaseAdmin.from("reports").insert({
-      reporter_id: userId,
-      reported_user_id: reportedUserId,
-      reported_post_id: reportedPostId,
-      reason,
-      details,
-      status: "pending",
-    });
-    if (altError) {
-      console.error("[moderation] create report alt schema error:", altError);
-      return c.json({ error: { message: "Failed to submit report" } }, 500);
-    }
+  if (!result.ok) {
+    return c.json({ error: { message: result.message } }, 500);
   }
 
   return c.json({ data: { ok: true } });
 });
 
-// ─── Blocking ────────────────────────────────────────────────────────────
 moderationRouter.post("/blocks/:userId", async (c) => {
   const userId = c.get("userId");
   const token = c.get("accessToken");

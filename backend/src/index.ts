@@ -64,6 +64,26 @@ app.get("/__marketing", (c) =>
         "UPDATE public.messages SET image = image_url WHERE image IS NULL AND image_url IS NOT NULL;",
         // Read receipts / unread counts
         "ALTER TABLE public.conversation_participants ADD COLUMN IF NOT EXISTS last_read_at TIMESTAMPTZ;",
+        // Close friends — match mobile schema (user_id). Also add owner_id alias for older code.
+        `CREATE TABLE IF NOT EXISTS public.close_friends (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+          friend_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE (user_id, friend_id),
+          CHECK (user_id <> friend_id)
+        );`,
+        "ALTER TABLE public.close_friends ADD COLUMN IF NOT EXISTS owner_id UUID;",
+        "UPDATE public.close_friends SET owner_id = user_id WHERE owner_id IS NULL AND user_id IS NOT NULL;",
+        "UPDATE public.close_friends SET user_id = owner_id WHERE (user_id IS NULL) AND owner_id IS NOT NULL;",
+        "CREATE INDEX IF NOT EXISTS idx_close_friends_user ON public.close_friends (user_id);",
+        "ALTER TABLE public.close_friends ENABLE ROW LEVEL SECURITY;",
+        'DROP POLICY IF EXISTS "Users view own close friends" ON public.close_friends;',
+        'DROP POLICY IF EXISTS "Users add close friends" ON public.close_friends;',
+        'DROP POLICY IF EXISTS "Users remove close friends" ON public.close_friends;',
+        `CREATE POLICY "Users view own close friends" ON public.close_friends FOR SELECT TO authenticated USING (auth.uid() = user_id OR auth.uid() = owner_id);`,
+        `CREATE POLICY "Users add close friends" ON public.close_friends FOR INSERT TO authenticated WITH CHECK (auth.uid() = user_id OR auth.uid() = owner_id);`,
+        `CREATE POLICY "Users remove close friends" ON public.close_friends FOR DELETE TO authenticated USING (auth.uid() = user_id OR auth.uid() = owner_id);`,
         // User blocks table (block/report features)
         `CREATE TABLE IF NOT EXISTS public.user_blocks (
           id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -242,13 +262,16 @@ app.use("*", async (c, next) => {
         c.set("accessToken", token);
 
         const userClient = createUserClient(token);
+        // Lean profile fetch — full `*` was slowing every authenticated request.
         const { data: profile } = await userClient
           .from("profiles")
-          .select("*")
+          .select(
+            "id, full_name, username, avatar_url, bio, location, birthday, gender, cover_url, created_at, show_age, show_zodiac, username_changed, push_notifications_enabled, email_notifications_enabled, post_visibility, push_token"
+          )
           .eq("id", authUser.id)
-          .single();
+          .maybeSingle();
 
-        c.set("user", profile ?? null);
+        c.set("user", profile ?? { id: authUser.id, full_name: authUser.user_metadata?.full_name ?? "Someone" });
       } else if (error) {
         console.warn(`[auth] Token rejected: ${error.message}`);
       }

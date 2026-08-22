@@ -7,22 +7,61 @@ import type { HonoVariables } from "../types";
 
 const friendsRouter = new Hono<{ Variables: HonoVariables }>();
 
-// Close friends ("starred" friends) are PRIVATE to the owner: a row in
-// `close_friends` means owner_id has starred friend_id. RLS restricts every
-// row to its owner, so the starred person is never notified and can't see it.
-// The table may not exist yet (the one-line SQL hasn't been run) — every read
-// here tolerates that and degrades to "no close friends".
+// Close friends ("starred" friends) are PRIVATE to the owner.
+// Schema drift: some DBs use `user_id`, others use `owner_id`. Support both.
 async function getCloseFriendIds(userClient: any, ownerId: string): Promise<Set<string>> {
   try {
-    const { data, error } = await userClient
+    let { data, error } = await userClient
       .from("close_friends")
       .select("friend_id")
-      .eq("owner_id", ownerId);
+      .eq("user_id", ownerId);
+
+    if (error && /owner_id|column|user_id/i.test(error.message ?? "")) {
+      ({ data, error } = await userClient
+        .from("close_friends")
+        .select("friend_id")
+        .eq("owner_id", ownerId));
+    }
+
     if (error || !data) return new Set();
     return new Set(data.map((r: any) => r.friend_id));
   } catch {
     return new Set();
   }
+}
+
+async function upsertCloseFriend(userClient: any, ownerId: string, friendId: string) {
+  // Prefer user_id (matches mobile + common production bootstrap).
+  let { error } = await userClient
+    .from("close_friends")
+    .upsert({ user_id: ownerId, friend_id: friendId }, { onConflict: "user_id,friend_id" });
+
+  if (!error) return null;
+
+  if (/owner_id|column|user_id|onConflict|conflict/i.test(error.message ?? "")) {
+    // Try owner_id schema, then plain inserts.
+    ({ error } = await userClient
+      .from("close_friends")
+      .upsert({ owner_id: ownerId, friend_id: friendId }, { onConflict: "owner_id,friend_id" }));
+    if (!error) return null;
+
+    ({ error } = await userClient
+      .from("close_friends")
+      .insert({ user_id: ownerId, friend_id: friendId }));
+    if (!error || /duplicate|unique/i.test(error.message ?? "")) return null;
+
+    ({ error } = await userClient
+      .from("close_friends")
+      .insert({ owner_id: ownerId, friend_id: friendId }));
+    if (!error || /duplicate|unique/i.test(error.message ?? "")) return null;
+  }
+
+  return error;
+}
+
+async function deleteCloseFriend(userClient: any, ownerId: string, friendId: string) {
+  await userClient.from("close_friends").delete().eq("user_id", ownerId).eq("friend_id", friendId);
+  await userClient.from("close_friends").delete().eq("owner_id", ownerId).eq("friend_id", friendId);
 }
 
 function formatProfile(p: any) {
@@ -345,37 +384,35 @@ friendsRouter.delete("/:id", async (c) => {
 // friends. Single source of truth for the home timeline's STAR filter.
 // Returns [] (never errors) if the close_friends table isn't set up yet.
 friendsRouter.get("/close-ids", async (c) => {
-  const user = c.get("user");
   const userId = c.get("userId");
   const token = c.get("accessToken");
-  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+  if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
-  const userClient = createUserClient(token);
-  const set = await getCloseFriendIds(userClient, userId);
+  // Service role so RLS / column quirks can't return an empty list after a successful star.
+  const set = await getCloseFriendIds(supabaseAdmin, userId);
   return c.json({ data: Array.from(set) });
 });
 
 // POST /api/friends/close/:userId — privately star a friend as a close friend.
-// Idempotent (upsert). No notification is ever sent; the other person can't see it.
 friendsRouter.post("/close/:userId", async (c) => {
-  const user = c.get("user");
   const userId = c.get("userId");
   const token = c.get("accessToken");
-  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+  if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
-  const { userId: targetId } = c.req.param();
-  if (targetId === userId) return c.json({ error: { message: "Cannot star yourself" } }, 400);
+  const targetId = c.req.param("userId");
+  if (!targetId || targetId === userId) {
+    return c.json({ error: { message: "Cannot star yourself" } }, 400);
+  }
 
-  const userClient = createUserClient(token);
-  const { error } = await userClient
-    .from("close_friends")
-    .upsert({ owner_id: userId, friend_id: targetId }, { onConflict: "owner_id,friend_id" });
+  // Prefer service role so missing RLS policies can't undo the optimistic UI.
+  const db = supabaseAdmin;
+  const error = await upsertCloseFriend(db, userId, targetId);
 
   if (error) {
-    // Most likely the table hasn't been created yet — tell the client clearly.
     if (/close_friends|relation|table|schema/i.test(error.message ?? "")) {
-      return c.json({ error: { message: "Close Friends isn't set up yet. Run the one-line SQL to enable it." } }, 400);
+      return c.json({ error: { message: "Close Friends isn't set up yet." } }, 400);
     }
+    console.error("[friends] close upsert failed:", error.message);
     return c.json({ error: { message: "Failed to update close friend" } }, 500);
   }
   return c.json({ data: { isCloseFriend: true } });
@@ -383,18 +420,12 @@ friendsRouter.post("/close/:userId", async (c) => {
 
 // DELETE /api/friends/close/:userId — remove the private star.
 friendsRouter.delete("/close/:userId", async (c) => {
-  const user = c.get("user");
   const userId = c.get("userId");
   const token = c.get("accessToken");
-  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+  if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
-  const { userId: targetId } = c.req.param();
-  const userClient = createUserClient(token);
-  await userClient
-    .from("close_friends")
-    .delete()
-    .eq("owner_id", userId)
-    .eq("friend_id", targetId);
+  const targetId = c.req.param("userId");
+  await deleteCloseFriend(supabaseAdmin, userId, targetId);
   return c.json({ data: { isCloseFriend: false } });
 });
 

@@ -6,24 +6,21 @@ function isMissingRelation(error: any): boolean {
   const code = String(error?.code ?? "");
   return (
     code === "42P01" ||
-    msg.includes("does not exist") ||
-    msg.includes("user_blocks") ||
-    msg.includes("Could not find the table")
+    /does not exist|user_blocks|Could not find the table/i.test(msg)
   );
 }
 
-/** Prefer service role; fall back to the caller's JWT so RLS still allows own-row writes. */
+function isDuplicate(error: any): boolean {
+  return /duplicate|unique|already exists/i.test(String(error?.message ?? ""));
+}
+
+/** Always prefer service role so RLS cannot silently reject moderation writes. */
 function writeClient(accessToken?: string | null) {
   if (env.SUPABASE_SERVICE_ROLE_KEY) return supabaseAdmin;
   if (accessToken) return createUserClient(accessToken);
   return supabaseAdmin;
 }
 
-/**
- * Bidirectional block set for `userId`.
- * Reads `user_blocks` when present, and also friendships with status='blocked'
- * so blocking still works on DBs that never got the user_blocks migration.
- */
 export async function getBlockedIds(userId: string, client: any = supabaseAdmin): Promise<string[]> {
   const others = new Set<string>();
 
@@ -39,7 +36,6 @@ export async function getBlockedIds(userId: string, client: any = supabaseAdmin)
     }
   }
 
-  // Fallback / dual-read: friendship rows marked blocked
   const { data: friendshipBlocks } = await client
     .from("friendships")
     .select("requester_id, receiver_id, status")
@@ -64,59 +60,54 @@ export async function isBlocked(
   return ids.includes(otherId);
 }
 
-/**
- * Persist a block. Tries `user_blocks` first; if that table is missing, stores
- * a friendships row with status='blocked' so the feature still works.
- */
 export async function createBlock(
   blockerId: string,
   blockedId: string,
   accessToken?: string | null
 ): Promise<{ ok: true } | { ok: false; message: string }> {
-  const db = writeClient(accessToken);
+  // Prefer service role; also try user JWT as a second chance.
+  const clients = env.SUPABASE_SERVICE_ROLE_KEY
+    ? [supabaseAdmin, ...(accessToken ? [createUserClient(accessToken)] : [])]
+    : [accessToken ? createUserClient(accessToken) : supabaseAdmin];
 
-  // Always remove friendship first so they leave each other's friend lists.
-  await db
-    .from("friendships")
-    .delete()
-    .or(
-      `and(requester_id.eq.${blockerId},receiver_id.eq.${blockedId}),and(requester_id.eq.${blockedId},receiver_id.eq.${blockerId})`
-    );
-
-  const { error } = await db.from("user_blocks").upsert(
-    { blocker_id: blockerId, blocked_id: blockedId },
-    { onConflict: "blocker_id,blocked_id" }
-  );
-
-  if (!error) return { ok: true };
-
-  if (!isMissingRelation(error)) {
-    console.error("[blocks] user_blocks upsert failed:", error.message, error.code);
-    // Still try friendship fallback below for FK / RLS edge cases after delete.
-  } else {
-    console.warn("[blocks] user_blocks missing — falling back to friendships.status=blocked");
+  // Remove friendship so they leave each other's friend lists.
+  for (const db of clients) {
+    await db
+      .from("friendships")
+      .delete()
+      .or(
+        `and(requester_id.eq.${blockerId},receiver_id.eq.${blockedId}),and(requester_id.eq.${blockedId},receiver_id.eq.${blockerId})`
+      );
   }
 
-  // Fallback: encode the block as a friendship row (insert, not upsert —
-  // some DBs lack the unique constraint name PostgREST expects for onConflict).
-  const { error: friendError } = await db.from("friendships").insert({
-    requester_id: blockerId,
-    receiver_id: blockedId,
-    status: "blocked",
-  });
+  let lastError = "";
 
-  if (friendError) {
-    // Duplicate is fine — already blocked via friendship.
-    const msg = String(friendError.message ?? "");
-    if (/duplicate|unique/i.test(msg)) return { ok: true };
+  for (const db of clients) {
+    // Prefer plain insert — upsert onConflict names differ across environments.
+    const { error: insertError } = await db
+      .from("user_blocks")
+      .insert({ blocker_id: blockerId, blocked_id: blockedId });
+
+    if (!insertError || isDuplicate(insertError)) return { ok: true };
+
+    if (!isMissingRelation(insertError)) {
+      lastError = insertError.message;
+      console.error("[blocks] user_blocks insert failed:", insertError.message, insertError.code);
+    }
+
+    // Friendship fallback encodes the block when user_blocks is unavailable.
+    const { error: friendError } = await db.from("friendships").insert({
+      requester_id: blockerId,
+      receiver_id: blockedId,
+      status: "blocked",
+    });
+
+    if (!friendError || isDuplicate(friendError)) return { ok: true };
+    lastError = friendError.message;
     console.error("[blocks] friendship fallback failed:", friendError.message);
-    return {
-      ok: false,
-      message: error?.message || friendError.message || "Failed to block user",
-    };
   }
 
-  return { ok: true };
+  return { ok: false, message: lastError || "Failed to block user" };
 }
 
 export async function removeBlock(
@@ -137,7 +128,6 @@ export async function removeBlock(
     return { ok: false, message: error.message };
   }
 
-  // Also clear any blocked friendship rows either direction.
   await db
     .from("friendships")
     .delete()
@@ -149,7 +139,6 @@ export async function removeBlock(
   return { ok: true };
 }
 
-/** Profiles the current user has blocked (one direction: I blocked them). */
 export async function listBlockedProfiles(
   userId: string,
   accessToken?: string | null
@@ -169,7 +158,6 @@ export async function listBlockedProfiles(
     }
   }
 
-  // Dual-read friendships marked blocked where I am the requester.
   const { data: friendRows } = await db
     .from("friendships")
     .select("receiver_id, created_at")

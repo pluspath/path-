@@ -539,12 +539,20 @@ usersRouter.get("/:id/posts", async (c) => {
     // Has the owner privately starred the viewer as a close friend?
     let isClose = false;
     if (isFriend) {
-      const { data: star } = await supabaseAdmin
+      let { data: star } = await supabaseAdmin
         .from("close_friends")
-        .select("owner_id")
-        .eq("owner_id", id)
+        .select("friend_id")
+        .eq("user_id", id)
         .eq("friend_id", userId)
         .maybeSingle();
+      if (!star) {
+        ({ data: star } = await supabaseAdmin
+          .from("close_friends")
+          .select("friend_id")
+          .eq("owner_id", id)
+          .eq("friend_id", userId)
+          .maybeSingle());
+      }
       isClose = !!star;
     }
 

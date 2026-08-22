@@ -23,12 +23,21 @@ const POST_SELECT = "*, profiles(*), reactions(user_id, type, profiles:user_id(a
 // close friends. Returns an empty set if the table isn't set up yet (graceful).
 async function getWhoStarredMe(viewerId: string): Promise<Set<string>> {
   try {
-    const { data, error } = await supabaseAdmin
+    // Support both schema variants: user_id (common) and owner_id (older).
+    let { data, error } = await supabaseAdmin
       .from("close_friends")
-      .select("owner_id")
+      .select("user_id")
       .eq("friend_id", viewerId);
-    if (error || !data) return new Set();
-    return new Set(data.map((r: any) => r.owner_id));
+
+    if (error || !data) {
+      ({ data, error } = await supabaseAdmin
+        .from("close_friends")
+        .select("owner_id")
+        .eq("friend_id", viewerId));
+      if (error || !data) return new Set();
+      return new Set(data.map((r: any) => r.owner_id).filter(Boolean));
+    }
+    return new Set(data.map((r: any) => r.user_id).filter(Boolean));
   } catch {
     return new Set();
   }

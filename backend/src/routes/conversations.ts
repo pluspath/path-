@@ -126,98 +126,123 @@ const emptyUser = (id = "unknown") => ({
 
 conversationsRouter.get("/", async (c) => {
   // Auth is JWT-derived userId (set only after supabase.auth.getUser succeeds).
-  // Do NOT require the profiles row (`user`) — missing profiles previously made
-  // messaging fail for one side of a chat while the other side worked.
   const userId = c.get("userId");
   const token = c.get("accessToken");
   if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
-  const db = adminOrUser(token);
+  // Always use service role for the inbox so RLS on participants/messages cannot
+  // return an empty list for a valid participant.
+  const db = supabaseAdmin;
 
-  const { data: participations } = await db
-    .from("conversation_participants")
-    .select("conversation_id, last_read_at")
-    .eq("user_id", userId);
-
-  const convIds = (participations ?? []).map((p: any) => p.conversation_id);
-  if (convIds.length === 0) return c.json({ data: [] });
-
-  const lastReadByConv: Record<string, string | null> = {};
-  for (const p of participations ?? []) lastReadByConv[p.conversation_id] = p.last_read_at ?? null;
-
-  const [{ data: conversations }, { data: allParticipants }, blockedIds] = await Promise.all([
-    db.from("conversations").select("*").in("id", convIds).order("updated_at", { ascending: false }),
-    db
+  try {
+    const { data: participations, error: partErr } = await db
       .from("conversation_participants")
-      .select("conversation_id, user_id")
-      .in("conversation_id", convIds)
-      .neq("user_id", userId),
-    getBlockedIds(userId, db),
-  ]);
+      .select("conversation_id, last_read_at")
+      .eq("user_id", userId);
 
-  const otherUserIdByConv: Record<string, string> = {};
-  for (const p of allParticipants ?? []) {
-    if (!otherUserIdByConv[p.conversation_id]) otherUserIdByConv[p.conversation_id] = p.user_id;
-  }
-
-  const blockedSet = new Set(blockedIds);
-  const visibleConversations = (conversations ?? []).filter((conv: any) => {
-    const otherUserId = otherUserIdByConv[conv.id];
-    return !otherUserId || !blockedSet.has(otherUserId);
-  });
-  const visibleIds = visibleConversations.map((c: any) => c.id);
-  if (visibleIds.length === 0) return c.json({ data: [] });
-
-  const otherUserIds = [
-    ...new Set(visibleIds.map((id: string) => otherUserIdByConv[id]).filter(Boolean)),
-  ];
-
-  // Batch: profiles + recent messages for all visible conversations (kills N+1).
-  const [{ data: profiles }, { data: recentMsgs }] = await Promise.all([
-    otherUserIds.length > 0
-      ? db.from("profiles").select("*").in("id", otherUserIds)
-      : Promise.resolve({ data: [] as any[] }),
-    db
-      .from("messages")
-      .select("id, conversation_id, content, text, created_at, sender_id, type")
-      .in("conversation_id", visibleIds)
-      .order("created_at", { ascending: false })
-      .limit(Math.min(visibleIds.length * 40, 800)),
-  ]);
-
-  const profilesById: Record<string, any> = {};
-  for (const p of profiles ?? []) profilesById[p.id] = formatProfile(p);
-
-  // First message per conversation (already sorted newest-first).
-  const lastMsgByConv: Record<string, any> = {};
-  const unreadByConv: Record<string, number> = {};
-  for (const id of visibleIds) unreadByConv[id] = 0;
-
-  for (const m of recentMsgs ?? []) {
-    if (!lastMsgByConv[m.conversation_id]) lastMsgByConv[m.conversation_id] = m;
-    if (m.sender_id === userId) continue;
-    const lastRead = lastReadByConv[m.conversation_id];
-    if (!lastRead || m.created_at > lastRead) {
-      unreadByConv[m.conversation_id] = (unreadByConv[m.conversation_id] ?? 0) + 1;
+    if (partErr) {
+      console.error("[conversations] list participations error:", partErr.message);
+      return c.json({ error: { message: "Failed to load conversations" } }, 500);
     }
+
+    const convIds = (participations ?? []).map((p: any) => p.conversation_id);
+    if (convIds.length === 0) return c.json({ data: [] });
+
+    const lastReadByConv: Record<string, string | null> = {};
+    for (const p of participations ?? []) lastReadByConv[p.conversation_id] = p.last_read_at ?? null;
+
+    const [{ data: conversations }, { data: allParticipants }, blockedIds] = await Promise.all([
+      db.from("conversations").select("*").in("id", convIds).order("updated_at", { ascending: false }),
+      db
+        .from("conversation_participants")
+        .select("conversation_id, user_id")
+        .in("conversation_id", convIds)
+        .neq("user_id", userId),
+      getBlockedIds(userId, db),
+    ]);
+
+    const otherUserIdByConv: Record<string, string> = {};
+    for (const p of allParticipants ?? []) {
+      if (!otherUserIdByConv[p.conversation_id]) otherUserIdByConv[p.conversation_id] = p.user_id;
+    }
+
+    const blockedSet = new Set(blockedIds);
+    const visibleConversations = (conversations ?? []).filter((conv: any) => {
+      const otherUserId = otherUserIdByConv[conv.id];
+      return !otherUserId || !blockedSet.has(otherUserId);
+    });
+    const visibleIds = visibleConversations.map((c: any) => c.id);
+    if (visibleIds.length === 0) return c.json({ data: [] });
+
+    const otherUserIds = [
+      ...new Set(visibleIds.map((id: string) => otherUserIdByConv[id]).filter(Boolean)),
+    ];
+
+    // Prefer selecting only widely-present columns (avoid failing the whole inbox
+    // when a legacy `text` column is missing or renamed).
+    let recentMsgs: any[] | null = null;
+    {
+      const primary = await db
+        .from("messages")
+        .select("id, conversation_id, content, created_at, sender_id, type")
+        .in("conversation_id", visibleIds)
+        .order("created_at", { ascending: false })
+        .limit(Math.min(visibleIds.length * 40, 800));
+      if (primary.error) {
+        console.warn("[conversations] messages select fallback:", primary.error.message);
+        const fallback = await db
+          .from("messages")
+          .select("*")
+          .in("conversation_id", visibleIds)
+          .order("created_at", { ascending: false })
+          .limit(Math.min(visibleIds.length * 40, 800));
+        recentMsgs = fallback.data;
+      } else {
+        recentMsgs = primary.data;
+      }
+    }
+
+    const { data: profiles } =
+      otherUserIds.length > 0
+        ? await db.from("profiles").select("*").in("id", otherUserIds)
+        : { data: [] as any[] };
+
+    const profilesById: Record<string, any> = {};
+    for (const p of profiles ?? []) profilesById[p.id] = formatProfile(p);
+
+    const lastMsgByConv: Record<string, any> = {};
+    const unreadByConv: Record<string, number> = {};
+    for (const id of visibleIds) unreadByConv[id] = 0;
+
+    for (const m of recentMsgs ?? []) {
+      if (!lastMsgByConv[m.conversation_id]) lastMsgByConv[m.conversation_id] = m;
+      if (m.sender_id === userId) continue;
+      const lastRead = lastReadByConv[m.conversation_id];
+      if (!lastRead || m.created_at > lastRead) {
+        unreadByConv[m.conversation_id] = (unreadByConv[m.conversation_id] ?? 0) + 1;
+      }
+    }
+
+    const result = visibleConversations.map((conv: any) => {
+      const otherUserId = otherUserIdByConv[conv.id];
+      const lastMsg = lastMsgByConv[conv.id];
+      const previewText = lastMsg?.content ?? lastMsg?.text ?? "";
+      return {
+        id: conv.id,
+        user: (otherUserId && profilesById[otherUserId]) || emptyUser(otherUserId),
+        lastMessage: lastMsg ? messagePreview(lastMsg.type, previewText) : "",
+        lastMessageTime: lastMsg?.created_at ?? conv.created_at,
+        lastMessageSenderId: lastMsg?.sender_id ?? null,
+        unreadCount: unreadByConv[conv.id] ?? 0,
+        messages: [],
+      };
+    });
+
+    return c.json({ data: result });
+  } catch (err) {
+    console.error("[conversations] list unexpected:", err);
+    return c.json({ error: { message: "Failed to load conversations" } }, 500);
   }
-
-  const result = visibleConversations.map((conv: any) => {
-    const otherUserId = otherUserIdByConv[conv.id];
-    const lastMsg = lastMsgByConv[conv.id];
-    const previewText = lastMsg?.content ?? lastMsg?.text ?? "";
-    return {
-      id: conv.id,
-      user: (otherUserId && profilesById[otherUserId]) || emptyUser(otherUserId),
-      lastMessage: lastMsg ? messagePreview(lastMsg.type, previewText) : "",
-      lastMessageTime: lastMsg?.created_at ?? conv.created_at,
-      lastMessageSenderId: lastMsg?.sender_id ?? null,
-      unreadCount: unreadByConv[conv.id] ?? 0,
-      messages: [],
-    };
-  });
-
-  return c.json({ data: result });
 });
 
 conversationsRouter.get("/:id", async (c) => {
