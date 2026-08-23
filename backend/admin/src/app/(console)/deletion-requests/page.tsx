@@ -148,7 +148,7 @@ export default function DeletionRequestsPage() {
       ) : (
         <>
           <DataTable columns={columns} rows={rows} rowKey={(r) => r.id} />
-          <PaginationBar page={meta.page} totalPages={meta.totalPages} onPageChange={setPage} />
+          <PaginationBar page={meta.page} totalPages={meta.totalPages} total={meta.total} onPageChange={setPage} />
         </>
       )}
     </div>
