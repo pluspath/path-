@@ -394,9 +394,11 @@ postsRouter.post("/", async (c) => {
   // the feed query below); 'private' is author-only; 'public'/'friends' behave as
   // today (visible to all accepted friends).
   if (body.audience && body.audience !== "friends") insertData.audience = body.audience;
-  // Disable Comments: only set when explicitly true (default false = omit, which
-  // matches the column default). Lets the insert succeed if the column is absent.
-  if (body.commentsDisabled === true) insertData.comments_disabled = true;
+  // Disable Comments: always persist when the client sends the field (true or
+  // false). Requires `comments_disabled` column — see migration 012.
+  if ("commentsDisabled" in body) {
+    insertData.comments_disabled = body.commentsDisabled === true;
+  }
 
   let { data: post, error } = await userClient
     .from("posts")
@@ -412,6 +414,10 @@ postsRouter.post("/", async (c) => {
     ("audience" in insertData || "comments_disabled" in insertData) &&
     /audience|comments_disabled|column/i.test(error.message ?? "")
   ) {
+    console.error(
+      "[posts] optional column missing on create — run migrations/012_posts_audience_comments_disabled.sql:",
+      error.message
+    );
     const { audience: _a, comments_disabled: _cd, ...withoutOptional } = insertData;
     ({ data: post, error } = await userClient
       .from("posts")
@@ -428,6 +434,26 @@ postsRouter.post("/", async (c) => {
       return c.json({ error: { message: "Repath isn't set up yet. Run the one-line SQL to enable it." } }, 400);
     }
     return c.json({ error: { message: "Failed to create post" } }, 500);
+  }
+
+  // Service-role safety net: if the client asked to disable comments but the
+  // inserted row doesn't reflect it (RLS/column quirks), force the flag.
+  const wantDisabled = body.commentsDisabled === true;
+  if (wantDisabled && post && !(post as any).comments_disabled) {
+    const { data: patched, error: patchErr } = await supabaseAdmin
+      .from("posts")
+      .update({ comments_disabled: true })
+      .eq("id", post.id)
+      .select(POST_SELECT)
+      .maybeSingle();
+    if (patchErr) {
+      console.error(
+        "[posts] failed to set comments_disabled — run migrations/012_posts_audience_comments_disabled.sql:",
+        patchErr.message
+      );
+    } else if (patched) {
+      post = patched;
+    }
   }
 
   // Resolve the nested original so the new repath renders immediately.
@@ -513,6 +539,10 @@ postsRouter.patch("/:id", async (c) => {
     ("audience" in updateData || "comments_disabled" in updateData) &&
     /audience|comments_disabled|column/i.test(error.message ?? "")
   ) {
+    console.error(
+      "[posts] optional column missing on update — run migrations/012_posts_audience_comments_disabled.sql:",
+      error.message
+    );
     const { audience: _a, comments_disabled: _cd, ...withoutOptional } = updateData;
     ({ data: updated, error } = await userClient
       .from("posts")
@@ -525,6 +555,28 @@ postsRouter.patch("/:id", async (c) => {
   if (error) {
     console.error("Update post error:", error);
     return c.json({ error: { message: "Failed to update post" } }, 500);
+  }
+
+  // Force comments_disabled via service role when the client asked for it but
+  // the user-scoped update didn't stick (missing column / RLS).
+  if ("commentsDisabled" in body && updated) {
+    const want = !!body.commentsDisabled;
+    if (!!(updated as any).comments_disabled !== want) {
+      const { data: patched, error: patchErr } = await supabaseAdmin
+        .from("posts")
+        .update({ comments_disabled: want })
+        .eq("id", id)
+        .select(SELECT)
+        .maybeSingle();
+      if (patchErr) {
+        console.error(
+          "[posts] failed to patch comments_disabled — run migrations/012_posts_audience_comments_disabled.sql:",
+          patchErr.message
+        );
+      } else if (patched) {
+        updated = patched;
+      }
+    }
   }
 
   return c.json({ data: formatPost(updated, userId) });
@@ -798,12 +850,11 @@ postsRouter.post("/:id/comments", async (c) => {
   const body = await c.req.json();
   const userClient = createUserClient(token);
 
-  // Block commenting when the moment's author turned comments off. `select("*")`
-  // is safe even before the `comments_disabled` column exists (it's just absent,
-  // so the guard is a no-op until the column is added — degrade-safe).
-  const { data: targetPost } = await userClient
+  // Block commenting when the moment's author turned comments off.
+  // Service role so RLS can't hide the comments_disabled flag.
+  const { data: targetPost } = await supabaseAdmin
     .from("posts")
-    .select("*")
+    .select("id, comments_disabled, user_id")
     .eq("id", id)
     .maybeSingle();
   if (targetPost?.comments_disabled) {
