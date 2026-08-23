@@ -105,7 +105,7 @@ socialRouter.get("/saved", async (c) => {
   return c.json({ data: ordered });
 });
 
-/** GET /api/social/liked-moments — moments the current user has reacted to */
+/** GET /api/social/liked-moments — moments the current user has interacted with */
 socialRouter.get("/liked-moments", async (c) => {
   const user = c.get("user");
   const userId = c.get("userId");
@@ -114,8 +114,15 @@ socialRouter.get("/liked-moments", async (c) => {
 
   const userClient = createUserClient(token);
 
-  // Do not select/order reactions.created_at — older DBs may lack that column,
-  // which made PostgREST fail and the Liked tab show nothing.
+  const orderedPostIds: string[] = [];
+  const seen = new Set<string>();
+  const add = (pid: string | null | undefined) => {
+    if (pid && !seen.has(pid)) {
+      seen.add(pid);
+      orderedPostIds.push(pid);
+    }
+  };
+
   const { data: myReactions, error: reactionsError } = await supabaseAdmin
     .from("reactions")
     .select("post_id")
@@ -125,16 +132,21 @@ socialRouter.get("/liked-moments", async (c) => {
     console.error("[social/liked-moments] reactions query failed:", reactionsError.message);
     return c.json({ error: { message: "Failed to load liked moments" } }, 500);
   }
+  for (const r of myReactions ?? []) add((r as any).post_id);
 
-  const orderedPostIds: string[] = [];
-  const seen = new Set<string>();
-  for (const r of myReactions ?? []) {
-    const pid = (r as any).post_id as string | undefined;
-    if (pid && !seen.has(pid)) {
-      seen.add(pid);
-      orderedPostIds.push(pid);
-    }
-  }
+  const { data: myComments } = await supabaseAdmin
+    .from("comments")
+    .select("post_id")
+    .eq("user_id", userId);
+  for (const row of myComments ?? []) add((row as any).post_id);
+
+  const { data: myRepaths } = await supabaseAdmin
+    .from("posts")
+    .select("repath_of")
+    .eq("user_id", userId)
+    .not("repath_of", "is", null);
+  for (const row of myRepaths ?? []) add((row as any).repath_of);
+
   if (orderedPostIds.length === 0) return c.json({ data: [] });
 
   // Same privacy boundary as the home feed: self + accepted friends, minus blocked.

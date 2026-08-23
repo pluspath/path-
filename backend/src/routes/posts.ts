@@ -228,45 +228,69 @@ postsRouter.get("/hashtag/:tag", async (c) => {
   return c.json({ data: matching.map((p) => formatPost(p, userId ?? undefined, blockedIds)) });
 });
 
-// GET /api/posts/reacted — moments the CURRENT user has reacted to (any
-// reaction they themselves gave). Respects the SAME privacy boundary as the
-// home feed: only moments the viewer can still access (their own + accepted
-// friends'). Declared before "/:id" so it isn't captured as an id.
-//
-// IMPORTANT: do NOT order/select reactions.created_at — older DBs never had
-// that column, and PostgREST then returns an error (silent empty Liked tab).
-postsRouter.get("/reacted", async (c) => {
+// Collect post ids the user has interacted with: reactions, comments, and
+// repaths (of someone else's moment). Order is insertion order (first touch).
+async function collectInteractedPostIds(userId: string): Promise<string[]> {
+  const ordered: string[] = [];
+  const seen = new Set<string>();
+  const add = (pid: string | null | undefined) => {
+    if (pid && !seen.has(pid)) {
+      seen.add(pid);
+      ordered.push(pid);
+    }
+  };
+
+  const { data: myReactions, error: reactionsError } = await supabaseAdmin
+    .from("reactions")
+    .select("post_id")
+    .eq("user_id", userId);
+  if (reactionsError) {
+    console.error("[posts/interacted] reactions query failed:", reactionsError.message);
+  } else {
+    for (const r of myReactions ?? []) add((r as any).post_id);
+  }
+
+  const { data: myComments, error: commentsError } = await supabaseAdmin
+    .from("comments")
+    .select("post_id")
+    .eq("user_id", userId);
+  if (commentsError) {
+    // Older / partial schemas may lack comments — don't fail the whole tab.
+    console.warn("[posts/interacted] comments query failed:", commentsError.message);
+  } else {
+    for (const row of myComments ?? []) add((row as any).post_id);
+  }
+
+  // Moments I repathed (the ORIGINAL id), so the Liked/Interacted tab shows the
+  // moment I engaged with, not my reshare row.
+  const { data: myRepaths, error: repathError } = await supabaseAdmin
+    .from("posts")
+    .select("repath_of")
+    .eq("user_id", userId)
+    .not("repath_of", "is", null);
+  if (repathError) {
+    // repath_of may not exist yet — ignore.
+    if (!/repath_of|column/i.test(repathError.message ?? "")) {
+      console.warn("[posts/interacted] repaths query failed:", repathError.message);
+    }
+  } else {
+    for (const row of myRepaths ?? []) add((row as any).repath_of);
+  }
+
+  return ordered;
+}
+
+// Shared handler for /reacted and /interacted.
+async function handleInteractedMoments(c: any) {
   const user = c.get("user");
   const userId = c.get("userId");
   const token = c.get("accessToken");
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const userClient = createUserClient(token);
-
-  const { data: myReactions, error: reactionsError } = await supabaseAdmin
-    .from("reactions")
-    .select("post_id")
-    .eq("user_id", userId);
-
-  if (reactionsError) {
-    console.error("[posts/reacted] reactions query failed:", reactionsError.message);
-    return c.json({ error: { message: "Failed to load liked moments" } }, 500);
-  }
-
-  // Distinct post ids (stable order — reaction table has no reliable timestamp
-  // on older schemas; we sort by post.created_at below).
-  const orderedPostIds: string[] = [];
-  const seen = new Set<string>();
-  for (const r of myReactions ?? []) {
-    const pid = (r as any).post_id as string | undefined;
-    if (pid && !seen.has(pid)) {
-      seen.add(pid);
-      orderedPostIds.push(pid);
-    }
-  }
+  const orderedPostIds = await collectInteractedPostIds(userId);
   if (orderedPostIds.length === 0) return c.json({ data: [] });
 
-  // Same privacy boundary as the feed (self + accepted friends), minus blocked.
   const blockedIds = await getBlockedIds(userId);
   const blockedSet = new Set(blockedIds);
   const allowedUserIds = new Set(
@@ -275,8 +299,6 @@ postsRouter.get("/reacted", async (c) => {
     )
   );
 
-  // Fetch by id via service role so a missing/partial posts RLS policy can't
-  // silently drop liked moments; privacy is enforced in JS below.
   const { data: posts, error: postsError } = await supabaseAdmin
     .from("posts")
     .select(POST_SELECT)
@@ -290,14 +312,20 @@ postsRouter.get("/reacted", async (c) => {
   const visible = (posts ?? []).filter((p: any) => allowedUserIds.has(p.user_id));
   await attachOriginals(userClient, visible);
 
-  // Newest moments first (post time — reliable across schemas).
   visible.sort(
     (a: any, b: any) =>
       new Date(b.created_at ?? 0).getTime() - new Date(a.created_at ?? 0).getTime()
   );
 
   return c.json({ data: visible.map((p: any) => formatPost(p, userId, blockedIds)) });
-});
+}
+
+// GET /api/posts/reacted — moments the CURRENT user has interacted with
+// (reacted, commented, or repathed). Same privacy boundary as the home feed.
+postsRouter.get("/reacted", handleInteractedMoments);
+
+// Alias for clarity on the client.
+postsRouter.get("/interacted", handleInteractedMoments);
 
 postsRouter.get("/:id", async (c) => {
   const user = c.get("user");
