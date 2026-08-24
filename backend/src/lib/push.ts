@@ -8,6 +8,16 @@ export async function sendPushNotification(
 ): Promise<void> {
   if (!pushToken || !pushToken.startsWith("ExponentPushToken")) return;
 
+  // Expo requires all `data` values to be strings. Non-strings are dropped or
+  // break deep-link handling on tap (app opens but never navigates).
+  const stringData: Record<string, string> = {};
+  if (data) {
+    for (const [key, value] of Object.entries(data)) {
+      if (value === undefined || value === null) continue;
+      stringData[key] = typeof value === "string" ? value : String(value);
+    }
+  }
+
   try {
     const res = await fetch("https://exp.host/--/api/v2/push/send", {
       method: "POST",
@@ -20,7 +30,7 @@ export async function sendPushNotification(
         to: pushToken,
         title,
         body,
-        data: data ?? {},
+        data: stringData,
         sound: "default",
         priority: "high",
         channelId: "default",

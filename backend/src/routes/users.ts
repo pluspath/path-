@@ -98,7 +98,10 @@ export function formatReactions(rawReactions: any[], viewerId?: string, ownerId?
       userId: r.user_id,
       type: baseReactionType(r.type),
       locked: isReactionLocked(r.type),
-      userAvatar: r.profiles?.avatar_url ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${r.user_id}`,
+      userAvatar:
+        r.profiles?.avatar_url && String(r.profiles.avatar_url).length > 0
+          ? r.profiles.avatar_url
+          : undefined,
     }));
 }
 
