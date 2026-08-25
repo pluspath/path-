@@ -60,6 +60,13 @@ app.get("/__marketing", (c) =>
         "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS location_lat DOUBLE PRECISION;",
         "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS location_lng DOUBLE PRECISION;",
         "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS repath_of UUID REFERENCES public.posts(id) ON DELETE SET NULL;",
+        `CREATE TABLE IF NOT EXISTS public.post_views (
+          post_id UUID NOT NULL REFERENCES public.posts(id) ON DELETE CASCADE,
+          user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+          viewed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (post_id, user_id)
+        );`,
+        "CREATE INDEX IF NOT EXISTS idx_post_views_post ON public.post_views (post_id, viewed_at DESC);",
         "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS audience TEXT DEFAULT 'friends';",
         "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS comments_disabled BOOLEAN DEFAULT FALSE;",
         "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active';",

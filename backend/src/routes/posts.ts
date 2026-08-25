@@ -452,10 +452,22 @@ postsRouter.post("/", async (c) => {
 
   if (error) {
     console.error("Create post error:", error);
-    // Repath attempted before the `repath_of` column exists → tell the client
-    // clearly instead of a generic failure, and never create a junk post.
+    // Repath column missing — add it automatically and retry once.
     if (body.repathOf && /repath_of|column/i.test(error.message ?? "")) {
-      return c.json({ error: { message: "Repath isn't set up yet. Run the one-line SQL to enable it." } }, 400);
+      const { ensureRepathColumn } = await import("../lib/schema");
+      await ensureRepathColumn();
+      ({ data: post, error } = await userClient
+        .from("posts")
+        .insert(insertData)
+        .select(POST_SELECT)
+        .single());
+      if (!error) {
+        if (post?.repath_of) await attachOriginals(userClient, [post]);
+        return c.json({ data: formatPost(post, userId) }, 201);
+      }
+    }
+    if (body.repathOf && /repath_of|column/i.test(error.message ?? "")) {
+      return c.json({ error: { message: "Repath failed. Please try again." } }, 500);
     }
     return c.json({ error: { message: "Failed to create post" } }, 500);
   }
@@ -756,12 +768,22 @@ postsRouter.post("/:id/view", async (c) => {
   if (ownerRow.user_id === userId) return c.body(null, 204);
 
   // Upsert; ignoreDuplicates means each viewer is recorded at most once.
-  await supabaseAdmin
+  const { error: viewErr } = await supabaseAdmin
     .from("post_views")
     .upsert(
       { post_id: id, user_id: userId, viewed_at: new Date().toISOString() },
       { onConflict: "post_id,user_id", ignoreDuplicates: true }
     );
+  if (viewErr) {
+    const { ensurePostViewsTable } = await import("../lib/schema");
+    await ensurePostViewsTable();
+    await supabaseAdmin
+      .from("post_views")
+      .upsert(
+        { post_id: id, user_id: userId, viewed_at: new Date().toISOString() },
+        { onConflict: "post_id,user_id", ignoreDuplicates: true }
+      );
+  }
 
   return c.body(null, 204);
 });

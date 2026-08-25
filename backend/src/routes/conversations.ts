@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { adminOrUser, supabaseAdmin } from "../supabase";
+import { supabaseAdmin } from "../supabase";
 import { sendPushNotification, getPushToken } from "../lib/push";
 import { encodeImages, decodeImages } from "../lib/images";
 import { getBlockedIds, isBlocked } from "../lib/blocks";
@@ -219,12 +219,22 @@ conversationsRouter.get("/", async (c) => {
 
     for (const m of recentMsgs ?? []) {
       if (!lastMsgByConv[m.conversation_id]) lastMsgByConv[m.conversation_id] = m;
-      if (m.sender_id === userId) continue;
-      const lastRead = lastReadByConv[m.conversation_id];
-      if (!lastRead || m.created_at > lastRead) {
-        unreadByConv[m.conversation_id] = (unreadByConv[m.conversation_id] ?? 0) + 1;
-      }
     }
+
+    // Exact unread counts from last_read_at (same logic as /unread-counts).
+    await Promise.all(
+      visibleIds.map(async (convId) => {
+        const lastRead = lastReadByConv[convId];
+        let query = db
+          .from("messages")
+          .select("*", { count: "exact", head: true })
+          .eq("conversation_id", convId)
+          .neq("sender_id", userId);
+        if (lastRead) query = query.gt("created_at", lastRead);
+        const { count } = await query;
+        unreadByConv[convId] = count ?? 0;
+      })
+    );
 
     const result = visibleConversations.map((conv: any) => {
       const otherUserId = otherUserIdByConv[conv.id];
@@ -240,6 +250,10 @@ conversationsRouter.get("/", async (c) => {
         messages: [],
       };
     });
+
+    result.sort(
+      (a, b) => new Date(b.lastMessageTime).getTime() - new Date(a.lastMessageTime).getTime()
+    );
 
     return c.json({ data: result });
   } catch (err) {
@@ -325,7 +339,7 @@ conversationsRouter.post("/unread-counts", async (c) => {
   const token = c.get("accessToken");
   if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
-  const db = adminOrUser(token);
+  const db = supabaseAdmin;
 
   const { data: participations } = await db
     .from("conversation_participants")
@@ -359,7 +373,7 @@ conversationsRouter.post("/:id/read", async (c) => {
   const token = c.get("accessToken");
   if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
-  const db = adminOrUser(token);
+  const db = supabaseAdmin;
 
   const { id } = c.req.param();
 
@@ -413,7 +427,10 @@ conversationsRouter.post("/:id/messages", async (c) => {
       : text ?? null;
 
   // Accept a single `image` (legacy) or an `images` array (up to 6).
-  const imageUrl = type === "location" ? null : encodeImages(images, image);
+  const hasImages = !!(images?.length || image);
+  const msgType =
+    type === "location" ? "location" : type === "ping" ? "ping" : hasImages ? "image" : type ?? "text";
+  const imageUrl = msgType === "location" ? null : encodeImages(images, image);
 
   // Dual-write content/text + image_url/image so both modern and legacy schemas work.
   const { data: message, error } = await db
@@ -425,7 +442,7 @@ conversationsRouter.post("/:id/messages", async (c) => {
       text: content,
       image_url: imageUrl,
       image: imageUrl,
-      type,
+      type: msgType,
     })
     .select()
     .single();
@@ -439,7 +456,7 @@ conversationsRouter.post("/:id/messages", async (c) => {
 
   // Fire-and-forget push: respond to the client immediately, deliver in background.
   const senderName = (user as any).full_name ?? "Someone";
-  notifyParticipantsInBackground(db, id, userId, senderName, messagePreview(type, text), {
+  notifyParticipantsInBackground(db, id, userId, senderName, messagePreview(msgType, text), {
     type: "message",
     conversationId: id,
   });

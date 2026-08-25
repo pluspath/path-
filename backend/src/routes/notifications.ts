@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { createUserClient } from "../supabase";
+import { supabaseAdmin } from "../supabase";
 import { getBlockedIds } from "../lib/blocks";
 import type { HonoVariables } from "../types";
 
@@ -11,13 +11,12 @@ notificationsRouter.get("/", async (c) => {
   const token = c.get("accessToken");
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
-  const userClient = createUserClient(token);
-  const { data: rawNotifications } = await userClient
+  const { data: rawNotifications } = await supabaseAdmin
     .from("notifications")
     .select("*")
     .eq("user_id", userId)
     .order("created_at", { ascending: false })
-    .limit(50);
+    .limit(120);
 
   // Hide notifications originating from a blocked user (either direction).
   const blockedSet = new Set(await getBlockedIds(userId));
@@ -31,7 +30,7 @@ notificationsRouter.get("/", async (c) => {
   const fromUserIds = [...new Set((notifications ?? []).map((n: any) => n.from_user_id).filter(Boolean))];
   let profileMap: Record<string, any> = {};
   if (fromUserIds.length > 0) {
-    const { data: profiles } = await userClient.from("profiles").select("*").in("id", fromUserIds as string[]);
+    const { data: profiles } = await supabaseAdmin.from("profiles").select("*").in("id", fromUserIds as string[]);
     for (const p of profiles ?? []) profileMap[p.id] = p;
   }
 
@@ -41,7 +40,7 @@ notificationsRouter.get("/", async (c) => {
   if (friendRequestNotifs.length > 0) {
     for (const n of friendRequestNotifs) {
       if (n.from_user_id) {
-        const { data: fs } = await userClient
+        const { data: fs } = await supabaseAdmin
           .from("friendships")
           .select("id, status")
           .eq("requester_id", n.from_user_id)

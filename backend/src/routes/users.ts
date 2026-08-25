@@ -93,7 +93,9 @@ export function formatReactions(rawReactions: any[], viewerId?: string, ownerId?
   const blockedSet = blockedIds.length > 0 ? new Set(blockedIds) : null;
   return (rawReactions ?? [])
     .filter((r: any) => !blockedSet || !blockedSet.has(r.user_id))
-    .filter((r: any) => !isReactionLocked(r.type) || r.user_id === viewerId || ownerId === viewerId)
+    // Locked reactions: visible to the moment owner and the reactor (for lock UI).
+    // Everyone else never receives locked reactions from the API.
+    .filter((r: any) => !isReactionLocked(r.type) || ownerId === viewerId || r.user_id === viewerId)
     .map((r: any) => ({
       userId: r.user_id,
       type: baseReactionType(r.type),
@@ -334,7 +336,15 @@ usersRouter.get("/me", async (c) => {
     supabaseAdmin.from("friendships").select("id", { count: "exact", head: true }).eq("status", "accepted").or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
   ]);
 
-  return c.json({ data: formatProfile(user, postsResult.count ?? 0, friendsResult.count ?? 0, userId) });
+  // Always read the profile row so username/avatar stay in sync with the DB.
+  const { data: profileRow } = await supabaseAdmin
+    .from("profiles")
+    .select("*")
+    .eq("id", userId)
+    .maybeSingle();
+
+  const profile = profileRow ?? user;
+  return c.json({ data: formatProfile(profile, postsResult.count ?? 0, friendsResult.count ?? 0, userId) });
 });
 
 // POST /api/set-gender — one-time gender selection for users who signed up
