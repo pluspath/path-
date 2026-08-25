@@ -462,7 +462,13 @@ usersRouter.put("/me", async (c) => {
   return c.json({ data: formatProfile(updated, postsResult.count ?? 0, friendsResult.count ?? 0, userId) });
 });
 
-// POST /api/me/deletion-request — queue account deletion for admin approval.
+import {
+  suspendAccountForDeletion,
+  permanentlyDeleteUser,
+  DELETION_SUSPEND_REASON,
+} from "../lib/account-deletion";
+
+// POST /api/me/deletion-request — immediately suspend account for 30-day deletion window.
 usersRouter.post("/me/deletion-request", async (c) => {
   const userId = c.get("userId");
   if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
@@ -470,87 +476,59 @@ usersRouter.post("/me/deletion-request", async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const reason = body?.reason ? String(body.reason).trim().slice(0, 1000) : null;
 
-  const { data: existing } = await supabaseAdmin
-    .from("account_deletion_requests")
-    .select("id, status, created_at")
-    .eq("user_id", userId)
-    .eq("status", "pending")
-    .maybeSingle();
-
-  if (existing) {
-    return c.json({ data: { id: existing.id, status: existing.status, createdAt: existing.created_at } });
+  const result = await suspendAccountForDeletion(userId, reason);
+  if (!result.ok) {
+    return c.json({ error: { message: result.message } }, 500);
   }
 
-  const { data, error } = await supabaseAdmin
-    .from("account_deletion_requests")
-    .insert({ user_id: userId, reason, status: "pending" })
-    .select("id, status, created_at")
-    .single();
-
-  if (error) {
-    console.error("[users] deletion-request failed:", error.message);
-    return c.json({ error: { message: "Failed to submit deletion request" } }, 500);
-  }
-
-  return c.json({ data: { id: data.id, status: data.status, createdAt: data.created_at } }, 201);
+  const now = new Date().toISOString();
+  return c.json({
+    data: {
+      status: "suspended",
+      suspendedAt: now,
+      message:
+        "Your account is suspended for 30 days. Sign in within 30 days to reactivate. After that, it will be permanently deleted.",
+    },
+  });
 });
 
 usersRouter.get("/me/deletion-request", async (c) => {
   const userId = c.get("userId");
   if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
 
-  const { data } = await supabaseAdmin
-    .from("account_deletion_requests")
-    .select("id, status, created_at, reason")
-    .eq("user_id", userId)
-    .in("status", ["pending", "approved"])
-    .order("created_at", { ascending: false })
-    .limit(1)
+  const { data: profile } = await supabaseAdmin
+    .from("profiles")
+    .select("status, suspended_at, suspended_reason")
+    .eq("id", userId)
     .maybeSingle();
 
-  return c.json({
-    data: data
-      ? { id: data.id, status: data.status, createdAt: data.created_at, reason: data.reason }
-      : null,
-  });
+  if (
+    profile?.status === "suspended" &&
+    profile.suspended_reason === DELETION_SUSPEND_REASON
+  ) {
+    return c.json({
+      data: {
+        status: "suspended",
+        suspendedAt: profile.suspended_at,
+      },
+    });
+  }
+
+  return c.json({ data: null });
 });
 
-// DELETE /api/me — permanently delete the signed-in account and auth user.
-// Prefer admin-approved deletion-request flow; this remains for service use.
+// DELETE /api/me — permanently delete (service / cron only; users use deletion-request).
 usersRouter.delete("/me", async (c) => {
   const userId = c.get("userId");
   if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
 
-  try {
-    await Promise.allSettled([
-      supabaseAdmin.from("notifications").delete().eq("user_id", userId),
-      supabaseAdmin.from("notifications").delete().eq("from_user_id", userId),
-      supabaseAdmin.from("user_blocks").delete().or(`blocker_id.eq.${userId},blocked_id.eq.${userId}`),
-      supabaseAdmin.from("friendships").delete().or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
-      supabaseAdmin.from("close_friends").delete().or(`user_id.eq.${userId},friend_id.eq.${userId}`),
-      supabaseAdmin.from("close_friends").delete().or(`owner_id.eq.${userId},friend_id.eq.${userId}`),
-      supabaseAdmin.from("reactions").delete().eq("user_id", userId),
-      supabaseAdmin.from("comments").delete().eq("user_id", userId),
-      supabaseAdmin.from("saved_posts").delete().eq("user_id", userId),
-      supabaseAdmin.from("posts").delete().eq("user_id", userId),
-      supabaseAdmin.from("conversation_participants").delete().eq("user_id", userId),
-      supabaseAdmin.from("messages").delete().eq("sender_id", userId),
-      supabaseAdmin.from("reports").delete().eq("reporter_user_id", userId),
-      supabaseAdmin.from("account_deletion_requests").delete().eq("user_id", userId),
-      supabaseAdmin.from("profiles").delete().eq("id", userId),
-    ]);
-
-    const { error } = await supabaseAdmin.auth.admin.deleteUser(userId);
-    if (error) {
-      console.error("[users] DELETE /me auth delete failed:", error.message);
-      return c.json({ error: { message: "Failed to delete account" } }, 500);
-    }
-
-    return c.body(null, 204);
-  } catch (err) {
-    console.error("[users] DELETE /me unexpected:", err);
+  const result = await permanentlyDeleteUser(userId);
+  if (!result.ok) {
+    console.error("[users] DELETE /me failed:", result.error);
     return c.json({ error: { message: "Failed to delete account" } }, 500);
   }
+
+  return c.body(null, 204);
 });
 
 // GET /api/:id

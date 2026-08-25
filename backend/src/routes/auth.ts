@@ -6,6 +6,11 @@ import { supabase, supabaseAdmin } from "../supabase";
 import { ensureJoinedPost } from "../lib/joined";
 import { isAdult } from "../lib/profileMeta";
 import { env } from "../env";
+import {
+  requestPasswordResetOtp,
+  verifyPasswordResetOtp,
+  confirmPasswordReset,
+} from "../lib/password-reset-otp";
 
 const authRouter = new Hono();
 
@@ -202,6 +207,56 @@ authRouter.post(
     }
 
     return c.json({ data: { success: true, message: "New verification code sent." } });
+  }
+);
+
+authRouter.post(
+  "/forgot-password",
+  zValidator("json", z.object({ email: z.string().email() })),
+  async (c) => {
+    const { email } = c.req.valid("json");
+    const result = await requestPasswordResetOtp(email);
+    if (!result.ok) return c.json({ error: { message: result.message } }, 400);
+    return c.json({ data: { success: true, message: "If an account exists, a reset code was sent." } });
+  }
+);
+
+authRouter.post(
+  "/verify-reset-otp",
+  zValidator("json", z.object({ email: z.string().email(), otp: z.string().length(6) })),
+  async (c) => {
+    const { email, otp } = c.req.valid("json");
+    const result = verifyPasswordResetOtp(email, otp);
+    if (!result.ok) return c.json({ error: { message: result.message } }, 400);
+    return c.json({ data: { success: true, verified: true } });
+  }
+);
+
+authRouter.post(
+  "/reset-password",
+  zValidator(
+    "json",
+    z.object({
+      email: z.string().email(),
+      password: z.string().min(6),
+    })
+  ),
+  async (c) => {
+    const { email, password } = c.req.valid("json");
+    const result = await confirmPasswordReset(email, password);
+    if (!result.ok) return c.json({ error: { message: result.message } }, 400);
+    return c.json({ data: { success: true, message: "Password updated successfully." } });
+  }
+);
+
+authRouter.post(
+  "/resend-reset-otp",
+  zValidator("json", z.object({ email: z.string().email() })),
+  async (c) => {
+    const { email } = c.req.valid("json");
+    const result = await requestPasswordResetOtp(email);
+    if (!result.ok) return c.json({ error: { message: result.message } }, 400);
+    return c.json({ data: { success: true, message: "A new reset code was sent." } });
   }
 );
 

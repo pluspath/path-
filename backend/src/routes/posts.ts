@@ -105,13 +105,37 @@ postsRouter.get("/", async (c) => {
     .order("created_at", { ascending: false })
     .limit(50);
 
+  // Public moments from non-friends appear in the home feed when audience is "public".
+  const friendIdSet = new Set(friendIds);
+  const { data: publicPosts } = await userClient
+    .from("posts")
+    .select(POST_SELECT)
+    .eq("audience", "public")
+    .order("created_at", { ascending: false })
+    .limit(40);
+
+  const publicFromOthers = (publicPosts ?? []).filter(
+    (p: any) =>
+      p.user_id !== userId &&
+      !friendIdSet.has(p.user_id) &&
+      !blockedSet.has(p.user_id)
+  );
+
+  const mergedById = new Map<string, any>();
+  for (const p of [...(posts ?? []), ...publicFromOthers]) {
+    if (p?.id) mergedById.set(p.id, p);
+  }
+  const allPosts = Array.from(mergedById.values()).sort(
+    (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+  );
+
   // Per-post audience enforcement. `whoStarredMe` = the set of authors who have
   // privately starred ME as a close friend (read with the admin client because
   // RLS hides other users' close_friends rows). A post with audience='close' is
   // delivered only to the author's starred close friends; 'private' is author-
   // only; everything else (incl. a missing `audience` column) behaves as today.
   const whoStarredMe = await getWhoStarredMe(userId!);
-  const visible = (posts ?? []).filter((p: any) => {
+  const visible = (allPosts ?? []).filter((p: any) => {
     if (p.user_id === userId) return true; // my own moments always show
     const audience = p.audience ?? "friends";
     if (audience === "private") return false;
@@ -801,12 +825,51 @@ postsRouter.get("/:id/views", async (c) => {
   return c.json({ data: { seenCount: viewers.length, friendTotal, viewers } });
 });
 
+async function isAcceptedFriend(viewerId: string, authorId: string): Promise<boolean> {
+  const { data } = await supabaseAdmin
+    .from("friendships")
+    .select("id")
+    .eq("status", "accepted")
+    .or(
+      `and(requester_id.eq.${viewerId},receiver_id.eq.${authorId}),and(requester_id.eq.${authorId},receiver_id.eq.${viewerId})`
+    )
+    .maybeSingle();
+  return !!data;
+}
+
+async function canViewerSeeComment(
+  viewerId: string | undefined,
+  postRow: { user_id: string; audience?: string | null },
+  commentAuthorId: string,
+  whoStarredViewer: Set<string>
+): Promise<boolean> {
+  if (!viewerId) return false;
+  const ownerId = postRow.user_id;
+  if (viewerId === ownerId || viewerId === commentAuthorId) return true;
+
+  const audience = postRow.audience ?? "friends";
+  if (audience === "private") return false;
+  if (audience === "close") return whoStarredViewer.has(ownerId);
+  if (audience === "public") return true;
+  return isAcceptedFriend(viewerId, ownerId);
+}
+
 postsRouter.get("/:id/comments", async (c) => {
   const user = c.get("user");
   const userId = c.get("userId");
   if (!user) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const { id } = c.req.param();
+
+  const { data: postRow } = await supabaseAdmin
+    .from("posts")
+    .select("user_id, audience")
+    .eq("id", id)
+    .maybeSingle();
+
+  if (!postRow) return c.json({ error: { message: "Post not found" } }, 404);
+
+  const whoStarredMe = userId ? await getWhoStarredMe(userId) : new Set<string>();
 
   const { data: comments, error } = await supabaseAdmin
     .from("comments")
@@ -819,12 +882,16 @@ postsRouter.get("/:id/comments", async (c) => {
     return c.json({ error: { message: "Failed to fetch comments" } }, 500);
   }
 
-  // Hide comments authored by a blocked user (either direction).
   const blockedSet = userId ? new Set(await getBlockedIds(userId)) : null;
 
-  const formatted = (comments ?? [])
-    .filter((comment: any) => !blockedSet || !blockedSet.has(comment.user_id))
-    .map((comment: any) => ({
+  const visibleComments: any[] = [];
+  for (const comment of comments ?? []) {
+    if (blockedSet?.has(comment.user_id)) continue;
+    const allowed = await canViewerSeeComment(userId, postRow, comment.user_id, whoStarredMe);
+    if (allowed) visibleComments.push(comment);
+  }
+
+  const formatted = visibleComments.map((comment: any) => ({
     id: comment.id,
     postId: comment.post_id,
     userId: comment.user_id,

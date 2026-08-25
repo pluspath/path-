@@ -90,14 +90,17 @@ function notifyParticipantsInBackground(
 
       await Promise.all(
         (otherParticipants ?? []).map(async (participant: any) => {
-          // In-app notification (bell) so alerts work even when push tokens are missing.
-          await db.from("notifications").insert({
-            user_id: participant.user_id,
-            from_user_id: senderId,
-            type: data?.type === "ping" ? "ping" : "message",
-            message: body,
-            read: false,
-          });
+          // DM alerts (message/ping) live on the Messages tab via unread counts — not the bell.
+          const isDm = data?.type === "ping" || data?.type === "message";
+          if (!isDm) {
+            await db.from("notifications").insert({
+              user_id: participant.user_id,
+              from_user_id: senderId,
+              type: data?.type ?? "message",
+              message: body,
+              read: false,
+            });
+          }
 
           const pushToken = await getPushToken(db, participant.user_id);
           await sendPushNotification(pushToken, senderName, body, data);

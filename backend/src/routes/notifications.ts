@@ -22,7 +22,10 @@ notificationsRouter.get("/", async (c) => {
   // Hide notifications originating from a blocked user (either direction).
   const blockedSet = new Set(await getBlockedIds(userId));
   const notifications = (rawNotifications ?? []).filter(
-    (n: any) => !n.from_user_id || !blockedSet.has(n.from_user_id)
+    (n: any) =>
+      (!n.from_user_id || !blockedSet.has(n.from_user_id)) &&
+      n.type !== "ping" &&
+      n.type !== "message"
   );
 
   const fromUserIds = [...new Set((notifications ?? []).map((n: any) => n.from_user_id).filter(Boolean))];

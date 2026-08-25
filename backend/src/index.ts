@@ -24,6 +24,13 @@ import { apiLimiter } from "./lib/rate-limit";
 import { secureHeadersMiddleware } from "./admin/middlewares/secure-headers";
 import { backfillJoinedPosts } from "./lib/joined";
 import { env, supabaseProjectRef } from "./env";
+import {
+  purgeExpiredDeletionAccounts,
+  reactivateDeletionSuspendedAccount,
+  DELETION_SUSPEND_REASON,
+  isDeletionGracePeriod,
+  shouldPurgeDeletionAccount,
+} from "./lib/account-deletion";
 import type { HonoVariables } from "./types";
 
 const app = new Hono<{ Variables: HonoVariables }>();
@@ -52,6 +59,12 @@ app.get("/__marketing", (c) =>
         "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS email_notifications_enabled BOOLEAN NOT NULL DEFAULT FALSE;",
         "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS location_lat DOUBLE PRECISION;",
         "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS location_lng DOUBLE PRECISION;",
+        "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS repath_of UUID REFERENCES public.posts(id) ON DELETE SET NULL;",
+        "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS audience TEXT DEFAULT 'friends';",
+        "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS comments_disabled BOOLEAN DEFAULT FALSE;",
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active';",
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS suspended_at TIMESTAMPTZ;",
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS suspended_reason TEXT;",
         // Liked Moments queries / reaction toggles — optional timestamp (older DBs lacked it)
         "ALTER TABLE public.reactions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();",
         // Messages: align API fields (content/image_url/type) with legacy text/image schema
@@ -126,6 +139,7 @@ app.get("/__marketing", (c) =>
         // Hot-path indexes for messaging performance
         "CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON public.messages (conversation_id, created_at DESC);",
         "CREATE INDEX IF NOT EXISTS idx_conversation_participants_user ON public.conversation_participants (user_id);",
+        "ALTER TABLE public.notifications ADD COLUMN IF NOT EXISTS conversation_id UUID;",
         "CREATE INDEX IF NOT EXISTS idx_notifications_user_created ON public.notifications (user_id, created_at DESC);",
         // Fix participants RLS without recursion (SECURITY DEFINER helper)
         `CREATE OR REPLACE FUNCTION public.is_conversation_participant(conv_id uuid)
@@ -190,6 +204,18 @@ app.get("/__marketing", (c) =>
   // One-time idempotent backfill: ensure every existing user has a "Joined
   // Path+" moment as the oldest item on their timeline.
   await backfillJoinedPosts();
+
+  // Purge accounts past the deletion grace window, then every 6 hours.
+  const runPurge = async () => {
+    try {
+      const n = await purgeExpiredDeletionAccounts();
+      if (n > 0) console.log(`[account-deletion] Cron purged ${n} account(s)`);
+    } catch (e) {
+      console.warn("[account-deletion] Cron purge error:", e instanceof Error ? e.message : e);
+    }
+  };
+  await runPurge();
+  setInterval(runPurge, 6 * 60 * 60 * 1000);
 })();
 
 // Surface Supabase connectivity problems immediately in logs (no secrets).
@@ -284,10 +310,33 @@ app.use("*", async (c, next) => {
         const { data: profile } = await userClient
           .from("profiles")
           .select(
-            "id, full_name, username, avatar_url, bio, location, birthday, gender, cover_url, created_at, show_age, show_zodiac, username_changed, push_notifications_enabled, email_notifications_enabled, post_visibility, push_token"
+            "id, full_name, username, avatar_url, bio, location, birthday, gender, cover_url, created_at, show_age, show_zodiac, username_changed, push_notifications_enabled, email_notifications_enabled, post_visibility, push_token, status, suspended_at, suspended_reason"
           )
           .eq("id", authUser.id)
           .maybeSingle();
+
+        if (profile?.status === "suspended") {
+          const reason = profile.suspended_reason ?? "";
+          const suspendedAt = profile.suspended_at as string | null;
+
+          if (reason === DELETION_SUSPEND_REASON && suspendedAt) {
+            if (shouldPurgeDeletionAccount(suspendedAt)) {
+              // Cron should have removed this; block until purge completes.
+              return c.json({ error: { message: "Account no longer available" } }, 403);
+            }
+            if (isDeletionGracePeriod(suspendedAt)) {
+              // User signed in within 30 days — reactivate automatically.
+              await reactivateDeletionSuspendedAccount(authUser.id);
+              profile.status = "active";
+              profile.suspended_at = null;
+              profile.suspended_reason = null;
+            } else {
+              return c.json({ error: { message: "Account no longer available" } }, 403);
+            }
+          } else {
+            return c.json({ error: { message: "Account suspended. Contact support@pathplus.store" } }, 403);
+          }
+        }
 
         c.set("user", profile ?? { id: authUser.id, full_name: authUser.user_metadata?.full_name ?? "Someone" });
       } else if (error) {
