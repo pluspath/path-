@@ -78,6 +78,7 @@ app.get("/__marketing", (c) =>
         "ALTER TABLE public.messages ADD COLUMN IF NOT EXISTS content TEXT;",
         "ALTER TABLE public.messages ADD COLUMN IF NOT EXISTS image_url TEXT;",
         "ALTER TABLE public.messages ADD COLUMN IF NOT EXISTS type TEXT DEFAULT 'text';",
+        "ALTER TABLE public.messages ADD COLUMN IF NOT EXISTS reply_to UUID;",
         "UPDATE public.messages SET content = text WHERE content IS NULL AND text IS NOT NULL;",
         "UPDATE public.messages SET image_url = image WHERE image_url IS NULL AND image IS NOT NULL;",
         "UPDATE public.messages SET text = content WHERE (text IS NULL OR text = '') AND content IS NOT NULL;",

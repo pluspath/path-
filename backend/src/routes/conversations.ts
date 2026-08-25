@@ -27,12 +27,14 @@ function formatProfile(p: any) {
 // Normalize a DB message row into the API message shape.
 // Location messages store their data as JSON in `content` (no dedicated columns),
 // so unpack them into locationName/locationLat/locationLng here.
-function mapMessage(m: any) {
+function mapMessage(m: any, replyPreview?: { id: string; text: string; type?: string; senderId?: string } | null) {
   const base = {
     id: m.id,
     senderId: m.sender_id,
     type: m.type ?? "text",
     createdAt: m.created_at,
+    replyToId: m.reply_to ?? undefined,
+    replyTo: replyPreview ?? undefined,
   };
   if (m.type === "location") {
     try {
@@ -74,6 +76,46 @@ function mapMessage(m: any) {
     image: images[0] ?? undefined,
     images: images.length > 0 ? images : undefined,
   };
+}
+
+function previewFromMessageRow(m: any): string {
+  if (!m) return "";
+  if (m.type === "image") return "📷 Photo";
+  if (m.type === "location") {
+    try {
+      const loc = JSON.parse(m.content ?? m.text ?? "{}");
+      return loc.name ?? "📍 Location";
+    } catch {
+      return "📍 Location";
+    }
+  }
+  if (m.type === "audio") return "🎤 Voice message";
+  if (m.type === "music") return "🎵 Music";
+  if (m.type === "ping") return "👋 Ping";
+  return m.content ?? m.text ?? "";
+}
+
+async function attachReplyPreviews(db: any, mapped: any[], rows: any[]) {
+  const replyIds = [...new Set(rows.map((r) => r.reply_to).filter(Boolean))];
+  if (replyIds.length === 0) return mapped;
+  const { data: parents } = await db.from("messages").select("*").in("id", replyIds);
+  const byId: Record<string, any> = {};
+  for (const p of parents ?? []) byId[p.id] = p;
+  return mapped.map((msg, i) => {
+    const parentId = rows[i]?.reply_to;
+    if (!parentId || !byId[parentId]) return msg;
+    const p = byId[parentId];
+    return {
+      ...msg,
+      replyToId: parentId,
+      replyTo: {
+        id: p.id,
+        text: previewFromMessageRow(p),
+        type: p.type ?? "text",
+        senderId: p.sender_id,
+      },
+    };
+  });
 }
 
 // Short human label for a message, used in push notifications + last-message previews.
@@ -336,6 +378,7 @@ conversationsRouter.get("/:id", async (c) => {
     .order("created_at", { ascending: true });
 
   const last = msgs?.[msgs.length - 1];
+  const mapped = await attachReplyPreviews(db, (msgs ?? []).map((m: any) => mapMessage(m)), msgs ?? []);
 
   return c.json({
     data: {
@@ -345,7 +388,7 @@ conversationsRouter.get("/:id", async (c) => {
       lastMessageTime: conv.updated_at,
       unreadCount: 0,
       otherLastReadAt,
-      messages: (msgs ?? []).map(mapMessage),
+      messages: mapped,
     },
   });
 });
@@ -426,6 +469,7 @@ conversationsRouter.post("/:id/messages", async (c) => {
     audioUrl,
     audioTitle,
     audioDuration,
+    replyToId,
   } = await c.req.json();
 
   // Security check: verify user is a participant
@@ -449,19 +493,7 @@ conversationsRouter.post("/:id/messages", async (c) => {
     return c.json({ error: { message: "Unable to message this user" } }, 403);
   }
 
-  // Location / audio / music messages encode metadata in `content`.
-  let content: string | null;
-  if (type === "location") {
-    content = JSON.stringify({ name: locationName ?? "", lat: locationLat ?? null, lng: locationLng ?? null });
-  } else if (type === "audio" || type === "music") {
-    content = JSON.stringify({
-      title: audioTitle ?? text ?? (type === "music" ? "Music" : "Voice message"),
-      duration: typeof audioDuration === "number" ? audioDuration : null,
-    });
-  } else {
-    content = text ?? null;
-  }
-
+  // Accept a single `image` (legacy) or an `images` array (up to 6).
   const hasImages = !!(images?.length || image);
   const hasAudio = !!(audioUrl && (type === "audio" || type === "music"));
   const msgType =
@@ -474,26 +506,88 @@ conversationsRouter.post("/:id/messages", async (c) => {
           : hasImages
             ? "image"
             : type ?? "text";
+
+  // Location / audio / music messages encode metadata in `content`.
+  // Image messages need a non-null text/content for schemas that require it.
+  let content: string | null;
+  if (msgType === "location") {
+    content = JSON.stringify({ name: locationName ?? "", lat: locationLat ?? null, lng: locationLng ?? null });
+  } else if (msgType === "audio" || msgType === "music") {
+    content = JSON.stringify({
+      title: audioTitle ?? text ?? (msgType === "music" ? "Music" : "Voice message"),
+      duration: typeof audioDuration === "number" ? audioDuration : null,
+    });
+  } else if (msgType === "image") {
+    content = text ?? "📷";
+  } else {
+    content = text ?? "";
+  }
+
   const imageUrl =
     msgType === "location" ? null : hasAudio ? audioUrl : encodeImages(images, image);
 
-  // Dual-write content/text + image_url/image so both modern and legacy schemas work.
-  const { data: message, error } = await db
-    .from("messages")
-    .insert({
-      conversation_id: id,
-      sender_id: userId,
-      content,
-      text: content,
-      image_url: imageUrl,
-      image: imageUrl,
-      type: msgType,
-    })
-    .select()
-    .single();
+  let replyTo: string | null = null;
+  if (typeof replyToId === "string" && replyToId.length > 0) {
+    const { data: parent } = await db
+      .from("messages")
+      .select("id, conversation_id")
+      .eq("id", replyToId)
+      .eq("conversation_id", id)
+      .maybeSingle();
+    if (parent?.id) replyTo = parent.id;
+  }
 
-  if (error) {
-    console.error("[conversations] send message error:", error.message);
+  const rowFull: Record<string, any> = {
+    conversation_id: id,
+    sender_id: userId,
+    content,
+    text: content,
+    image_url: imageUrl,
+    image: imageUrl,
+    type: msgType,
+  };
+  if (replyTo) rowFull.reply_to = replyTo;
+
+  let message: any = null;
+  let error: any = null;
+  ({ data: message, error } = await db.from("messages").insert(rowFull).select().single());
+
+  // Fall back when legacy columns are missing (or reply_to isn't migrated yet).
+  if (error && /column|content|text|image|reply/i.test(error.message ?? "")) {
+    const withoutReply = { ...rowFull };
+    delete withoutReply.reply_to;
+    ({ data: message, error } = await db.from("messages").insert(withoutReply).select().single());
+  }
+  if (error && /column|content|text|image/i.test(error.message ?? "")) {
+    ({ data: message, error } = await db
+      .from("messages")
+      .insert({
+        conversation_id: id,
+        sender_id: userId,
+        content,
+        image_url: imageUrl,
+        type: msgType,
+        ...(replyTo ? { reply_to: replyTo } : {}),
+      })
+      .select()
+      .single());
+  }
+  if (error && /column|content|text|image|reply/i.test(error.message ?? "")) {
+    ({ data: message, error } = await db
+      .from("messages")
+      .insert({
+        conversation_id: id,
+        sender_id: userId,
+        text: content,
+        image: imageUrl,
+        type: msgType,
+      })
+      .select()
+      .single());
+  }
+
+  if (error || !message) {
+    console.error("[conversations] send message error:", error?.message);
     return c.json({ error: { message: "Failed to send message" } }, 500);
   }
 
@@ -506,7 +600,51 @@ conversationsRouter.post("/:id/messages", async (c) => {
     conversationId: id,
   });
 
-  return c.json({ data: mapMessage(message) }, 201);
+  let mapped = mapMessage(message);
+  if (replyTo) {
+    const [withReply] = await attachReplyPreviews(db, [mapped], [message]);
+    mapped = withReply;
+  }
+
+  return c.json({ data: mapped }, 201);
+});
+
+// Delete a message. Only the original sender may delete their own message.
+conversationsRouter.delete("/:id/messages/:messageId", async (c) => {
+  const userId = c.get("userId");
+  const token = c.get("accessToken");
+  if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const db = supabaseAdmin;
+  const { id, messageId } = c.req.param();
+
+  const { data: participation } = await db
+    .from("conversation_participants")
+    .select("user_id")
+    .eq("conversation_id", id)
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (!participation) return c.json({ error: { message: "Unauthorized" } }, 403);
+
+  const { data: msg } = await db
+    .from("messages")
+    .select("id, sender_id, conversation_id")
+    .eq("id", messageId)
+    .eq("conversation_id", id)
+    .maybeSingle();
+
+  if (!msg) return c.json({ error: { message: "Not found" } }, 404);
+  if (msg.sender_id !== userId) {
+    return c.json({ error: { message: "You can only delete your own messages" } }, 403);
+  }
+
+  const { error } = await db.from("messages").delete().eq("id", messageId).eq("conversation_id", id);
+  if (error) {
+    console.error("[conversations] delete message error:", error.message);
+    return c.json({ error: { message: "Failed to delete message" } }, 500);
+  }
+
+  return c.json({ data: { ok: true } });
 });
 
 conversationsRouter.post("/start/:userId", async (c) => {
