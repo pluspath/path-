@@ -48,6 +48,22 @@ function mapMessage(m: any) {
       return { ...base, text: m.content ?? m.text ?? "" };
     }
   }
+  if (m.type === "audio" || m.type === "music") {
+    let meta: { title?: string; duration?: number } = {};
+    try {
+      meta = JSON.parse(m.content ?? m.text ?? "{}");
+    } catch {
+      meta = { title: m.content ?? m.text ?? undefined };
+    }
+    const audioUrl = decodeImages(m.image_url ?? m.image)[0] ?? m.image_url ?? undefined;
+    return {
+      ...base,
+      text: meta.title ?? (m.type === "music" ? "Music" : "Voice message"),
+      audioUrl,
+      audioTitle: meta.title,
+      audioDuration: typeof meta.duration === "number" ? meta.duration : undefined,
+    };
+  }
   // image_url may hold a single URL (legacy) or a JSON array (multi-image).
   // Also fall back to legacy `image` column.
   const images = decodeImages(m.image_url ?? m.image);
@@ -65,6 +81,8 @@ function messagePreview(type: string, text: string | null | undefined): string {
   if (type === "image") return "📷 Photo";
   if (type === "location") return "📍 Shared a location";
   if (type === "ping") return "👋 Pinged you";
+  if (type === "audio") return "🎤 Voice message";
+  if (type === "music") return "🎵 Music";
   return text ?? "Sent you a message";
 }
 
@@ -397,7 +415,18 @@ conversationsRouter.post("/:id/messages", async (c) => {
   const db = supabaseAdmin;
 
   const { id } = c.req.param();
-  const { text, image, images, type = "text", locationName, locationLat, locationLng } = await c.req.json();
+  const {
+    text,
+    image,
+    images,
+    type = "text",
+    locationName,
+    locationLat,
+    locationLng,
+    audioUrl,
+    audioTitle,
+    audioDuration,
+  } = await c.req.json();
 
   // Security check: verify user is a participant
   const { data: participation } = await db
@@ -420,17 +449,33 @@ conversationsRouter.post("/:id/messages", async (c) => {
     return c.json({ error: { message: "Unable to message this user" } }, 403);
   }
 
-  // Location messages have no dedicated columns — encode them as JSON in `content`.
-  const content =
-    type === "location"
-      ? JSON.stringify({ name: locationName ?? "", lat: locationLat ?? null, lng: locationLng ?? null })
-      : text ?? null;
+  // Location / audio / music messages encode metadata in `content`.
+  let content: string | null;
+  if (type === "location") {
+    content = JSON.stringify({ name: locationName ?? "", lat: locationLat ?? null, lng: locationLng ?? null });
+  } else if (type === "audio" || type === "music") {
+    content = JSON.stringify({
+      title: audioTitle ?? text ?? (type === "music" ? "Music" : "Voice message"),
+      duration: typeof audioDuration === "number" ? audioDuration : null,
+    });
+  } else {
+    content = text ?? null;
+  }
 
-  // Accept a single `image` (legacy) or an `images` array (up to 6).
   const hasImages = !!(images?.length || image);
+  const hasAudio = !!(audioUrl && (type === "audio" || type === "music"));
   const msgType =
-    type === "location" ? "location" : type === "ping" ? "ping" : hasImages ? "image" : type ?? "text";
-  const imageUrl = msgType === "location" ? null : encodeImages(images, image);
+    type === "location"
+      ? "location"
+      : type === "ping"
+        ? "ping"
+        : hasAudio
+          ? type
+          : hasImages
+            ? "image"
+            : type ?? "text";
+  const imageUrl =
+    msgType === "location" ? null : hasAudio ? audioUrl : encodeImages(images, image);
 
   // Dual-write content/text + image_url/image so both modern and legacy schemas work.
   const { data: message, error } = await db
