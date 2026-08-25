@@ -387,6 +387,59 @@ postsRouter.post("/", async (c) => {
   const body = await c.req.json();
   const userClient = createUserClient(token);
 
+  // Reshare ("Repath"): only set `repath_of` when this is actually a repath.
+  if (body.repathOf) {
+    const originalId = String(body.repathOf).trim();
+    if (!originalId) {
+      return c.json({ error: { message: "Invalid repath target" } }, 400);
+    }
+
+    const { ensureRepathColumn } = await import("../lib/schema");
+    const ready = await ensureRepathColumn();
+    if (!ready) {
+      return c.json({ error: { message: "Repath is temporarily unavailable. Please try again shortly." } }, 503);
+    }
+
+    const { data: original } = await supabaseAdmin
+      .from("posts")
+      .select("id")
+      .eq("id", originalId)
+      .maybeSingle();
+    if (!original) {
+      return c.json({ error: { message: "Original moment not found" } }, 404);
+    }
+
+    const repathInsert = {
+      user_id: userId,
+      type: body.type,
+      content: body.content || null,
+      repath_of: originalId,
+    };
+
+    let { data: post, error } = await supabaseAdmin
+      .from("posts")
+      .insert(repathInsert)
+      .select(POST_SELECT)
+      .single();
+
+    if (error && /repath_of|column/i.test(error.message ?? "")) {
+      await ensureRepathColumn();
+      ({ data: post, error } = await supabaseAdmin
+        .from("posts")
+        .insert(repathInsert)
+        .select(POST_SELECT)
+        .single());
+    }
+
+    if (error) {
+      console.error("[posts] repath create error:", error.message);
+      return c.json({ error: { message: "Failed to repath moment" } }, 500);
+    }
+
+    if (post?.repath_of) await attachOriginals(userClient, [post]);
+    return c.json({ data: formatPost(post, userId) }, 201);
+  }
+
   const insertData: Record<string, any> = {
     user_id: userId,
     type: body.type,
@@ -409,9 +462,6 @@ postsRouter.post("/", async (c) => {
     // Parse to minutes here so the Awake moment actually inserts.
     sleep_duration: parseDurationToMinutes(body.sleepDuration),
   };
-  // Reshare ("Repath"): only set `repath_of` when this is actually a repath, so
-  // normal posting is never affected if the column hasn't been added yet.
-  if (body.repathOf) insertData.repath_of = body.repathOf;
   // Audience ("Close Friends" etc.): only set when the client explicitly sends a
   // non-default value, so normal posting still works if the column doesn't exist
   // yet. 'close' delivers only to the author's starred close friends (enforced in
@@ -452,23 +502,6 @@ postsRouter.post("/", async (c) => {
 
   if (error) {
     console.error("Create post error:", error);
-    // Repath column missing — add it automatically and retry once.
-    if (body.repathOf && /repath_of|column/i.test(error.message ?? "")) {
-      const { ensureRepathColumn } = await import("../lib/schema");
-      await ensureRepathColumn();
-      ({ data: post, error } = await userClient
-        .from("posts")
-        .insert(insertData)
-        .select(POST_SELECT)
-        .single());
-      if (!error) {
-        if (post?.repath_of) await attachOriginals(userClient, [post]);
-        return c.json({ data: formatPost(post, userId) }, 201);
-      }
-    }
-    if (body.repathOf && /repath_of|column/i.test(error.message ?? "")) {
-      return c.json({ error: { message: "Repath failed. Please try again." } }, 500);
-    }
     return c.json({ error: { message: "Failed to create post" } }, 500);
   }
 

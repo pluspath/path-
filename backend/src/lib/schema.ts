@@ -1,31 +1,75 @@
+import postgres from "postgres";
 import { supabaseAdmin } from "../supabase";
 
-/** Run a DDL statement via exec_sql (no-op if RPC is missing). */
-async function execSql(sql: string): Promise<boolean> {
-  const { error } = await supabaseAdmin.rpc("exec_sql", { sql });
-  if (error) {
-    console.warn("[schema] exec_sql failed:", error.message);
+let repathColumnReady: boolean | null = null;
+
+/** Run DDL via exec_sql RPC, falling back to DATABASE_URL when RPC is missing. */
+async function runDdl(sql: string): Promise<boolean> {
+  const { error: rpcError } = await supabaseAdmin.rpc("exec_sql", { sql });
+  if (!rpcError) return true;
+
+  const databaseUrl = process.env.DATABASE_URL?.trim();
+  if (!databaseUrl) {
+    console.warn("[schema] exec_sql failed and DATABASE_URL is not set:", rpcError.message);
     return false;
   }
-  return true;
+
+  try {
+    const db = postgres(databaseUrl, { max: 1, ssl: "require" });
+    try {
+      await db.unsafe(sql);
+      return true;
+    } finally {
+      await db.end({ timeout: 5 });
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.warn("[schema] DATABASE_URL DDL failed:", message);
+    return false;
+  }
 }
 
-/** Ensure repath_of exists so POST /api/posts with repathOf succeeds. */
+/** Create exec_sql helper so later migrations can run without DATABASE_URL. */
+async function ensureExecSqlFunction(): Promise<boolean> {
+  return runDdl(`
+    CREATE OR REPLACE FUNCTION public.exec_sql(sql text)
+    RETURNS void
+    LANGUAGE plpgsql
+    SECURITY DEFINER
+    SET search_path = public
+    AS $$
+    BEGIN
+      EXECUTE sql;
+    END;
+    $$;
+    REVOKE ALL ON FUNCTION public.exec_sql(text) FROM PUBLIC;
+    REVOKE ALL ON FUNCTION public.exec_sql(text) FROM anon;
+    REVOKE ALL ON FUNCTION public.exec_sql(text) FROM authenticated;
+  `);
+}
+
+/** Ensure repath_of exists on posts (required for Repath). Safe to call repeatedly. */
 export async function ensureRepathColumn(): Promise<boolean> {
-  return execSql(
+  if (repathColumnReady === true) return true;
+
+  await ensureExecSqlFunction();
+
+  const ok = await runDdl(
     "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS repath_of UUID REFERENCES public.posts(id) ON DELETE SET NULL;"
   );
+
+  if (ok) {
+    repathColumnReady = true;
+    console.log("[schema] repath_of column ready");
+  } else {
+    console.warn("[schema] Could not ensure repath_of column");
+  }
+
+  return ok;
 }
 
-/** Ensure post_views exists for read-receipt stats on moments. */
-export async function ensurePostViewsTable(): Promise<boolean> {
-  return execSql(
-    `CREATE TABLE IF NOT EXISTS public.post_views (
-      post_id UUID NOT NULL REFERENCES public.posts(id) ON DELETE CASCADE,
-      user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
-      viewed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (post_id, user_id)
-    );
-    CREATE INDEX IF NOT EXISTS idx_post_views_post ON public.post_views (post_id, viewed_at DESC);`
-  );
+/** Probe whether repath_of is usable (cached after first successful ensure). */
+export async function isRepathColumnReady(): Promise<boolean> {
+  if (repathColumnReady === true) return true;
+  return ensureRepathColumn();
 }

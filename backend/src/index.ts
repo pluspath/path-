@@ -200,6 +200,8 @@ app.get("/__marketing", (c) =>
           console.warn(`[migration] exec_sql failed: ${error.message}`);
         }
       }
+      const { ensureRepathColumn } = await import("./lib/schema");
+      await ensureRepathColumn();
       console.log("[migration] column + posts RLS + social bootstrap finished");
     }
   } catch {
