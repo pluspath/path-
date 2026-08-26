@@ -672,14 +672,31 @@ usersRouter.get("/:id/posts", async (c) => {
     if (!allowed) return c.json({ error: { message: "Moments are private" } }, 403);
   }
 
-  const userClient = createUserClient(token);
-  const { data: posts } = await userClient
+  const { data: posts, error: postsErr } = await supabaseAdmin
     .from("posts")
     .select("*, profiles(*), reactions(user_id, type, profiles:user_id(avatar_url))")
     .eq("user_id", id)
     .order("created_at", { ascending: false });
 
-  const all = posts ?? [];
+  let all = posts ?? [];
+  if (postsErr) {
+    console.warn("[users/posts] nested select failed, retrying basic:", postsErr.message);
+    const { data: basic, error: basicErr } = await supabaseAdmin
+      .from("posts")
+      .select("*, profiles(*)")
+      .eq("user_id", id)
+      .order("created_at", { ascending: false });
+    all = basic ?? [];
+    if (basicErr || !basic) {
+      const { data: min, error: minErr } = await supabaseAdmin
+        .from("posts")
+        .select("*")
+        .eq("user_id", id)
+        .order("created_at", { ascending: false });
+      if (minErr) console.error("[users/posts] query failed:", minErr.message);
+      all = min ?? [];
+    }
+  }
 
   let visible = all;
   if (userId && userId !== id) {

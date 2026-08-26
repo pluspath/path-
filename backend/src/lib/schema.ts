@@ -61,6 +61,8 @@ export async function ensureRepathColumn(): Promise<boolean> {
   if (ok) {
     repathColumnReady = true;
     console.log("[schema] repath_of column ready");
+    // Force PostgREST to pick up the new column (avoids PGRST204 schema cache errors).
+    await runDdl("NOTIFY pgrst, 'reload schema';");
   } else {
     console.warn("[schema] Could not ensure repath_of column");
   }

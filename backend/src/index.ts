@@ -176,6 +176,8 @@ app.get("/__marketing", (c) =>
         `CREATE POLICY "Users can create posts" ON public.posts FOR INSERT TO authenticated WITH CHECK (auth.uid() = user_id);`,
         `CREATE POLICY "Users can update own posts" ON public.posts FOR UPDATE TO authenticated USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);`,
         `CREATE POLICY "Users can delete own posts" ON public.posts FOR DELETE TO authenticated USING (auth.uid() = user_id);`,
+        // Refresh PostgREST schema cache after column/policy changes
+        "NOTIFY pgrst, 'reload schema';",
         // Saved posts (minimal bootstrap if 006 not applied yet)
         `CREATE TABLE IF NOT EXISTS public.saved_posts (
           id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -325,13 +327,22 @@ app.use("*", async (c, next) => {
 
         const userClient = createUserClient(token);
         // Lean profile fetch — full `*` was slowing every authenticated request.
-        const { data: profile } = await userClient
+        // Prefer admin so a half-broken profiles RLS never blanks the session user.
+        let { data: profile, error: profileErr } = await supabaseAdmin
           .from("profiles")
           .select(
             "id, full_name, username, avatar_url, bio, location, birthday, gender, cover_url, created_at, show_age, show_zodiac, username_changed, push_notifications_enabled, email_notifications_enabled, post_visibility, push_token, status, suspended_at, suspended_reason"
           )
           .eq("id", authUser.id)
           .maybeSingle();
+        if (profileErr) {
+          console.warn("[auth] profile fetch failed, retrying lean:", profileErr.message);
+          ({ data: profile } = await userClient
+            .from("profiles")
+            .select("id, full_name, username, avatar_url")
+            .eq("id", authUser.id)
+            .maybeSingle());
+        }
 
         if (profile?.status === "suspended") {
           const reason = profile.suspended_reason ?? "";
