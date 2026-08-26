@@ -8,7 +8,7 @@ import { friendsRouter } from "./routes/friends";
 import { notificationsRouter } from "./routes/notifications";
 import { conversationsRouter } from "./routes/conversations";
 import { placesRouter } from "./routes/places";
-import { uploadRouter } from "./routes/upload";
+import { uploadRouter, ensurePostsBucketForChat } from "./routes/upload";
 import { moderationRouter } from "./routes/moderation";
 import { authRouter } from "./routes/auth";
 import { configRouter } from "./routes/config";
@@ -164,8 +164,8 @@ app.get("/__marketing", (c) =>
         `CREATE POLICY "Participants can view participants" ON public.conversation_participants FOR SELECT TO authenticated USING (public.is_conversation_participant(conversation_id));`,
         'DROP POLICY IF EXISTS "Participants can update own row" ON public.conversation_participants;',
         `CREATE POLICY "Participants can update own row" ON public.conversation_participants FOR UPDATE TO authenticated USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);`,
-        // Posts bucket should accept videos
-        `UPDATE storage.buckets SET file_size_limit = 52428800, allowed_mime_types = ARRAY['image/jpeg','image/png','image/webp','image/gif','video/mp4','video/quicktime','video/webm'] WHERE id = 'Posts';`,
+        // Posts bucket: images + video + chat audio (voice/music DMs)
+        `UPDATE storage.buckets SET file_size_limit = 52428800, allowed_mime_types = ARRAY['image/jpeg','image/jpg','image/png','image/webp','image/gif','video/mp4','video/quicktime','video/webm','audio/mpeg','audio/mp3','audio/mp4','audio/m4a','audio/aac','audio/wav','audio/webm','audio/x-m4a','audio/x-wav','audio/3gpp','audio/amr','audio/ogg'] WHERE id = 'Posts' OR name = 'Posts';`,
         // Critical posts RLS — fixes 42501 on POST /api/posts when policies were never applied
         "ALTER TABLE public.posts ENABLE ROW LEVEL SECURITY;",
         'DROP POLICY IF EXISTS "Anyone can view posts" ON public.posts;',
@@ -203,12 +203,20 @@ app.get("/__marketing", (c) =>
       }
       const { ensureRepathColumn } = await import("./lib/schema");
       await ensureRepathColumn();
+      await ensurePostsBucketForChat();
       console.log("[migration] column + posts RLS + social bootstrap finished");
     }
   } catch {
     console.log(
       "[migration] column/RLS migrations may not have run — run: bun run migrate:admin (see migrations/004_rls_policies.sql)."
     );
+  }
+
+  // Always widen Posts bucket MIME list for chat audio (safe if migration block failed).
+  try {
+    await ensurePostsBucketForChat();
+  } catch (e) {
+    console.warn("[boot] Posts bucket ensure failed:", e instanceof Error ? e.message : e);
   }
 
   // One-time idempotent backfill: ensure every existing user has a "Joined
