@@ -526,6 +526,13 @@ conversationsRouter.post("/:id/messages", async (c) => {
   const imageUrl =
     msgType === "location" ? null : hasAudio ? audioUrl : encodeImages(images, image);
 
+  if (msgType === "image" && !imageUrl) {
+    return c.json({ error: { message: "Image URL required" } }, 400);
+  }
+  if ((msgType === "audio" || msgType === "music") && !audioUrl) {
+    return c.json({ error: { message: "Audio URL required" } }, 400);
+  }
+
   let replyTo: string | null = null;
   if (typeof replyToId === "string" && replyToId.length > 0) {
     const { data: parent } = await db

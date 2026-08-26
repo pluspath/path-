@@ -28,6 +28,8 @@ const ALLOWED_AUDIO_TYPES = new Set([
   "audio/webm",
   "audio/x-m4a",
   "audio/x-wav",
+  "audio/3gpp",
+  "audio/amr",
 ]);
 
 const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
@@ -156,6 +158,7 @@ async function handleAudioUpload(c: any, bucket: string, prefix: string) {
       else if (rawName.endsWith(".wav")) contentType = "audio/wav";
       else if (rawName.endsWith(".webm")) contentType = "audio/webm";
       else if (rawName.endsWith(".aac")) contentType = "audio/aac";
+      else if (rawName.endsWith(".3gp")) contentType = "audio/3gpp";
       else contentType = "audio/mp4";
     }
 
