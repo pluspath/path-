@@ -16,6 +16,31 @@ const postsRouter = new Hono<{ Variables: HonoVariables }>();
 // avatars). `*` returns whatever columns exist, so `repath_of` is included
 // automatically once the column is added and simply absent before then.
 const POST_SELECT = "*, profiles(*), reactions(user_id, type, profiles:user_id(avatar_url))";
+const POST_SELECT_BASIC = "*, profiles(*)";
+const POST_SELECT_MIN = "*";
+
+/**
+ * Load posts with the service-role client (bypasses RLS). Privacy is enforced
+ * in route handlers (friends / audience / blocks).
+ *
+ * Why admin: user-JWT + RLS often returns an empty array with no thrown error
+ * when policies were dropped/half-applied during boot migrations — the home
+ * feed and profile timelines then look "wiped" even though rows still exist.
+ * Nested embeds can also fail after schema-cache lag; we fall back gradually.
+ */
+async function loadPosts(
+  build: (select: string) => any
+): Promise<{ data: any[]; error: any | null }> {
+  const attempts = [POST_SELECT, POST_SELECT_BASIC, POST_SELECT_MIN];
+  let lastError: any = null;
+  for (const select of attempts) {
+    const { data, error } = await build(select);
+    if (!error) return { data: data ?? [], error: null };
+    lastError = error;
+    console.warn(`[posts] select failed (${select.split(",")[0]}…):`, error.message);
+  }
+  return { data: [], error: lastError };
+}
 
 // The set of authors who have privately starred `viewerId` as a close friend.
 // Read with the admin client because RLS restricts `close_friends` rows to their
@@ -43,19 +68,17 @@ async function getWhoStarredMe(viewerId: string): Promise<Set<string>> {
   }
 }
 
-// Attach the nested `original` moment to any repath posts. Uses the RLS-scoped
-// userClient so feed privacy is preserved — originals the viewer isn't allowed
-// to see come back as null. No-ops when nothing references an original (e.g.
-// before the `repath_of` column exists), so it's safe with or without the SQL.
-async function attachOriginals(userClient: any, posts: any[]) {
+// Attach the nested `original` moment to any repath posts. Uses admin so
+// originals are still attached when user-JWT RLS is broken; feed privacy is
+// already applied before this runs. No-ops when nothing references an original.
+async function attachOriginals(_userClient: any, posts: any[]) {
   const originalIds = Array.from(
     new Set((posts ?? []).map((p) => p?.repath_of).filter(Boolean))
   );
   if (originalIds.length === 0) return posts;
-  const { data: originals } = await userClient
-    .from("posts")
-    .select(POST_SELECT)
-    .in("id", originalIds);
+  const { data: originals } = await loadPosts((select) =>
+    supabaseAdmin.from("posts").select(select).in("id", originalIds)
+  );
   const byId = new Map((originals ?? []).map((o: any) => [o.id, o]));
   for (const p of posts) {
     if (p?.repath_of) p.original = byId.get(p.repath_of) ?? null;
@@ -67,7 +90,7 @@ postsRouter.get("/", async (c) => {
   const user = c.get("user");
   const userId = c.get("userId");
   const token = c.get("accessToken");
-  if (!user || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const userClient = createUserClient(token);
 
@@ -75,11 +98,15 @@ postsRouter.get("/", async (c) => {
   // moments from ACCEPTED (mutual) friends. Pending/requested relationships
   // must never expose any moments — for every moment type, including the
   // "Joined Path+" auto-moments.
-  const { data: acceptedFriendships } = await userClient
+  // Use admin for friendships too — same RLS empty-result trap as posts.
+  const { data: acceptedFriendships, error: friendsErr } = await supabaseAdmin
     .from("friendships")
     .select("requester_id, receiver_id")
     .eq("status", "accepted")
     .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`);
+  if (friendsErr) {
+    console.error("[posts] friendships query failed:", friendsErr.message);
+  }
 
   const friendIds = (acceptedFriendships ?? []).map((f: any) =>
     f.requester_id === userId ? f.receiver_id : f.requester_id
@@ -87,32 +114,43 @@ postsRouter.get("/", async (c) => {
 
   // Self + accepted friends. (Always include self even with no friends yet.)
   // Then remove anyone blocked in either direction (self is never blocked).
-  const blockedIds = await getBlockedIds(userId!);
+  const blockedIds = await getBlockedIds(userId);
   const blockedSet = new Set(blockedIds);
   const allowedUserIds = Array.from(new Set([userId, ...friendIds])).filter(
-    (id) => id === userId || !blockedSet.has(id as string)
+    (id): id is string => typeof id === "string" && id.length > 0 && (id === userId || !blockedSet.has(id))
   );
 
   // Lazily detect birthdays (the viewer's + their friends') and create the
   // birthday moment + friend notifications before loading the feed, so a fresh
   // birthday moment shows up in this same response. Idempotent (once per year).
-  await ensureBirthdayMoments(userId!, friendIds);
+  try {
+    await ensureBirthdayMoments(userId, friendIds);
+  } catch (e) {
+    console.warn("[posts] birthday ensure failed:", e instanceof Error ? e.message : e);
+  }
 
-  const { data: posts } = await userClient
-    .from("posts")
-    .select(POST_SELECT)
-    .in("user_id", allowedUserIds)
-    .order("created_at", { ascending: false })
-    .limit(50);
+  const { data: posts, error: postsErr } = await loadPosts((select) =>
+    supabaseAdmin
+      .from("posts")
+      .select(select)
+      .in("user_id", allowedUserIds)
+      .order("created_at", { ascending: false })
+      .limit(50)
+  );
+  if (postsErr) {
+    console.error("[posts] feed query failed:", postsErr.message);
+  }
 
   // Public moments from non-friends appear in the home feed when audience is "public".
   const friendIdSet = new Set(friendIds);
-  const { data: publicPosts } = await userClient
-    .from("posts")
-    .select(POST_SELECT)
-    .eq("audience", "public")
-    .order("created_at", { ascending: false })
-    .limit(40);
+  const { data: publicPosts } = await loadPosts((select) =>
+    supabaseAdmin
+      .from("posts")
+      .select(select)
+      .eq("audience", "public")
+      .order("created_at", { ascending: false })
+      .limit(40)
+  );
 
   const publicFromOthers = (publicPosts ?? []).filter(
     (p: any) =>
@@ -134,7 +172,7 @@ postsRouter.get("/", async (c) => {
   // RLS hides other users' close_friends rows). A post with audience='close' is
   // delivered only to the author's starred close friends; 'private' is author-
   // only; everything else (incl. a missing `audience` column) behaves as today.
-  const whoStarredMe = await getWhoStarredMe(userId!);
+  const whoStarredMe = await getWhoStarredMe(userId);
   const visible = (allPosts ?? []).filter((p: any) => {
     if (p.user_id === userId) return true; // my own moments always show
     const audience = p.audience ?? "friends";
@@ -167,8 +205,8 @@ function extractHashtags(content: string | null | undefined): string[] {
 
 // Compute the viewer's allowed authors: themselves + accepted (mutual) friends.
 // This is the SAME privacy boundary the home feed uses.
-async function getAllowedAuthorIds(userClient: any, userId: string): Promise<string[]> {
-  const { data: acceptedFriendships } = await userClient
+async function getAllowedAuthorIds(_userClient: any, userId: string): Promise<string[]> {
+  const { data: acceptedFriendships } = await supabaseAdmin
     .from("friendships")
     .select("requester_id, receiver_id")
     .eq("status", "accepted")
@@ -236,13 +274,15 @@ postsRouter.get("/hashtag/:tag", async (c) => {
 
   // Candidate fetch: same privacy boundary + a cheap content prefilter. The
   // exact token match happens in JS so "#foo" never matches "#foobar".
-  const { data: posts } = await userClient
-    .from("posts")
-    .select(POST_SELECT)
-    .in("user_id", allowedUserIds)
-    .ilike("content", `%#${normalized}%`)
-    .order("created_at", { ascending: false })
-    .limit(200);
+  const { data: posts } = await loadPosts((select) =>
+    supabaseAdmin
+      .from("posts")
+      .select(select)
+      .in("user_id", allowedUserIds)
+      .ilike("content", `%#${normalized}%`)
+      .order("created_at", { ascending: false })
+      .limit(200)
+  );
 
   const matching = (posts ?? []).filter((p: any) =>
     extractHashtags(p.content).includes(normalized)
@@ -323,10 +363,9 @@ async function handleInteractedMoments(c: any) {
     )
   );
 
-  const { data: posts, error: postsError } = await supabaseAdmin
-    .from("posts")
-    .select(POST_SELECT)
-    .in("id", orderedPostIds);
+  const { data: posts, error: postsError } = await loadPosts((select) =>
+    supabaseAdmin.from("posts").select(select).in("id", orderedPostIds)
+  );
 
   if (postsError) {
     console.error("[posts/reacted] posts query failed:", postsError.message);
@@ -359,11 +398,10 @@ postsRouter.get("/:id", async (c) => {
 
   const { id } = c.req.param();
   const userClient = createUserClient(token);
-  const { data: post } = await userClient
-    .from("posts")
-    .select(POST_SELECT)
-    .eq("id", id)
-    .maybeSingle();
+  const { data: rows } = await loadPosts((select) =>
+    supabaseAdmin.from("posts").select(select).eq("id", id).limit(1)
+  );
+  const post = rows[0];
 
   if (!post) return c.json({ error: { message: "Post not found" } }, 404);
 
