@@ -12,11 +12,11 @@ import type { HonoVariables } from "../types";
 
 const postsRouter = new Hono<{ Variables: HonoVariables }>();
 
-// Standard post select: the row + author profile + reactions (with reactor
-// avatars). `*` returns whatever columns exist, so `repath_of` is included
-// automatically once the column is added and simply absent before then.
-const POST_SELECT = "*, profiles(*), reactions(user_id, type, profiles:user_id(avatar_url))";
-const POST_SELECT_BASIC = "*, profiles(*)";
+// Explicit FK hints — after `repath_of` (and any other FKs) PostgREST finds
+// multiple relationships between posts↔profiles and rejects bare `profiles(*)`.
+const POST_SELECT =
+  "*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(avatar_url))";
+const POST_SELECT_BASIC = "*, profiles!user_id(*)";
 const POST_SELECT_MIN = "*";
 
 /**
@@ -35,11 +35,30 @@ async function loadPosts(
   let lastError: any = null;
   for (const select of attempts) {
     const { data, error } = await build(select);
-    if (!error) return { data: data ?? [], error: null };
+    if (!error) {
+      const rows = data ?? [];
+      // If we fell back to bare `*`, hydrate author profiles so the app still
+      // gets names/avatars (formatPost reads `p.profiles`).
+      if (select === POST_SELECT_MIN && rows.length > 0 && !rows[0]?.profiles) {
+        await hydratePostProfiles(rows);
+      }
+      return { data: rows, error: null };
+    }
     lastError = error;
-    console.warn(`[posts] select failed (${select.split(",")[0]}…):`, error.message);
+    console.warn(`[posts] select failed:`, error.message);
   }
   return { data: [], error: lastError };
+}
+
+/** Attach `profiles` onto post rows when the embed select was unavailable. */
+async function hydratePostProfiles(posts: any[]): Promise<void> {
+  const ids = Array.from(new Set(posts.map((p) => p?.user_id).filter(Boolean)));
+  if (ids.length === 0) return;
+  const { data: profiles } = await supabaseAdmin.from("profiles").select("*").in("id", ids);
+  const byId = new Map((profiles ?? []).map((p: any) => [p.id, p]));
+  for (const post of posts) {
+    if (!post.profiles && post.user_id) post.profiles = byId.get(post.user_id) ?? null;
+  }
 }
 
 // The set of authors who have privately starred `viewerId` as a close friend.
@@ -630,7 +649,7 @@ postsRouter.patch("/:id", async (c) => {
   // Disable Comments: persist the boolean when the client sends it.
   if ("commentsDisabled" in body) updateData.comments_disabled = !!body.commentsDisabled;
 
-  const SELECT = "*, profiles(*), reactions(user_id, type, profiles:user_id(avatar_url))";
+  const SELECT = "*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(avatar_url))";
   let { data: updated, error } = await userClient
     .from("posts")
     .update(updateData)
@@ -785,7 +804,7 @@ postsRouter.post("/:id/reactions", async (c) => {
   }
 
   const { data: ownerRow } = await supabaseAdmin.from("posts").select("user_id").eq("id", id).maybeSingle();
-  const { data: reactions } = await supabaseAdmin.from("reactions").select("user_id, type, profiles:user_id(avatar_url)").eq("post_id", id);
+  const { data: reactions } = await supabaseAdmin.from("reactions").select("user_id, type, profiles!user_id(avatar_url)").eq("post_id", id);
   // Viewer here is the reactor — they always see their own reaction.
   return c.json({ data: { reactions: formatReactions(reactions ?? [], userId, ownerRow?.user_id) } });
 });
@@ -817,7 +836,7 @@ postsRouter.post("/:id/reactions/lock", async (c) => {
   await supabaseAdmin.from("reactions").update({ type: newType }).eq("post_id", id).eq("user_id", userId);
 
   const { data: ownerRow } = await supabaseAdmin.from("posts").select("user_id").eq("id", id).maybeSingle();
-  const { data: reactions } = await supabaseAdmin.from("reactions").select("user_id, type, profiles:user_id(avatar_url)").eq("post_id", id);
+  const { data: reactions } = await supabaseAdmin.from("reactions").select("user_id, type, profiles!user_id(avatar_url)").eq("post_id", id);
   return c.json({ data: { locked: nextLocked, reactions: formatReactions(reactions ?? [], userId, ownerRow?.user_id) } });
 });
 

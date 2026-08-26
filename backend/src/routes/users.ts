@@ -674,7 +674,7 @@ usersRouter.get("/:id/posts", async (c) => {
 
   const { data: posts, error: postsErr } = await supabaseAdmin
     .from("posts")
-    .select("*, profiles(*), reactions(user_id, type, profiles:user_id(avatar_url))")
+    .select("*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(avatar_url))")
     .eq("user_id", id)
     .order("created_at", { ascending: false });
 
@@ -683,7 +683,7 @@ usersRouter.get("/:id/posts", async (c) => {
     console.warn("[users/posts] nested select failed, retrying basic:", postsErr.message);
     const { data: basic, error: basicErr } = await supabaseAdmin
       .from("posts")
-      .select("*, profiles(*)")
+      .select("*, profiles!user_id(*)")
       .eq("user_id", id)
       .order("created_at", { ascending: false });
     all = basic ?? [];
@@ -695,6 +695,12 @@ usersRouter.get("/:id/posts", async (c) => {
         .order("created_at", { ascending: false });
       if (minErr) console.error("[users/posts] query failed:", minErr.message);
       all = min ?? [];
+      if (all.length > 0 && !all[0]?.profiles) {
+        const authorIds = Array.from(new Set(all.map((p: any) => p.user_id).filter(Boolean)));
+        const { data: profiles } = await supabaseAdmin.from("profiles").select("*").in("id", authorIds);
+        const byId = new Map((profiles ?? []).map((p: any) => [p.id, p]));
+        for (const p of all) p.profiles = byId.get(p.user_id) ?? null;
+      }
     }
   }
 

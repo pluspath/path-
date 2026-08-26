@@ -35,7 +35,7 @@ notificationsRouter.get("/", async (c) => {
   }
 
   // For friend_request notifications, fetch the friendship ID so mobile can accept/decline
-  const friendRequestNotifs = (notifications ?? []).filter((n: any) => n.type === 'friend_request');
+  const friendRequestNotifs = (notifications ?? []).filter((n: any) => n.type === "friend_request");
   let friendshipMap: Record<string, string> = {};
   if (friendRequestNotifs.length > 0) {
     for (const n of friendRequestNotifs) {
@@ -60,7 +60,9 @@ notificationsRouter.get("/", async (c) => {
         ? {
             id: profileMap[n.from_user_id].id,
             name: profileMap[n.from_user_id].full_name,
-            avatar: profileMap[n.from_user_id].avatar_url ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${n.from_user_id}`,
+            avatar:
+              profileMap[n.from_user_id].avatar_url ??
+              `https://api.dicebear.com/7.x/avataaars/svg?seed=${n.from_user_id}`,
           }
         : { id: "system", name: "Path+", avatar: "" },
       message: n.message,
@@ -80,8 +82,11 @@ notificationsRouter.post("/read-all", async (c) => {
   const token = c.get("accessToken");
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
-  const userClient = createUserClient(token);
-  await userClient.from("notifications").update({ read: true }).eq("user_id", userId).eq("read", false);
+  await supabaseAdmin
+    .from("notifications")
+    .update({ read: true })
+    .eq("user_id", userId)
+    .eq("read", false);
   return c.body(null, 204);
 });
 
@@ -92,8 +97,11 @@ notificationsRouter.post("/:id/read", async (c) => {
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const { id } = c.req.param();
-  const userClient = createUserClient(token);
-  await userClient.from("notifications").update({ read: true }).eq("id", id).eq("user_id", userId);
+  await supabaseAdmin
+    .from("notifications")
+    .update({ read: true })
+    .eq("id", id)
+    .eq("user_id", userId);
   return c.body(null, 204);
 });
 
