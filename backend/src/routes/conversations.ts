@@ -508,8 +508,8 @@ conversationsRouter.post("/:id/messages", async (c) => {
             : type ?? "text";
 
   // Location / audio / music messages encode metadata in `content`.
-  // Image messages need a non-null text/content for schemas that require it.
-  let content: string | null;
+  // DB has NOT NULL on `text` — never insert null for any message type.
+  let content: string;
   if (msgType === "location") {
     content = JSON.stringify({ name: locationName ?? "", lat: locationLat ?? null, lng: locationLng ?? null });
   } else if (msgType === "audio" || msgType === "music") {
@@ -518,9 +518,24 @@ conversationsRouter.post("/:id/messages", async (c) => {
       duration: typeof audioDuration === "number" ? audioDuration : null,
     });
   } else if (msgType === "image") {
-    content = text ?? "📷";
+    content = (typeof text === "string" && text.length > 0 ? text : "📷");
   } else {
-    content = text ?? "";
+    content = typeof text === "string" ? text : "";
+  }
+  // Empty string is allowed; null is not (Postgres NOT NULL on messages.text).
+  if (!content && msgType !== "text") {
+    content =
+      msgType === "image"
+        ? "📷"
+        : msgType === "audio"
+          ? "🎤"
+          : msgType === "music"
+            ? "🎵"
+            : msgType === "location"
+              ? "📍"
+              : msgType === "ping"
+                ? "👋"
+                : "";
   }
 
   const imageUrl =
@@ -560,18 +575,20 @@ conversationsRouter.post("/:id/messages", async (c) => {
   ({ data: message, error } = await db.from("messages").insert(rowFull).select().single());
 
   // Fall back when legacy columns are missing (or reply_to isn't migrated yet).
+  // Always keep `text` non-null — never omit it in any fallback.
   if (error && /column|content|text|image|reply/i.test(error.message ?? "")) {
     const withoutReply = { ...rowFull };
     delete withoutReply.reply_to;
     ({ data: message, error } = await db.from("messages").insert(withoutReply).select().single());
   }
-  if (error && /column|content|text|image/i.test(error.message ?? "")) {
+  if (error && /column|content|image|reply/i.test(error.message ?? "")) {
     ({ data: message, error } = await db
       .from("messages")
       .insert({
         conversation_id: id,
         sender_id: userId,
         content,
+        text: content,
         image_url: imageUrl,
         type: msgType,
         ...(replyTo ? { reply_to: replyTo } : {}),
@@ -579,7 +596,7 @@ conversationsRouter.post("/:id/messages", async (c) => {
       .select()
       .single());
   }
-  if (error && /column|content|text|image|reply/i.test(error.message ?? "")) {
+  if (error && /column|content|image|reply/i.test(error.message ?? "")) {
     ({ data: message, error } = await db
       .from("messages")
       .insert({
@@ -587,6 +604,18 @@ conversationsRouter.post("/:id/messages", async (c) => {
         sender_id: userId,
         text: content,
         image: imageUrl,
+        type: msgType,
+      })
+      .select()
+      .single());
+  }
+  if (error && /column|image/i.test(error.message ?? "")) {
+    ({ data: message, error } = await db
+      .from("messages")
+      .insert({
+        conversation_id: id,
+        sender_id: userId,
+        text: content,
         type: msgType,
       })
       .select()
