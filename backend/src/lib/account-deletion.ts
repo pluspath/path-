@@ -1,6 +1,7 @@
 import { Resend } from "resend";
 import { supabaseAdmin } from "../supabase";
 import { env } from "../env";
+import { resendFromAddress } from "./email-from";
 
 export const DELETION_SUSPEND_REASON = "account_deletion";
 /** User may log in and cancel deletion within this window (days). */
@@ -32,7 +33,7 @@ async function sendSuspensionEmail(email: string, fullName: string): Promise<voi
   const resend = new Resend(resendKey);
   const name = fullName || "there";
   const { error } = await resend.emails.send({
-    from: "noreply@pathplus.store",
+    from: resendFromAddress(),
     to: email,
     subject: "Your Path+ account is suspended for 30 days",
     html: `

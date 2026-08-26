@@ -16,7 +16,8 @@ We collect the following categories of information:
 
 ### Information you provide
 
-- **Account details:** your email address (used to sign in via a one-time code), your name, and your date of birth.
+- **Account details:** your email address and password (used to sign in), and your name/username.
+- **Optional profile details:** gender and date of birth, only if you choose to provide them. These are not required to create an account.
 - **Profile content:** your profile photo, cover photo, and any bio or details you add.
 - **Content you post:** photos, videos, text moments, reactions, comments, and messages you send to other users.
 

@@ -347,9 +347,9 @@ usersRouter.get("/me", async (c) => {
   return c.json({ data: formatProfile(profile, postsResult.count ?? 0, friendsResult.count ?? 0, userId) });
 });
 
-// POST /api/set-gender — one-time gender selection for users who signed up
-// before gender was mandatory. Refuses to overwrite an existing gender so it
-// can never be edited once set.
+// POST /api/set-gender — optional one-time gender selection.
+// Gender is NOT required to create or use an account (Apple 5.1.1(v)).
+// Refuses to overwrite an existing gender once set.
 usersRouter.post("/set-gender", async (c) => {
   const user = c.get("user");
   const userId = c.get("userId");
@@ -408,8 +408,8 @@ usersRouter.put("/me", async (c) => {
   if (body.username !== undefined) updateData.username = body.username;
   if (body.bio !== undefined) updateData.bio = body.bio;
   if (body.location !== undefined) updateData.location = body.location;
-  // birthday and gender are intentionally NOT editable here — they are fixed at
-  // signup. Only the age/zodiac visibility toggles can be changed.
+  // birthday and gender are optional profile fields; once set they are not
+  // changed here. Age/zodiac visibility toggles can still be updated.
   if (body.showAge !== undefined) updateData.show_age = !!body.showAge;
   if (body.showZodiac !== undefined) updateData.show_zodiac = !!body.showZodiac;
   if (body.coverPhoto !== undefined) updateData.cover_url = body.coverPhoto;

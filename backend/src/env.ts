@@ -25,6 +25,7 @@ function applyEnvFileOverrides() {
     "ADMIN_CORS_ORIGIN",
     "RESEND_API_KEY",
     "RESEND_FROM_EMAIL",
+    "PUBLIC_APP_URL",
   ]);
 
   let appliedFrom: string | null = null;
@@ -72,6 +73,8 @@ const envSchema = z.object({
   SUPABASE_ANON_KEY: z.string().min(1, "SUPABASE_ANON_KEY is required"),
   SUPABASE_SERVICE_ROLE_KEY: z.string().optional(),
   BACKEND_URL: z.string().default("http://localhost:3000"),
+  /** Public site / deep-link base for auth emails. Production: https://site.pathplus.store */
+  PUBLIC_APP_URL: z.string().url().optional(),
   GOOGLE_PLACES_API_KEY: z.string().min(1, "GOOGLE_PLACES_API_KEY is required"),
   OPENAI_API_KEY: z.string().optional(),
   BETTER_AUTH_SECRET: z.string().optional(),
@@ -113,6 +116,14 @@ function validateEnv() {
       );
     } else {
       console.log("[config] RESEND_API_KEY configured — OTP emails enabled");
+    }
+    if (parsed.PUBLIC_APP_URL) {
+      console.log(`[config] Public app URL: ${parsed.PUBLIC_APP_URL}`);
+      if (/localhost|127\.0\.0\.1/i.test(parsed.PUBLIC_APP_URL)) {
+        console.warn(
+          "[config] PUBLIC_APP_URL points at localhost — do not use this in production auth emails"
+        );
+      }
     }
     return parsed;
   } catch (error) {
