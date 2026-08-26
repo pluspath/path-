@@ -26,6 +26,10 @@ Set these on the production host (never commit real values):
 | `SUPABASE_SERVICE_ROLE_KEY` | Service role (backend only — never in the mobile app) |
 | `RESEND_API_KEY` | Resend API key for OTP emails |
 | `RESEND_FROM_EMAIL` | Optional. Default `Path+ <noreply@pathplus.store>` |
+| `CONFIG_ENCRYPTION_KEY` | Optional. Required to store Resend keys via Admin → External Services |
+
+Admins can also manage Resend settings from **Admin Dashboard → Settings → External Services**
+(DB config with env fallback). See `docs/EXTERNAL_SERVICES.md`.
 
 ## Resend setup
 

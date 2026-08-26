@@ -1,5 +1,7 @@
 // Sends an Expo push notification to a specific Expo push token
 // Uses Expo's free push notification service (not FCM directly).
+import { isPushEnabled } from "./external-config";
+
 export async function sendPushNotification(
   pushToken: string | null | undefined,
   title: string,
@@ -7,6 +9,8 @@ export async function sendPushNotification(
   data?: Record<string, any>
 ): Promise<void> {
   if (!pushToken || !pushToken.startsWith("ExponentPushToken")) return;
+
+  if (!(await isPushEnabled())) return;
 
   // Expo requires all `data` values to be strings. Non-strings are dropped or
   // break deep-link handling on tap (app opens but never navigates).

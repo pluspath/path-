@@ -1,7 +1,5 @@
-import { Resend } from "resend";
 import { supabaseAdmin } from "../supabase";
-import { env } from "../env";
-import { resendFromAddress } from "./email-from";
+import { sendAccountDeletionEmail } from "./email-service";
 
 export const DELETION_SUSPEND_REASON = "account_deletion";
 /** User may log in and cancel deletion within this window (days). */
@@ -25,37 +23,7 @@ export function shouldPurgeDeletionAccount(suspendedAt: string | null | undefine
 }
 
 async function sendSuspensionEmail(email: string, fullName: string): Promise<void> {
-  const resendKey = env.RESEND_API_KEY;
-  if (!resendKey) {
-    console.warn("[account-deletion] RESEND_API_KEY not set — suspension email skipped");
-    return;
-  }
-  const resend = new Resend(resendKey);
-  const name = fullName || "there";
-  const { error } = await resend.emails.send({
-    from: resendFromAddress(),
-    to: email,
-    subject: "Your Path+ account is suspended for 30 days",
-    html: `
-      <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto; padding: 32px;">
-        <h2 style="color: #0A1F44; margin-bottom: 8px;">Hi ${name},</h2>
-        <p style="color: #475569; line-height: 1.6; margin-bottom: 16px;">
-          Your Path+ account has been suspended for <strong>30 days</strong> as requested.
-          During this period your profile and data are kept but hidden from other users.
-        </p>
-        <p style="color: #475569; line-height: 1.6; margin-bottom: 16px;">
-          If you sign in again within 30 days, your account will be <strong>reactivated automatically</strong>
-          and deletion will be cancelled.
-        </p>
-        <p style="color: #475569; line-height: 1.6; margin-bottom: 24px;">
-          If you do not sign in within 30 days, your account and associated data will be
-          permanently deleted from our servers.
-        </p>
-        <p style="color: #94A3B8; font-size: 13px;">If you did not request this, contact privacy@pathplus.store immediately.</p>
-      </div>
-    `,
-  });
-  if (error) console.error("[account-deletion] suspension email failed:", error.message);
+  await sendAccountDeletionEmail(email, fullName);
 }
 
 /** Cascade-delete a user and their auth record. Idempotent-safe for cron retries. */

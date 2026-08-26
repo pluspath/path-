@@ -116,25 +116,21 @@ export async function getEmailConfig(): Promise<EmailConfig> {
   const apiKey = dbKey || envKey;
   const apiKeySource: EmailConfig["apiKeySource"] = dbKey ? "database" : envKey ? "env" : "none";
 
-  const fromEmailConfigured =
+  const fromName =
+    (typeof cfg.fromName === "string" && cfg.fromName.trim()) || "Path+";
+
+  const rawFrom =
     (typeof cfg.fromEmail === "string" && cfg.fromEmail.trim()) ||
     env.RESEND_FROM_EMAIL?.trim() ||
     "";
 
-  const fromName =
-    (typeof cfg.fromName === "string" && cfg.fromName.trim()) || "Path+";
-
-  let fromEmail = fromEmailConfigured;
-  if (!fromEmail) {
+  let fromEmail: string;
+  if (!rawFrom) {
     fromEmail = `${fromName} <noreply@pathplus.store>`;
-  } else if (!fromEmail.includes("<") && fromName) {
-    fromEmail = `${fromName} <${fromEmail.replace(/^.*<|>.*$/g, (m) => m).replace(/[<>]/g, "") || fromEmail}>`;
-    // If admin stored plain email, wrap with display name
-    if (!fromEmailConfigured.includes("<")) {
-      fromEmail = `${fromName} <${fromEmailConfigured}>`;
-    } else {
-      fromEmail = fromEmailConfigured;
-    }
+  } else if (rawFrom.includes("<")) {
+    fromEmail = rawFrom;
+  } else {
+    fromEmail = `${fromName} <${rawFrom}>`;
   }
 
   const publicAppUrl =

@@ -1,11 +1,9 @@
 import { Hono } from "hono";
 import { z } from "zod";
-import { Resend } from "resend";
 import { supabase, supabaseAdmin } from "../supabase";
 import { ensureJoinedPost } from "../lib/joined";
 import { isAdult } from "../lib/profileMeta";
-import { env } from "../env";
-import { publicAppUrl, resendFromAddress } from "../lib/email-from";
+import { sendSignupOtpEmail } from "../lib/email-service";
 import {
   requestPasswordResetOtp,
   verifyPasswordResetOtp,
@@ -38,29 +36,7 @@ function firstZodMessage(error: { issues: IssueLike[] }): string {
 }
 
 async function sendOTPEmail(email: string, otp: string, fullName: string): Promise<void> {
-  const resendKey = env.RESEND_API_KEY;
-  if (!resendKey) throw new Error("RESEND_API_KEY not configured");
-
-  const site = publicAppUrl();
-  const resend = new Resend(resendKey);
-  const { error } = await resend.emails.send({
-    from: resendFromAddress(),
-    to: email,
-    subject: "Your verification code",
-    html: `
-      <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto; padding: 32px;">
-        <h2 style="color: #0A1F44; margin-bottom: 8px;">Hi ${fullName},</h2>
-        <p style="color: #475569; margin-bottom: 24px;">Use this code to verify your Path+ account:</p>
-        <div style="background: #F1F5F9; border-radius: 12px; padding: 24px; text-align: center; margin-bottom: 24px;">
-          <span style="font-size: 40px; font-weight: 700; letter-spacing: 8px; color: #0A1F44;">${otp}</span>
-        </div>
-        <p style="color: #94A3B8; font-size: 13px;">This code expires in 10 minutes. Open the Path+ app and enter the code to finish signing up.</p>
-        <p style="color: #94A3B8; font-size: 12px; margin-top: 16px;">Learn more at <a href="${site}" style="color:#0A1F44;">${site.replace(/^https?:\/\//, "")}</a></p>
-      </div>
-    `,
-  });
-
-  if (error) throw new Error(error.message);
+  await sendSignupOtpEmail(email, otp, fullName);
 }
 
 /** Gender and date of birth are OPTIONAL (Apple Guideline 5.1.1(v)). */

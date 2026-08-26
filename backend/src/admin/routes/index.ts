@@ -11,6 +11,7 @@ import { notificationsRoutes } from "./notifications.routes";
 import { reportsRoutes } from "./reports.routes";
 import { deletionRequestsRoutes } from "./deletion-requests.routes";
 import { settingsRoutes, cmsRoutes } from "./settings.routes";
+import { externalServicesRoutes } from "./external-services.routes";
 import { filesRoutes } from "./files.routes";
 import { logsRoutes } from "./logs.routes";
 import { adminsRoutes } from "./admins.routes";
@@ -95,6 +96,7 @@ adminRouter.get("/", (c) =>
         "notifications",
         "reports",
         "settings",
+        "external-services",
         "cms",
         "files",
         "logs",
@@ -118,6 +120,7 @@ adminRouter.route("/notifications", notificationsRoutes);
 adminRouter.route("/reports", reportsRoutes);
 adminRouter.route("/deletion-requests", deletionRequestsRoutes);
 adminRouter.route("/settings", settingsRoutes);
+adminRouter.route("/external-services", externalServicesRoutes);
 adminRouter.route("/cms", cmsRoutes);
 adminRouter.route("/files", filesRoutes);
 adminRouter.route("/logs", logsRoutes);

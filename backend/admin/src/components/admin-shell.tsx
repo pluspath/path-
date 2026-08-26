@@ -24,6 +24,7 @@ import {
   UserCog,
   X,
   Trash2,
+  Cable,
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { useAuth } from "@/lib/auth";
@@ -62,6 +63,12 @@ const navGroups = [
       { href: "/admins", label: "Admin Accounts", icon: UserCog, permission: "admins:read" },
       { href: "/roles", label: "Roles", icon: Shield, permission: "admins:read" },
       { href: "/settings", label: "Settings", icon: Settings, permission: "settings:read" },
+      {
+        href: "/settings/external-services",
+        label: "External Services",
+        icon: Cable,
+        permission: "settings:read",
+      },
       { href: "/health", label: "System Health", icon: Server, permission: "health:read" },
     ],
   },
@@ -154,7 +161,11 @@ export function AdminShell({ children }: { children: React.ReactNode }) {
                 <div className="space-y-0.5">
                   {group.items.map((item) => {
                     const Icon = item.icon;
-                    const active = pathname === item.href || pathname.startsWith(item.href + "/");
+                    const exactOnly =
+                      item.href === "/settings" || item.href === "/dashboard";
+                    const active = exactOnly
+                      ? pathname === item.href
+                      : pathname === item.href || pathname.startsWith(item.href + "/");
                     return (
                       <Link
                         key={item.href}

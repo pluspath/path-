@@ -5,6 +5,28 @@ import { env } from "../env";
 import { hashPassword } from "./utils/password";
 import { adminUserRepository } from "./repositories/admin-user.repository";
 
+async function tryApplySqlFile(relativePath: string, label: string): Promise<void> {
+  const migrationPath = resolve(process.cwd(), relativePath);
+  if (!existsSync(migrationPath)) return;
+  try {
+    const sql = readFileSync(migrationPath, "utf8");
+    const { error } = await supabaseAdmin.rpc("exec_sql", { sql });
+    if (error) {
+      console.log(
+        `[admin] Could not auto-apply ${label} via exec_sql (apply ${relativePath} manually if needed):`,
+        error.message
+      );
+    } else {
+      console.log(`[admin] ${label} applied via exec_sql`);
+    }
+  } catch (e) {
+    console.log(
+      `[admin] ${label} auto-apply skipped:`,
+      e instanceof Error ? e.message : String(e)
+    );
+  }
+}
+
 /**
  * Ensures admin schema exists when possible (via exec_sql RPC) and seeds default admin.
  * Safe to call on every boot — all operations are idempotent.
@@ -15,27 +37,8 @@ export async function bootstrapAdminSystem(): Promise<void> {
     return;
   }
 
-  const migrationPath = resolve(process.cwd(), "migrations/001_admin_system.sql");
-  if (existsSync(migrationPath)) {
-    try {
-      const sql = readFileSync(migrationPath, "utf8");
-      // Prefer applying via RPC if available; otherwise rely on manual SQL application.
-      const { error } = await supabaseAdmin.rpc("exec_sql", { sql });
-      if (error) {
-        console.log(
-          "[admin] Could not auto-apply migration via exec_sql (apply migrations/001_admin_system.sql manually if needed):",
-          error.message
-        );
-      } else {
-        console.log("[admin] Migration applied via exec_sql");
-      }
-    } catch (e) {
-      console.log(
-        "[admin] Migration auto-apply skipped:",
-        e instanceof Error ? e.message : String(e)
-      );
-    }
-  }
+  await tryApplySqlFile("migrations/001_admin_system.sql", "Admin system migration");
+  await tryApplySqlFile("migrations/002_external_services.sql", "External services migration");
 
   try {
     const existing = await adminUserRepository.findByUsername("admin");

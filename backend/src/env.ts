@@ -26,6 +26,7 @@ function applyEnvFileOverrides() {
     "RESEND_API_KEY",
     "RESEND_FROM_EMAIL",
     "PUBLIC_APP_URL",
+    "CONFIG_ENCRYPTION_KEY",
   ]);
 
   let appliedFrom: string | null = null;
@@ -75,7 +76,7 @@ const envSchema = z.object({
   BACKEND_URL: z.string().default("http://localhost:3000"),
   /** Public site / deep-link base for auth emails. Production: https://site.pathplus.store */
   PUBLIC_APP_URL: z.string().url().optional(),
-  GOOGLE_PLACES_API_KEY: z.string().min(1, "GOOGLE_PLACES_API_KEY is required"),
+  GOOGLE_PLACES_API_KEY: z.string().optional(),
   OPENAI_API_KEY: z.string().optional(),
   BETTER_AUTH_SECRET: z.string().optional(),
   RESEND_API_KEY: z.string().optional(),
@@ -84,6 +85,12 @@ const envSchema = z.object({
   ADMIN_JWT_EXPIRES_IN: z.string().optional().default("8h"),
   ADMIN_DEFAULT_PASSWORD: z.string().optional(),
   ADMIN_CORS_ORIGIN: z.string().optional(),
+  /**
+   * AES-256-GCM master key for encrypting admin-managed secrets at rest.
+   * Prefer 64-char hex from: openssl rand -hex 32
+   * NEVER commit the real value. NEVER expose to clients.
+   */
+  CONFIG_ENCRYPTION_KEY: z.string().min(32).optional(),
 });
 
 function supabaseProjectRef(url: string): string {
@@ -112,10 +119,22 @@ function validateEnv() {
     }
     if (!parsed.RESEND_API_KEY?.trim()) {
       console.warn(
-        "[config] RESEND_API_KEY not set — signup OTP emails will not be sent"
+        "[config] RESEND_API_KEY not set — signup OTP emails will not be sent (unless configured in Admin → External Services)"
       );
     } else {
       console.log("[config] RESEND_API_KEY configured — OTP emails enabled");
+    }
+    if (!parsed.CONFIG_ENCRYPTION_KEY?.trim()) {
+      console.warn(
+        "[config] CONFIG_ENCRYPTION_KEY not set — Admin cannot store encrypted secrets in the database until configured"
+      );
+    } else {
+      console.log("[config] CONFIG_ENCRYPTION_KEY configured — secret encryption enabled");
+    }
+    if (!parsed.GOOGLE_PLACES_API_KEY?.trim()) {
+      console.warn(
+        "[config] GOOGLE_PLACES_API_KEY not set — Places API will use Admin External Services config if present"
+      );
     }
     if (parsed.PUBLIC_APP_URL) {
       console.log(`[config] Public app URL: ${parsed.PUBLIC_APP_URL}`);

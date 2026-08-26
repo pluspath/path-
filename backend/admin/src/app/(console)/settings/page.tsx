@@ -1,6 +1,7 @@
 ﻿"use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
@@ -91,11 +92,16 @@ export default function SettingsPage() {
         eyebrow="Operations" title="Settings"
         description="Application configuration and environment overview"
         actions={
-          hasPermission("settings:write") ? (
-            <Button disabled={busy} onClick={() => void save()}>
-              Save general settings
+          <div className="flex flex-wrap gap-2">
+            <Button variant="outline" asChild>
+              <Link href="/settings/external-services">External Services</Link>
             </Button>
-          ) : null
+            {hasPermission("settings:write") ? (
+              <Button disabled={busy} onClick={() => void save()}>
+                Save general settings
+              </Button>
+            ) : null}
+          </div>
         }
       />
 

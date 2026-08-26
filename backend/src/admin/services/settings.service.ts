@@ -14,6 +14,7 @@ const SENSITIVE_ENV_KEYS = [
   "GOOGLE_PLACES_API_KEY",
   "OPENAI_API_KEY",
   "BETTER_AUTH_SECRET",
+  "CONFIG_ENCRYPTION_KEY",
 ];
 
 export const settingsService = {
@@ -31,6 +32,7 @@ export const settingsService = {
         hasResendKey: !!env.RESEND_API_KEY,
         hasGooglePlacesKey: !!env.GOOGLE_PLACES_API_KEY,
         hasAdminJwtSecret: !!env.ADMIN_JWT_SECRET,
+        hasConfigEncryptionKey: !!env.CONFIG_ENCRYPTION_KEY,
       },
       // Never expose secret values — only presence flags above.
       redactedSecrets: SENSITIVE_ENV_KEYS,

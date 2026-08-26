@@ -1,20 +1,27 @@
 import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
 import { z } from "zod";
-import { env } from "../env";
+import { getGooglePlacesApiKey } from "../lib/external-config";
 import type { HonoVariables } from "../types";
 
 const placesRouter = new Hono<{ Variables: HonoVariables }>();
 
 placesRouter.post(
   "/nearby",
-  zValidator("json", z.object({
-    latitude: z.number(),
-    longitude: z.number(),
-    radius: z.number().optional().default(500),
-  })),
+  zValidator(
+    "json",
+    z.object({
+      latitude: z.number(),
+      longitude: z.number(),
+      radius: z.number().optional().default(500),
+    })
+  ),
   async (c) => {
     const { latitude, longitude, radius } = c.req.valid("json");
+    const apiKey = await getGooglePlacesApiKey();
+    if (!apiKey) {
+      return c.json({ error: { message: "Places service is not configured." } }, 503);
+    }
 
     const body = {
       locationRestriction: {
@@ -30,7 +37,7 @@ placesRouter.post(
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "X-Goog-Api-Key": env.GOOGLE_PLACES_API_KEY,
+        "X-Goog-Api-Key": apiKey,
         "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.types,places.rating",
       },
       body: JSON.stringify(body),
@@ -38,10 +45,11 @@ placesRouter.post(
 
     if (!response.ok) {
       const errText = await response.text();
-      return c.json({ error: { message: `Places API error: ${errText}` } }, 502);
+      console.error("[places] searchNearby failed:", response.status, errText.slice(0, 200));
+      return c.json({ error: { message: "Failed to search nearby places" } }, 502);
     }
 
-    const data = await response.json() as { places?: any[] };
+    const data = (await response.json()) as { places?: any[] };
     const places = (data.places ?? []).map((p: any) => ({
       name: p.displayName?.text ?? "Unknown Place",
       address: p.formattedAddress ?? "",

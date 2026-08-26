@@ -1,7 +1,5 @@
-import { Resend } from "resend";
 import { supabaseAdmin } from "../supabase";
-import { env } from "../env";
-import { publicAppUrl, resendFromAddress } from "./email-from";
+import { sendPasswordResetOtpEmail } from "./email-service";
 
 const OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const MAX_ATTEMPTS = 5;
@@ -34,34 +32,7 @@ function generateOTP(): string {
  * This avoids Supabase Site URL / localhost links in reset emails.
  */
 async function sendResetEmail(email: string, otp: string): Promise<void> {
-  const resendKey = env.RESEND_API_KEY;
-  if (!resendKey) throw new Error("RESEND_API_KEY not configured");
-
-  const site = publicAppUrl();
-  if (/localhost|127\.0\.0\.1/i.test(site)) {
-    console.warn(
-      "[password-reset] PUBLIC_APP_URL resolves to localhost — set PUBLIC_APP_URL for production"
-    );
-  }
-
-  const resend = new Resend(resendKey);
-  const { error } = await resend.emails.send({
-    from: resendFromAddress(),
-    to: email,
-    subject: "Your Path+ password reset code",
-    html: `
-      <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto; padding: 32px;">
-        <h2 style="color: #0A1F44; margin-bottom: 8px;">Reset your password</h2>
-        <p style="color: #475569; margin-bottom: 24px;">Use this code in the Path+ app to reset your password. No link is required.</p>
-        <div style="background: #F1F5F9; border-radius: 12px; padding: 24px; text-align: center; margin-bottom: 24px;">
-          <span style="font-size: 40px; font-weight: 700; letter-spacing: 8px; color: #0A1F44;">${otp}</span>
-        </div>
-        <p style="color: #94A3B8; font-size: 13px;">This code expires in 10 minutes and can only be used once. If you didn't request this, ignore this email.</p>
-        <p style="color: #94A3B8; font-size: 12px; margin-top: 16px;">Path+ · <a href="${site}" style="color:#0A1F44;">${site.replace(/^https?:\/\//, "")}</a></p>
-      </div>
-    `,
-  });
-  if (error) throw new Error(error.message);
+  await sendPasswordResetOtpEmail(email, otp);
 }
 
 /** Request a password-reset OTP. Returns generic success even if email unknown (no enumeration). */
