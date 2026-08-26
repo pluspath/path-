@@ -30,13 +30,33 @@ export type FriendEntry = { id: string; name: string; avatar: string | null };
 // both the new JSON-array format and legacy single-friend rows (where `content`
 // was the friend's plain name and `location`/`image_url` held the id/avatar).
 export function parseFriendshipFriends(row: any): FriendEntry[] {
+  const ownerId = row?.user_id ?? null;
+  const seen = new Set<string>();
+  const push = (list: FriendEntry[], f: FriendEntry) => {
+    if (!f.id || seen.has(f.id)) return;
+    if (ownerId && f.id === ownerId) return;
+    const name = (f.name ?? "").trim();
+    if (!name) return;
+    seen.add(f.id);
+    list.push({ id: String(f.id), name, avatar: f.avatar ?? null });
+  };
+
+  const out: FriendEntry[] = [];
+
   if (row?.content) {
     try {
       const parsed = JSON.parse(row.content);
       if (Array.isArray(parsed)) {
-        return parsed
-          .filter((f: any) => f && f.id)
-          .map((f: any) => ({ id: String(f.id), name: f.name ?? "", avatar: f.avatar ?? null }));
+        for (const f of parsed) {
+          if (f && f.id) {
+            push(out, {
+              id: String(f.id),
+              name: f.name ?? "",
+              avatar: f.avatar ?? null,
+            });
+          }
+        }
+        return out;
       }
     } catch {
       // not JSON → legacy single-friend row, fall through
@@ -44,9 +64,13 @@ export function parseFriendshipFriends(row: any): FriendEntry[] {
   }
   // Legacy row: content = name, location = friend id, image_url = avatar.
   if (row?.location || row?.content) {
-    return [{ id: row.location ?? "", name: row.content ?? "", avatar: row.image_url ?? null }];
+    push(out, {
+      id: row.location ?? "",
+      name: row.content ?? "",
+      avatar: row.image_url ?? null,
+    });
   }
-  return [];
+  return out;
 }
 
 // True if `isoDate` falls on the same calendar day as `now`. We don't store the
