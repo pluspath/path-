@@ -271,7 +271,15 @@ usersRouter.get("/username-check/:username", async (c) => {
     return c.json({ data: { available: false, reason: "Only letters, numbers, and underscores allowed" } });
   }
   const { data } = await supabase.from("profiles").select("id").eq("username", trimmed).maybeSingle();
-  return c.json({ data: { available: !data } });
+  if (data) {
+    return c.json({ data: { available: false, reason: "Username already taken" } });
+  }
+  const { data: pending } = await supabaseAdmin
+    .from("pending_registrations")
+    .select("id")
+    .ilike("username", trimmed)
+    .maybeSingle();
+  return c.json({ data: { available: !pending } });
 });
 
 // POST /api/setup-profile

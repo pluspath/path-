@@ -49,7 +49,7 @@ async function main() {
   }
   console.log("✓ Sign up succeeded:", signup.json?.data?.message ?? signup.json);
 
-  console.log("\n3. Supabase profile check...");
+  console.log("\n3. Verify NO active account exists before OTP...");
   const url = process.env.SUPABASE_URL!;
   const service = process.env.SUPABASE_SERVICE_ROLE_KEY!;
   if (url && service) {
@@ -57,17 +57,24 @@ async function main() {
     const admin = createClient(url, service, {
       auth: { autoRefreshToken: false, persistSession: false },
     });
-    const { data: profile, error } = await admin
+    const { data: profile } = await admin
       .from("profiles")
       .select("id, username, full_name")
       .eq("username", testUser.username)
       .maybeSingle();
-    if (error) {
-      console.log("✗ Profile lookup failed:", error.message);
-    } else if (profile) {
-      console.log("✓ Profile created in Supabase:", profile);
+    if (profile) {
+      console.log("✗ Profile should NOT exist before OTP verification:", profile);
+      process.exit(1);
+    }
+    const { data: pending } = await admin
+      .from("pending_registrations")
+      .select("email, username")
+      .eq("email", testUser.email)
+      .maybeSingle();
+    if (pending) {
+      console.log("✓ Pending registration stored (account not created yet):", pending);
     } else {
-      console.log("⚠ User may exist in auth but profile row not found yet");
+      console.log("⚠ pending_registrations row not found — run migration 014 or restart backend for boot DDL");
     }
   }
 

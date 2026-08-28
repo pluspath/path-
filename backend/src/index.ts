@@ -20,7 +20,7 @@ import {
 } from "./routes/content";
 import { adminRouter } from "./admin/routes";
 import { bootstrapAdminSystem } from "./admin/bootstrap";
-import { apiLimiter } from "./lib/rate-limit";
+import { apiLimiter, authLimiter } from "./lib/rate-limit";
 import { secureHeadersMiddleware } from "./admin/middlewares/secure-headers";
 import { backfillJoinedPosts } from "./lib/joined";
 import { env, supabaseProjectRef } from "./env";
@@ -216,6 +216,36 @@ app.get("/__marketing", (c) =>
         `CREATE POLICY "Users can unsave posts" ON public.saved_posts FOR DELETE TO authenticated USING (auth.uid() = user_id);`,
         'DROP POLICY IF EXISTS "Users can update own saved posts" ON public.saved_posts;',
         `CREATE POLICY "Users can update own saved posts" ON public.saved_posts FOR UPDATE TO authenticated USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);`,
+        // Pending email-verified registrations (no account until OTP verified)
+        `CREATE TABLE IF NOT EXISTS public.pending_registrations (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          email TEXT NOT NULL UNIQUE,
+          password_encrypted TEXT NOT NULL,
+          username TEXT NOT NULL,
+          full_name TEXT NOT NULL,
+          gender TEXT,
+          birthday TEXT,
+          otp_hash TEXT NOT NULL,
+          otp_expires_at TIMESTAMPTZ NOT NULL,
+          attempts INT NOT NULL DEFAULT 0,
+          last_sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          expires_at TIMESTAMPTZ NOT NULL
+        );`,
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_registrations_username_lower ON public.pending_registrations (LOWER(username));",
+        "CREATE INDEX IF NOT EXISTS idx_pending_registrations_expires ON public.pending_registrations (expires_at);",
+        "ALTER TABLE public.pending_registrations ENABLE ROW LEVEL SECURITY;",
+        `CREATE TABLE IF NOT EXISTS public.password_reset_otps (
+          email TEXT PRIMARY KEY,
+          user_id UUID NOT NULL,
+          otp_hash TEXT NOT NULL,
+          otp_expires_at TIMESTAMPTZ NOT NULL,
+          attempts INT NOT NULL DEFAULT 0,
+          last_sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          verified BOOLEAN NOT NULL DEFAULT FALSE
+        );`,
+        "CREATE INDEX IF NOT EXISTS idx_password_reset_otps_expires ON public.password_reset_otps (otp_expires_at);",
+        "ALTER TABLE public.password_reset_otps ENABLE ROW LEVEL SECURITY;",
       ];
       for (const sql of statements) {
         const { error } = await supabaseAdmin.rpc("exec_sql", { sql });
@@ -256,6 +286,23 @@ app.get("/__marketing", (c) =>
   };
   await runPurge();
   setInterval(runPurge, 6 * 60 * 60 * 1000);
+
+  const runAuthCleanup = async () => {
+    try {
+      const { purgeExpiredPendingRegistrations, purgeExpiredPasswordResetOtps } = await import(
+        "./routes/auth"
+      );
+      const pending = await purgeExpiredPendingRegistrations();
+      const resets = await purgeExpiredPasswordResetOtps();
+      if (pending > 0 || resets > 0) {
+        console.log(`[auth-cleanup] Purged ${pending} pending registration(s), ${resets} reset OTP(s)`);
+      }
+    } catch (e) {
+      console.warn("[auth-cleanup] error:", e instanceof Error ? e.message : e);
+    }
+  };
+  await runAuthCleanup();
+  setInterval(runAuthCleanup, 60 * 60 * 1000);
 })();
 
 // Surface Supabase connectivity problems immediately in logs (no secrets).
@@ -329,6 +376,7 @@ bootstrapAdminSystem()
 app.use("*", logger());
 app.use("/api/admin/*", secureHeadersMiddleware);
 app.use("/api/*", apiLimiter);
+app.use("/api/auth/*", authLimiter);
 
 app.use("*", async (c, next) => {
   c.set("user", null);

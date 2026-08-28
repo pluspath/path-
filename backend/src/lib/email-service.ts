@@ -127,7 +127,7 @@ export async function sendSignupOtpEmail(
     html: `
       <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto; padding: 32px;">
         <h2 style="color: #0A1F44; margin-bottom: 8px;">Hi ${escapeHtml(fullName)},</h2>
-        <p style="color: #475569; margin-bottom: 24px;">Use this code to verify your Path+ account:</p>
+        <p style="color: #475569; margin-bottom: 24px;">Your Path+ verification code is:</p>
         <div style="background: #F1F5F9; border-radius: 12px; padding: 24px; text-align: center; margin-bottom: 24px;">
           <span style="font-size: 40px; font-weight: 700; letter-spacing: 8px; color: #0A1F44;">${escapeHtml(otp)}</span>
         </div>

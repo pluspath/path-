@@ -1,109 +1,146 @@
 import { supabaseAdmin } from "../supabase";
+import { findAuthUserByEmail } from "./auth-users";
 import { sendPasswordResetOtpEmail } from "./email-service";
+import {
+  generateOtp,
+  hashOtp,
+  verifyOtpHash,
+  otpExpiresAt,
+  MAX_OTP_ATTEMPTS,
+  RESEND_RATE_LIMIT_MS,
+} from "./otp";
 
-const OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
-const MAX_ATTEMPTS = 5;
-const RATE_LIMIT_MS = 60 * 1000; // 1 resend per minute per email
-
-interface ResetOtpEntry {
-  otpHash: string;
-  expiry: number;
+type ResetOtpRow = {
+  email: string;
+  user_id: string;
+  otp_hash: string;
+  otp_expires_at: string;
   attempts: number;
-  lastSentAt: number;
+  last_sent_at: string;
   verified: boolean;
-}
+};
 
-// email → entry (in-memory; same pattern as signup OTP)
-const resetOtpStore = new Map<string, ResetOtpEntry>();
-
-function hashOtp(otp: string): string {
-  // Simple hash — sufficient for short-lived OTP alongside rate limits
-  let h = 0;
-  for (let i = 0; i < otp.length; i++) h = (h * 31 + otp.charCodeAt(i)) >>> 0;
-  return String(h);
-}
-
-function generateOTP(): string {
-  return Math.floor(100000 + Math.random() * 900000).toString();
-}
-
-/**
- * Password reset uses a 6-digit OTP (no recovery URL).
- * This avoids Supabase Site URL / localhost links in reset emails.
- */
-async function sendResetEmail(email: string, otp: string): Promise<void> {
-  await sendPasswordResetOtpEmail(email, otp);
-}
-
-/** Request a password-reset OTP. Returns generic success even if email unknown (no enumeration). */
-export async function requestPasswordResetOtp(email: string): Promise<{ ok: true } | { ok: false; message: string }> {
+async function getResetRow(email: string): Promise<ResetOtpRow | null> {
   const key = email.toLowerCase().trim();
-  if (!key.includes("@")) return { ok: false, message: "Please enter a valid email address." };
+  const { data, error } = await supabaseAdmin
+    .from("password_reset_otps")
+    .select("*")
+    .eq("email", key)
+    .maybeSingle();
 
-  const existing = resetOtpStore.get(key);
-  if (existing && Date.now() - existing.lastSentAt < RATE_LIMIT_MS) {
-    return { ok: false, message: "Please wait a minute before requesting another code." };
+  if (error) {
+    console.error("[password-reset] fetch failed:", error.message);
+    return null;
+  }
+  return data as ResetOtpRow | null;
+}
+
+/** Request a password-reset OTP. Returns explicit not-found when email is unknown. */
+export async function requestPasswordResetOtp(
+  email: string
+): Promise<{ ok: true } | { ok: false; message: string; status?: number }> {
+  const key = email.toLowerCase().trim();
+  if (!key.includes("@")) {
+    return { ok: false, message: "Please enter a valid email address.", status: 400 };
   }
 
-  // Confirm account exists (admin API — do not reveal to client).
-  const { data: listData } = await supabaseAdmin.auth.admin.listUsers({ page: 1, perPage: 1000 });
-  const user = (listData?.users ?? []).find((u) => u.email?.toLowerCase() === key);
+  const existing = await getResetRow(key);
+  if (existing && Date.now() - new Date(existing.last_sent_at).getTime() < RESEND_RATE_LIMIT_MS) {
+    return {
+      ok: false,
+      message: "Please wait a minute before requesting another code.",
+      status: 429,
+    };
+  }
+
+  const user = await findAuthUserByEmail(key);
   if (!user) {
-    // Generic delay to reduce timing attacks
-    await new Promise((r) => setTimeout(r, 400));
-    return { ok: true };
+    return { ok: false, message: "Email address not found", status: 404 };
   }
 
-  const otp = generateOTP();
-  const expiry = Date.now() + OTP_TTL_MS;
-  resetOtpStore.set(key, {
-    otpHash: hashOtp(otp),
-    expiry,
+  const otp = generateOtp();
+  const now = Date.now();
+  const row = {
+    email: key,
+    user_id: user.id,
+    otp_hash: hashOtp(otp),
+    otp_expires_at: otpExpiresAt(now),
     attempts: 0,
-    lastSentAt: Date.now(),
+    last_sent_at: new Date(now).toISOString(),
     verified: false,
-  });
+  };
+
+  const { error: upsertError } = await supabaseAdmin
+    .from("password_reset_otps")
+    .upsert(row, { onConflict: "email" });
+
+  if (upsertError) {
+    console.error("[password-reset] upsert failed:", upsertError.message);
+    return { ok: false, message: "Failed to send reset email. Please try again.", status: 500 };
+  }
 
   try {
-    await sendResetEmail(key, otp);
+    await sendPasswordResetOtpEmail(key, otp);
   } catch (err) {
-    resetOtpStore.delete(key);
+    await supabaseAdmin.from("password_reset_otps").delete().eq("email", key);
     console.error(
       "[password-reset] send failed:",
       err instanceof Error ? err.message : "unknown"
     );
-    return { ok: false, message: "Failed to send reset email. Please try again." };
+    return { ok: false, message: "Failed to send reset email. Please try again.", status: 500 };
   }
 
   return { ok: true };
 }
 
 /** Verify OTP (single-use). Marks entry verified for the subsequent password update step. */
-export function verifyPasswordResetOtp(
+export async function verifyPasswordResetOtp(
   email: string,
   otp: string
-): { ok: true } | { ok: false; message: string } {
+): Promise<{ ok: true } | { ok: false; message: string; status?: number }> {
   const key = email.toLowerCase().trim();
-  const stored = resetOtpStore.get(key);
+  const stored = await getResetRow(key);
 
   if (!stored) {
-    return { ok: false, message: "No reset code found. Please request a new one." };
-  }
-  if (Date.now() > stored.expiry) {
-    resetOtpStore.delete(key);
-    return { ok: false, message: "Code expired. Please request a new one." };
-  }
-  if (stored.attempts >= MAX_ATTEMPTS) {
-    resetOtpStore.delete(key);
-    return { ok: false, message: "Too many attempts. Please request a new code." };
+    return {
+      ok: false,
+      message: "No reset code found. Please request a new one.",
+      status: 400,
+    };
   }
 
-  if (stored.otpHash !== hashOtp(otp)) {
-    stored.attempts++;
-    return { ok: false, message: "Invalid code. Please try again." };
+  const now = Date.now();
+  if (new Date(stored.otp_expires_at).getTime() < now) {
+    await supabaseAdmin.from("password_reset_otps").delete().eq("email", key);
+    return {
+      ok: false,
+      message: "This verification code has expired. Please request a new code.",
+      status: 400,
+    };
   }
 
-  stored.verified = true;
+  if (stored.attempts >= MAX_OTP_ATTEMPTS) {
+    await supabaseAdmin.from("password_reset_otps").delete().eq("email", key);
+    return {
+      ok: false,
+      message: "Too many attempts. Please request a new code.",
+      status: 400,
+    };
+  }
+
+  if (!verifyOtpHash(otp, stored.otp_hash)) {
+    await supabaseAdmin
+      .from("password_reset_otps")
+      .update({ attempts: stored.attempts + 1 })
+      .eq("email", key);
+    return { ok: false, message: "Invalid verification code", status: 400 };
+  }
+
+  await supabaseAdmin
+    .from("password_reset_otps")
+    .update({ verified: true })
+    .eq("email", key);
+
   return { ok: true };
 }
 
@@ -111,38 +148,53 @@ export function verifyPasswordResetOtp(
 export async function confirmPasswordReset(
   email: string,
   newPassword: string
-): Promise<{ ok: true } | { ok: false; message: string }> {
+): Promise<{ ok: true } | { ok: false; message: string; status?: number }> {
   const key = email.toLowerCase().trim();
-  const stored = resetOtpStore.get(key);
+  const stored = await getResetRow(key);
 
   if (!stored?.verified) {
-    return { ok: false, message: "Please verify your code first." };
+    return { ok: false, message: "Please verify your code first.", status: 400 };
   }
-  if (Date.now() > stored.expiry) {
-    resetOtpStore.delete(key);
-    return { ok: false, message: "Code expired. Please start over." };
+
+  if (new Date(stored.otp_expires_at).getTime() < Date.now()) {
+    await supabaseAdmin.from("password_reset_otps").delete().eq("email", key);
+    return {
+      ok: false,
+      message: "This verification code has expired. Please request a new code.",
+      status: 400,
+    };
   }
+
   if (newPassword.length < 6) {
-    return { ok: false, message: "Password must be at least 6 characters." };
+    return { ok: false, message: "Password must be at least 6 characters.", status: 400 };
   }
 
-  const { data: listData } = await supabaseAdmin.auth.admin.listUsers({ page: 1, perPage: 1000 });
-  const user = (listData?.users ?? []).find((u) => u.email?.toLowerCase() === key);
-  if (!user) {
-    resetOtpStore.delete(key);
-    return { ok: false, message: "Account not found." };
-  }
-
-  const { error } = await supabaseAdmin.auth.admin.updateUserById(user.id, {
+  const { error } = await supabaseAdmin.auth.admin.updateUserById(stored.user_id, {
     password: newPassword,
   });
 
-  resetOtpStore.delete(key);
+  await supabaseAdmin.from("password_reset_otps").delete().eq("email", key);
 
   if (error) {
     console.error("[password-reset] updateUserById failed:", error.message);
-    return { ok: false, message: "Failed to update password. Please try again." };
+    return { ok: false, message: "Failed to update password. Please try again.", status: 500 };
   }
 
   return { ok: true };
+}
+
+/** Remove expired password reset rows (best-effort cleanup). */
+export async function purgeExpiredPasswordResetOtps(): Promise<number> {
+  const now = new Date().toISOString();
+  const { data, error } = await supabaseAdmin
+    .from("password_reset_otps")
+    .delete()
+    .lt("otp_expires_at", now)
+    .select("email");
+
+  if (error) {
+    console.warn("[password-reset] purge failed:", error.message);
+    return 0;
+  }
+  return data?.length ?? 0;
 }
