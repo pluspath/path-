@@ -4,7 +4,7 @@ import { externalServicesRepository, type ExternalServiceRow } from "../admin/re
 
 /**
  * Central resolver for external-service configuration.
- * Priority: Admin DB (encrypted secrets + configuration) → environment variables.
+ * Priority: environment variables (production) → Admin DB (encrypted secrets + configuration).
  * Cache is process-local and invalidated on admin updates.
  */
 
@@ -111,10 +111,15 @@ export async function getEmailConfig(): Promise<EmailConfig> {
   const cfg = (row?.configuration ?? {}) as Record<string, unknown>;
   const templatesRaw = (cfg.templates ?? {}) as Record<string, Record<string, unknown>>;
 
-  const dbKey = secrets.apiKey?.trim() || null;
   const envKey = env.RESEND_API_KEY?.trim() || null;
-  const apiKey = dbKey || envKey;
-  const apiKeySource: EmailConfig["apiKeySource"] = dbKey ? "database" : envKey ? "env" : "none";
+  const dbKey = secrets.apiKey?.trim() || null;
+  // Production .env must win over a stale Admin DB key (common misconfiguration).
+  const apiKey = envKey || dbKey;
+  const apiKeySource: EmailConfig["apiKeySource"] = envKey
+    ? "env"
+    : dbKey
+      ? "database"
+      : "none";
 
   const fromName =
     (typeof cfg.fromName === "string" && cfg.fromName.trim()) || "Path+";

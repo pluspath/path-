@@ -109,8 +109,12 @@ export async function startRegistration(
 
   await purgeExpiredPendingRegistrations();
 
-  const existingUser = await findAuthUserByEmail(email);
-  if (existingUser) {
+  const existingLookup = await findAuthUserByEmail(email);
+  if (!existingLookup.ok) {
+    console.error("[pending-registration] auth lookup failed:", existingLookup.reason);
+    return { ok: false, message: "Unable to start registration. Please try again.", status: 503 };
+  }
+  if (existingLookup.user) {
     return {
       ok: false,
       message: "An account with this email already exists. Please sign in instead.",

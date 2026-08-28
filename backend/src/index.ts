@@ -324,6 +324,19 @@ app.get("/__marketing", (c) =>
         "Update SUPABASE_URL / keys in backend .env to your active project, then restart."
     );
   }
+
+  try {
+    const { getEmailConfig } = await import("./lib/external-config");
+    const emailCfg = await getEmailConfig();
+    console.log(
+      `[email] Resend configured via ${emailCfg.apiKeySource} (enabled=${emailCfg.enabled})`
+    );
+    if (emailCfg.apiKeySource === "none") {
+      console.warn("[email] No Resend API key — password reset/signup emails will fail");
+    }
+  } catch (e) {
+    console.warn("[email] config check failed:", e instanceof Error ? e.message : e);
+  }
 })();
 
 const isProd = process.env.NODE_ENV === "production";

@@ -1,5 +1,6 @@
 import { Resend } from "resend";
 import { getEmailConfig, type EmailConfig } from "./external-config";
+import { toSafeUserMessage } from "./safe-errors";
 
 /**
  * Central email sender. Callers never touch Resend keys or SMTP secrets.
@@ -26,6 +27,10 @@ export async function resolveEmailConfig(): Promise<EmailConfig> {
   return getEmailConfig();
 }
 
+function mapEmailSendError(raw: string): string {
+  return toSafeUserMessage(raw, "Unable to send email. Please try again later.");
+}
+
 export async function sendEmail(
   input: SendEmailInput
 ): Promise<{ ok: true } | { ok: false; message: string }> {
@@ -34,10 +39,11 @@ export async function sendEmail(
     return { ok: false, message: "Email service is disabled." };
   }
   if (!config.apiKey) {
-    return { ok: false, message: "Email service is not configured." };
+    console.error("[email] send blocked: RESEND_API_KEY not configured (source: none)");
+    return { ok: false, message: "Unable to send email. Please try again later." };
   }
   if (config.provider !== "resend") {
-    return { ok: false, message: "Unsupported email provider." };
+    return { ok: false, message: "Unable to send email. Please try again later." };
   }
 
   try {
@@ -50,14 +56,18 @@ export async function sendEmail(
       replyTo: input.replyTo || config.replyTo || undefined,
     });
     if (error) {
-      console.error("[email] send failed:", sanitizeProviderError(error.message));
-      return { ok: false, message: "The email provider rejected the request." };
+      console.error(
+        "[email] send failed:",
+        sanitizeProviderError(error.message),
+        `(key source: ${config.apiKeySource})`
+      );
+      return { ok: false, message: mapEmailSendError(error.message) };
     }
     return { ok: true };
   } catch (e) {
     const raw = e instanceof Error ? e.message : "unknown";
     console.error("[email] send exception:", sanitizeProviderError(raw));
-    return { ok: false, message: "Failed to send email." };
+    return { ok: false, message: mapEmailSendError(raw) };
   }
 }
 
@@ -79,8 +89,14 @@ export async function testEmailProviderConnection(): Promise<{
     const { data, error } = await resend.domains.list();
     if (error) {
       const msg = sanitizeProviderError(error.message);
-      if (/unauthorized|invalid|api.?key|forbidden/i.test(msg)) {
-        return { ok: false, message: "Authentication failed. Check the API key." };
+      if (/unauthorized|invalid|api.?key|forbidden|restricted_api_key/i.test(msg)) {
+        return {
+          ok: false,
+          message:
+            /restricted_api_key/i.test(msg)
+              ? "Send-only API key configured (email sending may still work)."
+              : "Authentication failed. Check the API key.",
+        };
       }
       return { ok: false, message: "Provider rejected the connection." };
     }

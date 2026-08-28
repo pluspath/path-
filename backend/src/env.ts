@@ -8,10 +8,11 @@ import { resolve } from "path";
  * Prefer SUPABASE_* (and BACKEND_URL) from the workspace .env when present.
  */
 function applyEnvFileOverrides() {
-  // Prefer .env / .env.local over empty host or .env.production values.
+  const isProd = process.env.NODE_ENV === "production";
   const candidates = [
     resolve(process.cwd(), ".env"),
     resolve(process.cwd(), ".env.local"),
+    ...(isProd ? [resolve(process.cwd(), ".env.production")] : []),
   ];
 
   const overrideKeys = new Set([
@@ -119,11 +120,17 @@ function validateEnv() {
     }
     if (!parsed.RESEND_API_KEY?.trim()) {
       console.warn(
-        "[config] RESEND_API_KEY not set — signup OTP emails will not be sent (unless configured in Admin → External Services)"
+        "[config] RESEND_API_KEY not set — signup/password-reset OTP emails will not be sent (unless configured in Admin → External Services)"
       );
     } else {
       console.log("[config] RESEND_API_KEY configured — OTP emails enabled");
     }
+    console.log(
+      `[config] Secrets audit: SUPABASE_URL=${parsed.SUPABASE_URL ? "present" : "missing"}, ` +
+        `SUPABASE_ANON_KEY=${parsed.SUPABASE_ANON_KEY ? "present" : "missing"}, ` +
+        `SUPABASE_SERVICE_ROLE_KEY=${parsed.SUPABASE_SERVICE_ROLE_KEY?.trim() ? "present" : "missing"}, ` +
+        `RESEND_API_KEY=${parsed.RESEND_API_KEY?.trim() ? "present" : "missing"}`
+    );
     if (!parsed.CONFIG_ENCRYPTION_KEY?.trim()) {
       console.warn(
         "[config] CONFIG_ENCRYPTION_KEY not set — Admin cannot store encrypted secrets in the database until configured"

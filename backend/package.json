@@ -11,6 +11,7 @@
     "seed:admin": "bun run scripts/seed-admin.ts",
     "seed:legal": "bun run scripts/seed-legal-content.ts",
     "migrate:admin": "bun run scripts/apply-admin-migration.ts",
+    "diagnose:auth": "bun run scripts/diagnose-auth-config.ts",
     "admin:install": "bun install --cwd admin",
     "admin:dev": "cd admin && bun run dev",
     "admin:build": "bun install --cwd admin && cd admin && bun run build",

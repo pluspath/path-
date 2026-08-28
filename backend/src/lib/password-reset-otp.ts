@@ -2,6 +2,12 @@ import { supabaseAdmin } from "../supabase";
 import { findAuthUserByEmail } from "./auth-users";
 import { sendPasswordResetOtpEmail } from "./email-service";
 import {
+  RESET_EMAIL_SEND_ERROR,
+  RESET_LOOKUP_ERROR,
+  RESET_PASSWORD_UPDATE_ERROR,
+  toSafeUserMessage,
+} from "./safe-errors";
+import {
   generateOtp,
   hashOtp,
   verifyOtpHash,
@@ -53,10 +59,20 @@ export async function requestPasswordResetOtp(
     };
   }
 
-  const user = await findAuthUserByEmail(key);
-  if (!user) {
+  const lookup = await findAuthUserByEmail(key);
+  if (!lookup.ok) {
+    console.error("[password-reset] user lookup failed:", lookup.reason);
+    return {
+      ok: false,
+      message: lookup.reason === "supabase_config" ? RESET_LOOKUP_ERROR : RESET_LOOKUP_ERROR,
+      status: 503,
+    };
+  }
+  if (!lookup.user) {
     return { ok: false, message: "Email address not found", status: 404 };
   }
+
+  const user = lookup.user;
 
   const otp = generateOtp();
   const now = Date.now();
@@ -76,7 +92,7 @@ export async function requestPasswordResetOtp(
 
   if (upsertError) {
     console.error("[password-reset] upsert failed:", upsertError.message);
-    return { ok: false, message: "Failed to send reset email. Please try again.", status: 500 };
+    return { ok: false, message: RESET_EMAIL_SEND_ERROR, status: 500 };
   }
 
   try {
@@ -87,7 +103,7 @@ export async function requestPasswordResetOtp(
       "[password-reset] send failed:",
       err instanceof Error ? err.message : "unknown"
     );
-    return { ok: false, message: "Failed to send reset email. Please try again.", status: 500 };
+    return { ok: false, message: RESET_EMAIL_SEND_ERROR, status: 500 };
   }
 
   return { ok: true };
@@ -177,7 +193,11 @@ export async function confirmPasswordReset(
 
   if (error) {
     console.error("[password-reset] updateUserById failed:", error.message);
-    return { ok: false, message: "Failed to update password. Please try again.", status: 500 };
+    return {
+      ok: false,
+      message: toSafeUserMessage(error.message, RESET_PASSWORD_UPDATE_ERROR),
+      status: 500,
+    };
   }
 
   return { ok: true };
