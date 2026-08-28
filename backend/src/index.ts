@@ -327,12 +327,21 @@ app.get("/__marketing", (c) =>
 
   try {
     const { getEmailConfig } = await import("./lib/external-config");
+    const { testEmailProviderConnection } = await import("./lib/email-service");
     const emailCfg = await getEmailConfig();
     console.log(
-      `[email] Resend configured via ${emailCfg.apiKeySource} (enabled=${emailCfg.enabled})`
+      `[email] Resend configured via ${emailCfg.apiKeySource} (enabled=${emailCfg.enabled}) from=${emailCfg.fromEmail.replace(/@.+/, "@***")}`
     );
     if (emailCfg.apiKeySource === "none") {
-      console.warn("[email] No Resend API key — password reset/signup emails will fail");
+      console.error("[email] CRITICAL: No Resend API key — password reset/signup emails will fail");
+    } else {
+      const test = await testEmailProviderConnection();
+      if (!test.ok) {
+        console.error(`[email] CRITICAL: Resend check failed — ${test.message}`);
+        console.error(
+          "[email] Create a new key at https://resend.com/api-keys, verify pathplus.store, update RESEND_API_KEY in backend/.env, restart."
+        );
+      }
     }
   } catch (e) {
     console.warn("[email] config check failed:", e instanceof Error ? e.message : e);

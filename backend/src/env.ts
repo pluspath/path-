@@ -103,9 +103,27 @@ function supabaseProjectRef(url: string): string {
   }
 }
 
+function normalizeSecret(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  let v = value.trim();
+  if (
+    (v.startsWith('"') && v.endsWith('"')) ||
+    (v.startsWith("'") && v.endsWith("'"))
+  ) {
+    v = v.slice(1, -1).trim();
+  }
+  return v || undefined;
+}
+
 function validateEnv() {
   try {
     const parsed = envSchema.parse(process.env);
+    if (parsed.RESEND_API_KEY) {
+      process.env.RESEND_API_KEY = normalizeSecret(parsed.RESEND_API_KEY) ?? "";
+    }
+    if (parsed.RESEND_FROM_EMAIL) {
+      process.env.RESEND_FROM_EMAIL = normalizeSecret(parsed.RESEND_FROM_EMAIL) ?? "";
+    }
     console.log("Environment variables validated successfully");
     console.log(`[config] Supabase URL: ${parsed.SUPABASE_URL}`);
     console.log(`[config] Supabase project: ${supabaseProjectRef(parsed.SUPABASE_URL)}`);

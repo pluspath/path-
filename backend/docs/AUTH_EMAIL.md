@@ -25,7 +25,7 @@ Set these on the production host (never commit real values):
 | `SUPABASE_ANON_KEY` | Anon key (server + mobile) |
 | `SUPABASE_SERVICE_ROLE_KEY` | Service role (backend only — never in the mobile app) |
 | `RESEND_API_KEY` | Resend API key for OTP emails |
-| `RESEND_FROM_EMAIL` | Optional. Default `Path+ <noreply@pathplus.store>` |
+| `RESEND_FROM_EMAIL` | Optional. Default `onboarding@resend.dev` (test). Use `dev@pathplus.store` in production after domain verification. |
 | `CONFIG_ENCRYPTION_KEY` | Optional. Required to store Resend keys via Admin → External Services |
 
 Admins can also manage Resend settings from **Admin Dashboard → Settings → External Services**

@@ -36,7 +36,7 @@ ADMIN_JWT_SECRET=
 
 # Strongly recommended
 RESEND_API_KEY=
-RESEND_FROM_EMAIL=Path+ <noreply@pathplus.store>
+RESEND_FROM_EMAIL=onboarding@resend.dev
 PUBLIC_APP_URL=https://site.pathplus.store
 GOOGLE_PLACES_API_KEY=
 

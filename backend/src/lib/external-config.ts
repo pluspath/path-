@@ -124,14 +124,15 @@ export async function getEmailConfig(): Promise<EmailConfig> {
   const fromName =
     (typeof cfg.fromName === "string" && cfg.fromName.trim()) || "Path+";
 
-  const rawFrom =
-    (typeof cfg.fromEmail === "string" && cfg.fromEmail.trim()) ||
-    env.RESEND_FROM_EMAIL?.trim() ||
-    "";
+  const envFrom = env.RESEND_FROM_EMAIL?.trim() || "";
+  const dbFrom =
+    typeof cfg.fromEmail === "string" && cfg.fromEmail.trim() ? cfg.fromEmail.trim() : "";
+  // Production .env sender must win over stale Admin DB fromEmail.
+  const rawFrom = envFrom || dbFrom;
 
   let fromEmail: string;
   if (!rawFrom) {
-    fromEmail = `${fromName} <dev@pathplus.store>`;
+    fromEmail = "onboarding@resend.dev";
   } else if (rawFrom.includes("<")) {
     fromEmail = rawFrom;
   } else {

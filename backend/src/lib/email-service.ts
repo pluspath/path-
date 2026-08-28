@@ -31,6 +31,12 @@ function mapEmailSendError(raw: string): string {
   return toSafeUserMessage(raw, "Unable to send email. Please try again later.");
 }
 
+function logResendFailure(context: string, error: { message?: string; name?: string }): void {
+  const name = error.name ?? "unknown";
+  const message = sanitizeProviderError(error.message ?? "unknown");
+  console.error(`[email] ${context}: name=${name} message=${message}`);
+}
+
 export async function sendEmail(
   input: SendEmailInput
 ): Promise<{ ok: true } | { ok: false; message: string }> {
@@ -56,11 +62,8 @@ export async function sendEmail(
       replyTo: input.replyTo || config.replyTo || undefined,
     });
     if (error) {
-      console.error(
-        "[email] send failed:",
-        sanitizeProviderError(error.message),
-        `(key source: ${config.apiKeySource})`
-      );
+      logResendFailure("send failed", error);
+      console.error(`[email] from=${config.fromEmail.replace(/@.+/, "@***")} keySource=${config.apiKeySource}`);
       return { ok: false, message: mapEmailSendError(error.message) };
     }
     return { ok: true };
