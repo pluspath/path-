@@ -4,7 +4,7 @@ import { env } from "../env";
 export function resendFromAddress(): string {
   const configured = env.RESEND_FROM_EMAIL?.trim();
   if (configured) return configured;
-  return "onboarding@resend.dev";
+  return "Resend <onboarding@resend.dev>";
 }
 
 /**
