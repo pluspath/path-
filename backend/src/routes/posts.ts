@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { createUserClient, supabaseAdmin } from "../supabase";
 import { formatPost, formatReactions, isReactionLocked, baseReactionType, lockedReactionType } from "./users";
-import { sendPushNotification, getPushToken } from "../lib/push";
+import { sendPushToUser } from "../lib/push";
 import { SYSTEM_MOMENT_TYPES, refreshFriendshipAvatars } from "../lib/systemMoments";
 import { ensureBirthdayMoments } from "../lib/birthday";
 import { notifyMentions } from "../lib/mentions";
@@ -457,20 +457,40 @@ postsRouter.post("/", async (c) => {
       return c.json({ error: { message: "Repath is temporarily unavailable. Please try again shortly." } }, 503);
     }
 
-    const { data: original } = await supabaseAdmin
+    const { data: target } = await supabaseAdmin
       .from("posts")
-      .select("id")
+      .select("id, user_id, repath_of")
       .eq("id", originalId)
       .maybeSingle();
-    if (!original) {
+    if (!target) {
       return c.json({ error: { message: "Original moment not found" } }, 404);
+    }
+
+    // Always repath the root moment (one level deep) and notify its owner.
+    let rootId = originalId;
+    let originalOwnerId = target.user_id as string;
+    if (target.repath_of) {
+      rootId = target.repath_of as string;
+      const { data: root } = await supabaseAdmin
+        .from("posts")
+        .select("id, user_id")
+        .eq("id", rootId)
+        .maybeSingle();
+      if (!root) {
+        return c.json({ error: { message: "Original moment not found" } }, 404);
+      }
+      originalOwnerId = root.user_id as string;
+    }
+
+    if (originalOwnerId === userId) {
+      return c.json({ error: { message: "You cannot repath your own moment" } }, 400);
     }
 
     const repathInsert = {
       user_id: userId,
       type: body.type,
       content: body.content || null,
-      repath_of: originalId,
+      repath_of: rootId,
     };
 
     let { data: post, error } = await supabaseAdmin
@@ -494,6 +514,37 @@ postsRouter.post("/", async (c) => {
     }
 
     if (post?.repath_of) await attachOriginals(userClient, [post]);
+
+    // Notify the original moment owner (activity feed + push). post_id is the
+    // new repath so tapping opens User B's repath of the moment, not the feed.
+    try {
+      if (post?.id && originalOwnerId !== userId) {
+        const { data: inserted } = await supabaseAdmin.from("notifications").insert({
+          user_id: originalOwnerId,
+          from_user_id: userId,
+          type: "repath",
+          message: "repathed your moment",
+          post_id: post.id,
+          read: false,
+        }).select("id").single();
+
+        await sendPushToUser(
+          supabaseAdmin,
+          originalOwnerId,
+          "New Repath",
+          `${user.full_name} repathed your moment`,
+          {
+            postId: post.id,
+            type: "repath",
+            fromUserId: userId,
+            notificationId: inserted?.id,
+          }
+        );
+      }
+    } catch (e) {
+      console.error("[notifications] repath insert error:", e);
+    }
+
     return c.json({ data: formatPost(post, userId) }, 201);
   }
 
@@ -602,6 +653,17 @@ postsRouter.post("/", async (c) => {
         read: false,
       }));
       await userClient.from("notifications").insert(notifications);
+
+      // Push each friend about the sleep moment (in-app + push).
+      for (const n of notifications) {
+        await sendPushToUser(
+          supabaseAdmin,
+          n.user_id,
+          "Sleep Update",
+          n.message,
+          { type: "sleep", postId: post.id, fromUserId: userId }
+        );
+      }
     }
   }
 
@@ -782,21 +844,26 @@ postsRouter.post("/:id/reactions", async (c) => {
     const { data: postOwner } = await userClient.from("posts").select("user_id").eq("id", id).maybeSingle();
     if (didReact && postOwner && postOwner.user_id !== userId) {
       const isSheep = incoming === "🐑";
-      await supabaseAdmin.from("notifications").insert({
+      const { data: inserted } = await supabaseAdmin.from("notifications").insert({
         user_id: postOwner.user_id,
         from_user_id: userId,
         type: isSheep ? "sleep" : "reaction",
         message: isSheep ? "sent you a sheep" : "loved your moment",
         post_id: id,
         read: false,
-      });
+      }).select("id").single();
 
-      const pushToken = await getPushToken(supabaseAdmin, postOwner.user_id);
-      await sendPushNotification(
-        pushToken,
+      await sendPushToUser(
+        supabaseAdmin,
+        postOwner.user_id,
         isSheep ? "New Sheep" : "New Reaction",
         isSheep ? `${user.full_name} sent you a sheep` : `${user.full_name} reacted to your moment`,
-        { postId: id, type: isSheep ? "sleep" : "reaction" }
+        {
+          postId: id,
+          type: isSheep ? "sleep" : "reaction",
+          fromUserId: userId,
+          notificationId: inserted?.id,
+        }
       );
     }
   } catch (e) {
@@ -1074,21 +1141,26 @@ postsRouter.post("/:id/comments", async (c) => {
   try {
     const { data: postOwner } = await userClient.from("posts").select("user_id").eq("id", id).maybeSingle();
     if (postOwner && postOwner.user_id !== userId) {
-      await supabaseAdmin.from("notifications").insert({
+      const { data: inserted } = await supabaseAdmin.from("notifications").insert({
         user_id: postOwner.user_id,
         from_user_id: userId,
         type: "comment",
         message: "commented on your moment",
         post_id: id,
         read: false,
-      });
+      }).select("id").single();
 
-      const pushToken = await getPushToken(supabaseAdmin, postOwner.user_id);
-      await sendPushNotification(
-        pushToken,
+      await sendPushToUser(
+        supabaseAdmin,
+        postOwner.user_id,
         "New Comment",
         `${user.full_name} commented on your moment`,
-        { postId: id, type: "comment" }
+        {
+          postId: id,
+          type: "comment",
+          fromUserId: userId,
+          notificationId: inserted?.id,
+        }
       );
     }
   } catch (e) {

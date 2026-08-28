@@ -1,6 +1,6 @@
 import { supabaseAdmin } from "../supabase";
 import { extractHashtags, extractMentions } from "./text-parse";
-import { sendPushNotification, getPushToken } from "./push";
+import { sendPushToUser } from "./push";
 
 /**
  * After a post is created, index hashtags and notify mentioned users.
@@ -71,21 +71,21 @@ export async function enrichPostContent(opts: {
         { onConflict: "post_id,mentioned_user_id" }
       );
 
-      await supabaseAdmin.from("notifications").insert({
+      const { data: inserted } = await supabaseAdmin.from("notifications").insert({
         user_id: profile.id,
         from_user_id: authorId,
         type: "mention",
         message: `${authorName} mentioned you in a moment`,
         post_id: postId,
         read: false,
-      });
+      }).select("id").single();
 
       try {
-        const pushToken = await getPushToken(supabaseAdmin, profile.id);
-        await sendPushNotification(pushToken, "Mention", `${authorName} mentioned you`, {
+        await sendPushToUser(supabaseAdmin, profile.id, "Mention", `${authorName} mentioned you`, {
           type: "mention",
           postId,
           fromUserId: authorId,
+          notificationId: inserted?.id,
         });
       } catch {
         // push optional

@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { supabaseAdmin } from "../supabase";
-import { sendPushNotification, getPushToken } from "../lib/push";
+import { sendPushToUser } from "../lib/push";
 import { encodeImages, decodeImages } from "../lib/images";
 import { getBlockedIds, isBlocked } from "../lib/blocks";
 import type { HonoVariables } from "../types";
@@ -162,8 +162,9 @@ function notifyParticipantsInBackground(
             });
           }
 
-          const pushToken = await getPushToken(db, participant.user_id);
-          await sendPushNotification(pushToken, senderName, body, data);
+          const pushTitle =
+            data?.type === "message" ? `New message from ${senderName}` : senderName;
+          await sendPushToUser(db, participant.user_id, pushTitle, body, data);
         })
       );
     } catch (e) {
@@ -634,6 +635,7 @@ conversationsRouter.post("/:id/messages", async (c) => {
   notifyParticipantsInBackground(db, id, userId, senderName, messagePreview(msgType, text), {
     type: "message",
     conversationId: id,
+    fromUserId: userId,
   });
 
   let mapped = mapMessage(message);
@@ -853,6 +855,7 @@ conversationsRouter.post("/:id/ping", async (c) => {
   notifyParticipantsInBackground(db, id, userId, senderName, "👋 Pinged you", {
     type: "ping",
     conversationId: id,
+    fromUserId: userId,
   });
 
   return c.json({ data: mapMessage(message) }, 201);

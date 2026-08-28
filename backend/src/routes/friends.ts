@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { createUserClient, supabaseAdmin } from "../supabase";
-import { sendPushNotification, getPushToken } from "../lib/push";
+import { sendPushToUser } from "../lib/push";
 import { ensureFriendshipMoments } from "../lib/systemMoments";
 import { getBlockedIds, isBlocked } from "../lib/blocks";
 import type { HonoVariables } from "../types";
@@ -205,28 +205,27 @@ friendsRouter.post("/request/:userId", async (c) => {
   // Insert the in-app notification with the admin client: the sender is
   // writing a row owned by the recipient, which RLS on userClient blocks.
   try {
-    await supabaseAdmin.from("notifications").insert({
+    const { data: inserted } = await supabaseAdmin.from("notifications").insert({
       user_id: targetId,
       from_user_id: userId,
       type: "friend_request",
       message: `${user.full_name} sent you a friend request`,
       read: false,
-    });
-  } catch (e) {
-    console.error("[notifications] friend_request insert error:", e);
-  }
+    }).select("id").single();
 
-  // Send push notification to target user
-  try {
-    const pushToken = await getPushToken(supabaseAdmin, targetId);
-    await sendPushNotification(
-      pushToken,
+    await sendPushToUser(
+      supabaseAdmin,
+      targetId,
       "Friend Request",
       `${user.full_name} sent you a friend request`,
-      { type: "friend_request", fromUserId: userId }
+      {
+        type: "friend_request",
+        fromUserId: userId,
+        notificationId: inserted?.id,
+      }
     );
   } catch (e) {
-    console.error("[push] friend request notification error:", e);
+    console.error("[notifications] friend_request insert/push error:", e);
   }
 
   return c.json({ data: friendship }, 201);
@@ -261,15 +260,27 @@ friendsRouter.post("/accept/:id", async (c) => {
   // admin client since this row is owned by the requester, not the accepter,
   // and RLS on userClient would silently block the insert.
   try {
-    await supabaseAdmin.from("notifications").insert({
+    const { data: acceptedNotif } = await supabaseAdmin.from("notifications").insert({
       user_id: friendship.requester_id,
       from_user_id: userId,
       type: "friend_accepted",
       message: `${user.full_name} accepted your friend request`,
       read: false,
-    });
+    }).select("id").single();
+
+    await sendPushToUser(
+      supabaseAdmin,
+      friendship.requester_id,
+      "Friend Request Accepted",
+      `${user.full_name} accepted your friend request`,
+      {
+        type: "friend_accepted",
+        fromUserId: userId,
+        notificationId: acceptedNotif?.id,
+      }
+    );
   } catch (e) {
-    console.error("[notifications] friend_accepted insert error:", e);
+    console.error("[notifications] friend_accepted insert/push error:", e);
   }
 
   // Also notify the ACCEPTER (this user) so BOTH people get a Notifications
@@ -281,27 +292,27 @@ friendsRouter.post("/accept/:id", async (c) => {
       .eq("id", friendship.requester_id)
       .maybeSingle();
     const requesterName = requesterProfile?.full_name ?? "Someone";
-    await supabaseAdmin.from("notifications").insert({
+    const { data: nowFriendsNotif } = await supabaseAdmin.from("notifications").insert({
       user_id: userId,
       from_user_id: friendship.requester_id,
       type: "now_friends",
       message: `You are now friends with ${requesterName}`,
       read: false,
-    });
-  } catch (e) {
-    console.error("[notifications] now_friends insert error:", e);
-  }
+    }).select("id").single();
 
-  try {
-    const pushToken = await getPushToken(supabaseAdmin, friendship.requester_id);
-    await sendPushNotification(
-      pushToken,
-      "Friend Request Accepted",
-      `${user.full_name} accepted your friend request`,
-      { type: "friend_accepted", fromUserId: userId }
+    await sendPushToUser(
+      supabaseAdmin,
+      userId,
+      "New Friend",
+      `You are now friends with ${requesterName}`,
+      {
+        type: "now_friends",
+        fromUserId: friendship.requester_id,
+        notificationId: nowFriendsNotif?.id,
+      }
     );
   } catch (e) {
-    console.error("[push] friend accepted notification error:", e);
+    console.error("[notifications] now_friends insert/push error:", e);
   }
 
   return c.json({ data: updated });

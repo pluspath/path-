@@ -5,6 +5,7 @@ import { computeAge, computeZodiac } from "../lib/profileMeta";
 import { decodeImages } from "../lib/images";
 import { getBlockedIds } from "../lib/blocks";
 import { formatDuration } from "../lib/duration";
+import { upsertUserDevice, deactivateUserDevices } from "../lib/push";
 import type { HonoVariables, Profile } from "../types";
 
 const usersRouter = new Hono<{ Variables: HonoVariables }>();
@@ -414,11 +415,23 @@ usersRouter.put("/me", async (c) => {
   if (body.showZodiac !== undefined) updateData.show_zodiac = !!body.showZodiac;
   if (body.coverPhoto !== undefined) updateData.cover_url = body.coverPhoto;
   if (body.avatar !== undefined) updateData.avatar_url = body.avatar;
+  const deviceId =
+    typeof body.device_id === "string" && body.device_id.trim()
+      ? body.device_id.trim()
+      : typeof body.deviceId === "string" && body.deviceId.trim()
+        ? body.deviceId.trim()
+        : null;
+  const platform =
+    typeof body.platform === "string" && body.platform.trim()
+      ? body.platform.trim().toLowerCase()
+      : "unknown";
+
   if (body.push_token !== undefined) updateData.push_token = body.push_token;
   if (body.pushNotificationsEnabled !== undefined) {
     updateData.push_notifications_enabled = Boolean(body.pushNotificationsEnabled);
     if (body.pushNotificationsEnabled === false) {
       updateData.push_token = null;
+      await deactivateUserDevices(supabaseAdmin, userId);
     }
   }
   if (body.emailNotificationsEnabled !== undefined) {
@@ -453,6 +466,19 @@ usersRouter.put("/me", async (c) => {
     return c.json({ error: { message: "Update failed" } }, 500);
   }
 
+  // Register push token in user_devices when the client sends token + device id.
+  if (
+    typeof body.push_token === "string" &&
+    body.push_token.startsWith("ExponentPushToken") &&
+    deviceId
+  ) {
+    await upsertUserDevice(supabaseAdmin, userId, {
+      pushToken: body.push_token,
+      platform,
+      deviceId,
+    });
+  }
+
   // Auto-create system moments when the avatar / cover photo ACTUALLY changes.
   // We compare against the values the profile had before this update.
   const oldAvatar = (user as any).avatar_url ?? null;
@@ -470,6 +496,23 @@ usersRouter.put("/me", async (c) => {
   ]);
 
   return c.json({ data: formatProfile(updated, postsResult.count ?? 0, friendsResult.count ?? 0, userId) });
+});
+
+// POST /api/me/push-deactivate — deactivate this device's push token (logout).
+usersRouter.post("/me/push-deactivate", async (c) => {
+  const userId = c.get("userId");
+  if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const body = await c.req.json().catch(() => ({}));
+  const deviceId =
+    typeof body.device_id === "string" && body.device_id.trim()
+      ? body.device_id.trim()
+      : typeof body.deviceId === "string" && body.deviceId.trim()
+        ? body.deviceId.trim()
+        : null;
+
+  await deactivateUserDevices(supabaseAdmin, userId, deviceId);
+  return c.body(null, 204);
 });
 
 import {

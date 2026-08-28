@@ -1,5 +1,5 @@
 import { supabaseAdmin } from "../supabase";
-import { sendPushNotification, getPushToken } from "./push";
+import { sendPushToUser } from "./push";
 
 // Matches @mention tokens: latin + accented + Arabic letters, digits, underscore.
 // Mirrors the client-side TOKEN_RE in mobile/src/components/RichText.tsx so the
@@ -91,14 +91,20 @@ export async function notifyMentions(opts: {
       post_id: postId,
       read: false,
     }));
-    await supabaseAdmin.from("notifications").insert(rows);
+    const { data: insertedRows } = await supabaseAdmin.from("notifications").insert(rows).select("id, user_id");
+
+    const insertedByUser = new Map<string, string>();
+    for (const row of insertedRows ?? []) {
+      insertedByUser.set(row.user_id, row.id);
+    }
 
     for (const uid of targetIds) {
       try {
-        const pushToken = await getPushToken(supabaseAdmin, uid);
-        await sendPushNotification(pushToken, "New Mention", `${authorName} mentioned you`, {
+        await sendPushToUser(supabaseAdmin, uid, "New Mention", `${authorName} mentioned you`, {
           postId,
           type: "mention",
+          fromUserId: authorId,
+          notificationId: insertedByUser.get(uid),
         });
       } catch (e) {
         console.error("[notifications] mention push error:", e);

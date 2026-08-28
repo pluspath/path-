@@ -1,4 +1,5 @@
-import { sendPushNotification } from "../../lib/push";
+import { sendPushToUser } from "../../lib/push";
+import { supabaseAdmin } from "../../supabase";
 import { dataRepository } from "../repositories/data.repository";
 import { logRepository } from "../repositories/log.repository";
 import { toPaginated } from "../utils/pagination";
@@ -64,12 +65,10 @@ export const notificationsService = {
 
     if (input.sendPush) {
       for (const t of targets) {
-        if (t.push_token) {
-          await sendPushNotification(t.push_token, title, message, {
-            type: "admin_broadcast",
-          });
-          pushSent += 1;
-        }
+        await sendPushToUser(supabaseAdmin, t.id, title, message, {
+          type: "admin_broadcast",
+        });
+        pushSent += 1;
       }
     }
 

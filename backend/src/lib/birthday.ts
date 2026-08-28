@@ -1,5 +1,5 @@
 import { supabaseAdmin } from "../supabase";
-import { sendPushNotification } from "./push";
+import { sendPushToUser } from "./push";
 
 // The "Birthday" auto-moment: on a user's birthday a system moment is created on
 // THEIR own timeline ("🎂 It's my birthday today!") and every accepted friend
@@ -78,23 +78,28 @@ async function ensureBirthdayForUser(person: any, now: Date): Promise<void> {
     post_id: post.id,
     read: false,
   }));
-  const { error: notifErr } = await supabaseAdmin.from("notifications").insert(rows);
+  const { data: insertedRows, error: notifErr } = await supabaseAdmin
+    .from("notifications")
+    .insert(rows)
+    .select("id, user_id");
   if (notifErr) console.error("[birthday] notifications insert failed:", notifErr.message);
 
-  // Best-effort push to each friend (matches the other notification types).
-  try {
-    const { data: tokens } = await supabaseAdmin
-      .from("profiles")
-      .select("push_token")
-      .in("id", friendIds);
-    for (const t of tokens ?? []) {
-      await sendPushNotification(t.push_token, "🎂 Birthday", message, {
+  const insertedByUser = new Map<string, string>();
+  for (const row of insertedRows ?? []) {
+    insertedByUser.set(row.user_id, row.id);
+  }
+
+  for (const fid of friendIds) {
+    try {
+      await sendPushToUser(supabaseAdmin, fid, "🎂 Birthday", message, {
         postId: post.id,
         type: BIRTHDAY_TYPE,
+        fromUserId: person.id,
+        notificationId: insertedByUser.get(fid),
       });
+    } catch (e) {
+      console.error("[birthday] push error for", fid, e);
     }
-  } catch (e) {
-    console.error("[birthday] push error:", e);
   }
 }
 

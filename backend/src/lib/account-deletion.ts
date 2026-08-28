@@ -131,8 +131,10 @@ export async function suspendAccountForDeletion(
     });
   }
 
-  // Clear push token so no notifications after "deletion".
+  // Clear push tokens so no notifications after "deletion".
   await supabaseAdmin.from("profiles").update({ push_token: null }).eq("id", userId);
+  const { deactivateUserDevices } = await import("./push");
+  await deactivateUserDevices(supabaseAdmin, userId);
 
   const { data: authUser } = await supabaseAdmin.auth.admin.getUserById(userId);
   const email = authUser?.user?.email;
