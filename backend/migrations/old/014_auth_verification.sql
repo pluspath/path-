@@ -1,5 +1,5 @@
 -- Email verification pending registrations + password reset OTP storage
--- Run in Supabase SQL Editor if boot-time exec_sql is unavailable.
+-- Run in Supabase SQL Editor or via: bun run migrate:admin
 
 CREATE TABLE IF NOT EXISTS public.pending_registrations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
