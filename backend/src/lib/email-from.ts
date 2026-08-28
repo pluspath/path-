@@ -4,7 +4,7 @@ import { env } from "../env";
 export function resendFromAddress(): string {
   const configured = env.RESEND_FROM_EMAIL?.trim();
   if (configured) return configured;
-  return "Path+ <noreply@pathplus.store>";
+  return "Path+ <dev@pathplus.store>";
 }
 
 /**
