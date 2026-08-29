@@ -132,7 +132,7 @@ export async function getEmailConfig(): Promise<EmailConfig> {
 
   let fromEmail: string;
   if (!rawFrom) {
-    fromEmail = "Resend <onboarding@resend.dev>";
+    fromEmail = "Path+ <dev@pathplus.store>";
   } else if (rawFrom.includes("<")) {
     fromEmail = rawFrom;
   } else {

@@ -74,7 +74,12 @@ export async function sendEmail(
   }
 }
 
-/** Verify Resend API key without sending mail (domains.list). */
+/**
+ * Verify Resend API key without sending mail.
+ * Uses domains.list — that endpoint requires a Full access key.
+ * Sending-only keys return restricted_api_key (401); that is OK for Path+
+ * (signup/reset only call emails.send).
+ */
 export async function testEmailProviderConnection(): Promise<{
   ok: boolean;
   message: string;
@@ -92,14 +97,22 @@ export async function testEmailProviderConnection(): Promise<{
     const { data, error } = await resend.domains.list();
     if (error) {
       const msg = sanitizeProviderError(error.message);
-      if (/unauthorized|invalid|api.?key|forbidden|restricted_api_key/i.test(msg)) {
+      const name = typeof (error as { name?: string }).name === "string"
+        ? (error as { name: string }).name
+        : "";
+      // Sending-only keys cannot list domains — email sending still works.
+      if (
+        name === "restricted_api_key" ||
+        /restricted_api_key|restricted to only send/i.test(msg)
+      ) {
         return {
-          ok: false,
+          ok: true,
           message:
-            /restricted_api_key/i.test(msg)
-              ? "Send-only API key configured (email sending may still work)."
-              : "Authentication failed. Check the API key.",
+            "Send-only API key OK (domains list blocked; email sending is allowed).",
         };
+      }
+      if (/unauthorized|invalid.?api.?key|forbidden|missing.?api.?key/i.test(msg)) {
+        return { ok: false, message: "Authentication failed. Check the API key." };
       }
       return { ok: false, message: "Provider rejected the connection." };
     }

@@ -341,6 +341,8 @@ app.get("/__marketing", (c) =>
         console.error(
           "[email] Create a new key at https://resend.com/api-keys, verify pathplus.store, update RESEND_API_KEY in backend/.env, restart."
         );
+      } else {
+        console.log(`[email] Resend check: ${test.message}`);
       }
     }
   } catch (e) {
