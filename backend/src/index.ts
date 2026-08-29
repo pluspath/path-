@@ -348,6 +348,22 @@ app.get("/__marketing", (c) =>
   } catch (e) {
     console.warn("[email] config check failed:", e instanceof Error ? e.message : e);
   }
+
+  try {
+    const { isPushEnabled } = await import("./lib/external-config");
+    const pushEnabled = await isPushEnabled();
+    console.log(
+      `[push] Expo Push Service ${pushEnabled ? "enabled" : "DISABLED"} — ` +
+        "architecture: Backend → exp.host → APNs/FCM (ExponentPushToken required)"
+    );
+    if (!pushEnabled) {
+      console.error(
+        "[push] CRITICAL: Push is disabled in Admin → External Services. All notifications will be skipped."
+      );
+    }
+  } catch (e) {
+    console.warn("[push] config check failed:", e instanceof Error ? e.message : e);
+  }
 })();
 
 const isProd = process.env.NODE_ENV === "production";

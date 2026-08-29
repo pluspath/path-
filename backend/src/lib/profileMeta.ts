@@ -40,3 +40,22 @@ export function isAdult(birthday: string | null | undefined): boolean {
   const age = computeAge(birthday);
   return age !== null && age >= 18;
 }
+
+/** Parse YYYY-MM-DD without timezone shift; returns null if invalid or future. */
+export function parseCalendarDate(value: string): Date | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  const [y, m, d] = value.split("-").map(Number);
+  const date = new Date(y, m - 1, d, 12, 0, 0, 0);
+  if (date.getFullYear() !== y || date.getMonth() !== m - 1 || date.getDate() !== d) return null;
+  const today = new Date();
+  const todayNoon = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 12, 0, 0, 0);
+  if (date > todayNoon) return null;
+  return date;
+}
+
+/** Validate and normalize a birthday string; returns YYYY-MM-DD or null. */
+export function normalizeBirthday(value: string | null | undefined): string | null {
+  if (!value || typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return parseCalendarDate(trimmed) ? trimmed : null;
+}

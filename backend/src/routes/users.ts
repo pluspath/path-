@@ -5,7 +5,7 @@ import { computeAge, computeZodiac } from "../lib/profileMeta";
 import { decodeImages } from "../lib/images";
 import { getBlockedIds } from "../lib/blocks";
 import { formatDuration } from "../lib/duration";
-import { upsertUserDevice, deactivateUserDevices } from "../lib/push";
+import { upsertUserDevice, deactivateUserDevices, getPushTokensForUser, getPushStatusForUser, sendPushNotificationDetailed } from "../lib/push";
 import type { HonoVariables, Profile } from "../types";
 
 const usersRouter = new Hono<{ Variables: HonoVariables }>();
@@ -521,6 +521,96 @@ usersRouter.post("/me/push-deactivate", async (c) => {
 
   await deactivateUserDevices(supabaseAdmin, userId, deviceId);
   return c.body(null, 204);
+});
+
+// GET /api/me/push-status — diagnostic summary (no secrets, no full tokens).
+usersRouter.get("/me/push-status", async (c) => {
+  const userId = c.get("userId");
+  if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const status = await getPushStatusForUser(supabaseAdmin, userId);
+  return c.json({
+    data: {
+      ...status,
+      architecture: "expo_push",
+      expoPushApi: "https://exp.host/--/api/v2/push/send",
+      bundleIdentifier: "com.mazyd.pathplus",
+      easProjectId: "a6adef19-c35b-4fc7-b4b9-6bc4af060d39",
+    },
+  });
+});
+
+// POST /api/me/push-test — send a test notification to the authenticated user's devices.
+usersRouter.post("/me/push-test", async (c) => {
+  const userId = c.get("userId");
+  if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const status = await getPushStatusForUser(supabaseAdmin, userId);
+
+  if (!status.pushEnabledGlobally) {
+    return c.json({
+      data: {
+        ok: false,
+        step: "push_disabled_globally",
+        message: "Push notifications are disabled in Admin → External Services.",
+        ...status,
+      },
+    });
+  }
+
+  if (!status.pushEnabledForUser) {
+    return c.json({
+      data: {
+        ok: false,
+        step: "push_disabled_user",
+        message: "Push notifications are turned off in your account settings.",
+        ...status,
+      },
+    });
+  }
+
+  const tokens = await getPushTokensForUser(supabaseAdmin, userId);
+  if (tokens.length === 0) {
+    return c.json({
+      data: {
+        ok: false,
+        step: "no_tokens",
+        message:
+          "No active push token found. Use a physical iOS device (not simulator), grant notification permission, and open the app while signed in.",
+        activeDeviceCount: 0,
+        ...status,
+      },
+    });
+  }
+
+  console.log(`[push-test] User ${userId.slice(0, 8)}… requesting test push (${tokens.length} device(s))`);
+
+  const results = await Promise.all(
+    tokens.map((token) =>
+      sendPushNotificationDetailed(
+        token,
+        "Path+ Test Notification",
+        "Push notifications are working correctly.",
+        { type: "test" },
+        supabaseAdmin,
+        { waitForReceipt: true }
+      )
+    )
+  );
+
+  const ok = results.some((r) => r.ok);
+  return c.json({
+    data: {
+      ok,
+      step: ok ? "delivered" : "delivery_failed",
+      message: ok
+        ? "Test notification sent successfully."
+        : results[0]?.message ?? "Push delivery failed — check backend logs for Expo ticket/receipt errors.",
+      activeDeviceCount: tokens.length,
+      results,
+      ...status,
+    },
+  });
 });
 
 import {

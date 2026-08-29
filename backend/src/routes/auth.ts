@@ -3,7 +3,7 @@ import type { StatusCode } from "hono/utils/http-status";
 import { z } from "zod";
 import { supabase, supabaseAdmin } from "../supabase";
 import { ensureJoinedPost } from "../lib/joined";
-import { isAdult } from "../lib/profileMeta";
+import { isAdult, normalizeBirthday } from "../lib/profileMeta";
 import {
   startRegistration,
   resendRegistrationOtp,
@@ -69,11 +69,11 @@ authRouter.post("/signup", async (c) => {
     parsed.data.gender === "Male" || parsed.data.gender === "Female"
       ? parsed.data.gender
       : null;
-  const birthday =
-    typeof parsed.data.birthday === "string" &&
-    /^\d{4}-\d{2}-\d{2}$/.test(parsed.data.birthday)
-      ? parsed.data.birthday
-      : null;
+  const birthday = normalizeBirthday(parsed.data.birthday);
+
+  if (parsed.data.birthday && !birthday) {
+    return c.json({ error: { message: "Please enter a valid date of birth (YYYY-MM-DD)." } }, 400);
+  }
 
   if (birthday && !isAdult(birthday)) {
     return c.json({ error: { message: "You must be 18 or older to use Path+" } }, 400);

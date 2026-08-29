@@ -28,6 +28,7 @@ function applyEnvFileOverrides() {
     "RESEND_FROM_EMAIL",
     "PUBLIC_APP_URL",
     "CONFIG_ENCRYPTION_KEY",
+    "EXPO_ACCESS_TOKEN",
   ]);
 
   let appliedFrom: string | null = null;
@@ -92,6 +93,8 @@ const envSchema = z.object({
    * NEVER commit the real value. NEVER expose to clients.
    */
   CONFIG_ENCRYPTION_KEY: z.string().min(32).optional(),
+  /** Optional Expo access token for higher rate limits / push receipt API. Server-only. */
+  EXPO_ACCESS_TOKEN: z.string().optional(),
 });
 
 function supabaseProjectRef(url: string): string {
@@ -159,6 +162,13 @@ function validateEnv() {
     if (!parsed.GOOGLE_PLACES_API_KEY?.trim()) {
       console.warn(
         "[config] GOOGLE_PLACES_API_KEY not set — Places API will use Admin External Services config if present"
+      );
+    }
+    if (parsed.EXPO_ACCESS_TOKEN?.trim()) {
+      console.log("[config] EXPO_ACCESS_TOKEN configured — Expo Push API authenticated");
+    } else {
+      console.log(
+        "[config] EXPO_ACCESS_TOKEN not set — Expo Push still works; optional for higher rate limits"
       );
     }
     if (parsed.PUBLIC_APP_URL) {
