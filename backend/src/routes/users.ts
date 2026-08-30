@@ -590,7 +590,7 @@ usersRouter.post("/me/push-test", async (c) => {
       sendPushNotificationDetailed(
         token,
         "Path+ Test Notification",
-        "Push notifications are working correctly.",
+        "Push Notifications are working correctly.",
         { type: "test" },
         supabaseAdmin,
         { waitForReceipt: true }

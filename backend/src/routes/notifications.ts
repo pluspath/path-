@@ -1,9 +1,93 @@
 import { Hono } from "hono";
 import { supabaseAdmin } from "../supabase";
 import { getBlockedIds } from "../lib/blocks";
+import {
+  getPushTokensForUser,
+  getPushStatusForUser,
+  sendPushNotificationDetailed,
+} from "../lib/push";
 import type { HonoVariables } from "../types";
 
 const notificationsRouter = new Hono<{ Variables: HonoVariables }>();
+
+/**
+ * POST /api/notifications/test — authenticated self-test push (same as /api/me/push-test).
+ * Protected: requires Bearer session. Sends only to the caller's devices.
+ */
+notificationsRouter.post("/test", async (c) => {
+  const userId = c.get("userId");
+  if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const status = await getPushStatusForUser(supabaseAdmin, userId);
+
+  if (!status.pushEnabledGlobally) {
+    return c.json({
+      data: {
+        ok: false,
+        step: "push_disabled_globally",
+        message: "Push notifications are disabled in Admin → External Services.",
+        ...status,
+      },
+    });
+  }
+
+  if (!status.pushEnabledForUser) {
+    return c.json({
+      data: {
+        ok: false,
+        step: "push_disabled_user",
+        message: "Push notifications are turned off in your account settings.",
+        ...status,
+      },
+    });
+  }
+
+  const tokens = await getPushTokensForUser(supabaseAdmin, userId);
+  if (tokens.length === 0) {
+    return c.json({
+      data: {
+        ok: false,
+        step: "no_tokens",
+        message:
+          "No active push token found. Open the app on a physical iPhone, allow notifications, stay signed in, then try again.",
+        activeDeviceCount: 0,
+        ...status,
+      },
+    });
+  }
+
+  console.log(
+    `[push-test] /api/notifications/test user=${userId.slice(0, 8)}… devices=${tokens.length}`
+  );
+
+  const results = await Promise.all(
+    tokens.map((token) =>
+      sendPushNotificationDetailed(
+        token,
+        "Path+ Test Notification",
+        "Push Notifications are working correctly.",
+        { type: "test" },
+        supabaseAdmin,
+        { waitForReceipt: true }
+      )
+    )
+  );
+
+  const ok = results.some((r) => r.ok);
+  return c.json({
+    data: {
+      ok,
+      step: ok ? "delivered" : "delivery_failed",
+      message: ok
+        ? "Test notification sent successfully."
+        : results[0]?.message ??
+          "Push delivery failed — check server logs for Expo ticket/receipt errors (often missing APNs key on EAS).",
+      activeDeviceCount: tokens.length,
+      results,
+      ...status,
+    },
+  });
+});
 
 notificationsRouter.get("/", async (c) => {
   const user = c.get("user");
