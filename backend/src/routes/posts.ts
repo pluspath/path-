@@ -519,14 +519,27 @@ postsRouter.post("/", async (c) => {
     // new repath so tapping opens User B's repath of the moment, not the feed.
     try {
       if (post?.id && originalOwnerId !== userId) {
-        const { data: inserted } = await supabaseAdmin.from("notifications").insert({
-          user_id: originalOwnerId,
-          from_user_id: userId,
-          type: "repath",
-          message: "repathed your moment",
-          post_id: post.id,
-          read: false,
-        }).select("id").single();
+        const { data: existingNotif } = await supabaseAdmin
+          .from("notifications")
+          .select("id")
+          .eq("user_id", originalOwnerId)
+          .eq("from_user_id", userId)
+          .eq("type", "repath")
+          .eq("post_id", post.id)
+          .maybeSingle();
+
+        let notificationId = existingNotif?.id as string | undefined;
+        if (!notificationId) {
+          const { data: inserted } = await supabaseAdmin.from("notifications").insert({
+            user_id: originalOwnerId,
+            from_user_id: userId,
+            type: "repath",
+            message: "repathed your moment",
+            post_id: post.id,
+            read: false,
+          }).select("id").single();
+          notificationId = inserted?.id;
+        }
 
         await sendPushToUser(
           supabaseAdmin,
@@ -537,7 +550,7 @@ postsRouter.post("/", async (c) => {
             postId: post.id,
             type: "repath",
             fromUserId: userId,
-            notificationId: inserted?.id,
+            notificationId,
           }
         );
       }
