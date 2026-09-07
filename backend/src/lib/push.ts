@@ -342,7 +342,11 @@ export async function sendPushNotificationDetailed(
     return { ok: false, tokenSuffix: suffix, message: "Push notifications disabled in Admin settings" };
   }
 
-  const stringData = stringifyPushData(data);
+  const stringData = stringifyPushData({
+    ...data,
+    title: title || (typeof data?.title === "string" ? data.title : undefined),
+    body: body || (typeof data?.body === "string" ? data.body : undefined),
+  });
 
   try {
     const res = await fetch(EXPO_PUSH_URL, {
@@ -356,6 +360,8 @@ export async function sendPushNotificationDetailed(
         sound: "default",
         priority: "high",
         channelId: "default",
+        // Visible iOS banner (avoid silent/content-available-only pushes).
+        badge: 1,
       }),
     });
 
@@ -364,7 +370,17 @@ export async function sendPushNotificationDetailed(
 
     if (!res.ok) {
       const msg = json?.errors?.[0]?.message ?? `HTTP ${res.status}`;
-      console.error(`[push] Expo HTTP error for ${suffix}:`, msg);
+      const code = json?.errors?.[0]?.code ?? json?.errors?.[0]?.error ?? "";
+      console.error(`[push] Expo HTTP error for ${suffix}:`, msg, code);
+      if (
+        String(code).includes("UNAUTHORIZED") ||
+        String(msg).toLowerCase().includes("unauthorized")
+      ) {
+        console.error(
+          "[push] CRITICAL: Expo rejected the request — set EXPO_ACCESS_TOKEN on the server " +
+            "(required when Enhanced Push Security is enabled on the EAS project)."
+        );
+      }
       return { ok: false, tokenSuffix: suffix, message: msg };
     }
 
