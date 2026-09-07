@@ -143,12 +143,13 @@ notificationsRouter.get("/", async (c) => {
       user: n.from_user_id && profileMap[n.from_user_id]
         ? {
             id: profileMap[n.from_user_id].id,
-            name: profileMap[n.from_user_id].full_name,
+            name: profileMap[n.from_user_id].full_name ?? "",
+            username: profileMap[n.from_user_id].username ?? "",
             avatar:
               profileMap[n.from_user_id].avatar_url ??
               `https://api.dicebear.com/7.x/avataaars/svg?seed=${n.from_user_id}`,
           }
-        : { id: "system", name: "Path+", avatar: "" },
+        : { id: "system", name: "Path+", username: "", avatar: "" },
       message: n.message,
       postId: n.post_id ?? undefined,
       friendshipId: friendshipMap[n.id] ?? undefined,

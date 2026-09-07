@@ -31,19 +31,26 @@ function formatProfile(p: any, postCount = 0, friendCount = 0, viewerId?: string
     showMomentsToOthers: p.show_moments_to_others ?? true,
   };
 
+  // Identity fields are always public — never gated by privacy settings.
+  // Accept both DB snake_case and any already-mapped camelCase aliases so
+  // hydrated / legacy rows still surface name + username + location.
+  const name = String(p.full_name ?? p.name ?? "").trim();
+  const username = String(p.username ?? "").trim();
+  const location = String(p.location ?? "").trim();
+
   return {
     id: p.id,
-    name: p.full_name ?? "",
-    username: p.username ?? "",
+    name,
+    username,
     email: "",
-    avatar: p.avatar_url ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${p.id}`,
+    avatar: p.avatar_url ?? p.avatar ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${p.id}`,
     bio: p.bio ?? "",
-    location: p.location ?? "",
+    location,
     // Raw birthday is private — only ever returned to the profile owner.
     birthday: isOwner ? (p.birthday ?? "") : "",
     gender: p.gender ?? "",
-    coverPhoto: p.cover_url ?? "https://images.unsplash.com/photo-1519638399535-1b036603ac77?w=800",
-    joinDate: p.created_at ?? new Date().toISOString(),
+    coverPhoto: p.cover_url ?? p.coverPhoto ?? "https://images.unsplash.com/photo-1519638399535-1b036603ac77?w=800",
+    joinDate: p.created_at ?? p.joinDate ?? new Date().toISOString(),
     friendCount,
     postCount,
     momentCount: postCount,
@@ -698,19 +705,56 @@ usersRouter.get("/:id", async (c) => {
     }
   }
 
-  const userClient = createUserClient(token);
-  const { data: targetProfile } = await userClient.from("profiles").select("*").eq("id", id).single();
+  // Service role — same as GET /me. User-JWT + half-broken profiles RLS can
+  // return incomplete or empty rows for some accounts (missing name/username).
+  const { data: targetProfile, error: profileErr } = await supabaseAdmin
+    .from("profiles")
+    .select("*")
+    .eq("id", id)
+    .maybeSingle();
+
+  if (profileErr) {
+    console.warn("[users] GET /:id profile error:", profileErr.message);
+  }
   if (!targetProfile) return c.json({ error: { message: "User not found" } }, 404);
 
+  // If identity fields are blank on the profile row, fill from auth metadata
+  // (older accounts / partial upserts) without inventing new values.
+  let enriched = targetProfile;
+  const needsIdentity =
+    !String(targetProfile.full_name ?? "").trim() ||
+    !String(targetProfile.username ?? "").trim();
+  if (needsIdentity) {
+    try {
+      const { data: authData } = await supabaseAdmin.auth.admin.getUserById(id);
+      const meta = authData?.user?.user_metadata ?? {};
+      enriched = {
+        ...targetProfile,
+        full_name:
+          String(targetProfile.full_name ?? "").trim() ||
+          String(meta.full_name ?? meta.name ?? "").trim() ||
+          targetProfile.full_name,
+        username:
+          String(targetProfile.username ?? "").trim() ||
+          String(meta.username ?? "").trim() ||
+          targetProfile.username,
+      };
+    } catch (e) {
+      console.warn("[users] GET /:id auth metadata fallback failed:", e);
+    }
+  }
+
   const [postsResult, friendsResult] = await Promise.all([
-    userClient.from("posts").select("id", { count: "exact", head: true }).eq("user_id", id),
+    supabaseAdmin.from("posts").select("id", { count: "exact", head: true }).eq("user_id", id),
     // True total friend count — uses the admin client so RLS doesn't restrict the
     // count to only the friendships the *viewer* is part of (which made the count
     // differ per viewer). Same number for everyone now.
     supabaseAdmin.from("friendships").select("id", { count: "exact", head: true }).eq("status", "accepted").or(`requester_id.eq.${id},receiver_id.eq.${id}`),
   ]);
 
-  return c.json({ data: formatProfile(targetProfile, postsResult.count ?? 0, friendsResult.count ?? 0, userId ?? undefined) });
+  return c.json({
+    data: formatProfile(enriched, postsResult.count ?? 0, friendsResult.count ?? 0, userId ?? undefined),
+  });
 });
 
 async function areFriends(a: string, b: string): Promise<boolean> {

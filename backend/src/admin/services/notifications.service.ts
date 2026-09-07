@@ -67,6 +67,8 @@ export const notificationsService = {
       for (const t of targets) {
         await sendPushToUser(supabaseAdmin, t.id, title, message, {
           type: "admin_broadcast",
+          title,
+          body: message,
         });
         pushSent += 1;
       }

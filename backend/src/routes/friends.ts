@@ -67,11 +67,11 @@ async function deleteCloseFriend(userClient: any, ownerId: string, friendId: str
 function formatProfile(p: any) {
   return {
     id: p.id,
-    name: p.full_name ?? "",
-    username: p.username ?? "",
+    name: String(p.full_name ?? p.name ?? "").trim(),
+    username: String(p.username ?? "").trim(),
     avatar: p.avatar_url ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${p.id}`,
     bio: p.bio ?? "",
-    location: p.location ?? "",
+    location: String(p.location ?? "").trim(),
     // Raw birthday is private — never exposed in friend lists / suggestions.
     birthday: "",
     gender: p.gender ?? "",
@@ -137,7 +137,8 @@ friendsRouter.get("/", async (c) => {
 
   let profileMap: Record<string, any> = {};
   if (allIds.length > 0) {
-    const { data: profiles } = await userClient.from("profiles").select("*").in("id", allIds);
+    // Admin client so half-broken profiles RLS cannot omit name/username/location.
+    const { data: profiles } = await supabaseAdmin.from("profiles").select("*").in("id", allIds);
     for (const p of profiles ?? []) profileMap[p.id] = p;
   }
 
