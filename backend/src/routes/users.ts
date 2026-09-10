@@ -977,6 +977,9 @@ usersRouter.get("/:id/posts", async (c) => {
     );
   }
 
+  const { attachOriginals } = await import("../lib/load-posts");
+  await attachOriginals(null, visible);
+
   const formatted = visible.map((p) => formatPost(p, userId ?? undefined, blockedIds));
   await refreshFriendshipAvatars(formatted);
   return c.json({ data: formatted });

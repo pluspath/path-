@@ -8,58 +8,10 @@ import { notifyMentions } from "../lib/mentions";
 import { encodeImages } from "../lib/images";
 import { getBlockedIds } from "../lib/blocks";
 import { parseDurationToMinutes } from "../lib/duration";
+import { POST_SELECT, loadPosts, attachOriginals } from "../lib/load-posts";
 import type { HonoVariables } from "../types";
 
 const postsRouter = new Hono<{ Variables: HonoVariables }>();
-
-// Explicit FK hints — after `repath_of` (and any other FKs) PostgREST finds
-// multiple relationships between posts↔profiles and rejects bare `profiles(*)`.
-const POST_SELECT =
-  "*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(avatar_url))";
-const POST_SELECT_BASIC = "*, profiles!user_id(*)";
-const POST_SELECT_MIN = "*";
-
-/**
- * Load posts with the service-role client (bypasses RLS). Privacy is enforced
- * in route handlers (friends / audience / blocks).
- *
- * Why admin: user-JWT + RLS often returns an empty array with no thrown error
- * when policies were dropped/half-applied during boot migrations — the home
- * feed and profile timelines then look "wiped" even though rows still exist.
- * Nested embeds can also fail after schema-cache lag; we fall back gradually.
- */
-async function loadPosts(
-  build: (select: string) => any
-): Promise<{ data: any[]; error: any | null }> {
-  const attempts = [POST_SELECT, POST_SELECT_BASIC, POST_SELECT_MIN];
-  let lastError: any = null;
-  for (const select of attempts) {
-    const { data, error } = await build(select);
-    if (!error) {
-      const rows = data ?? [];
-      // If we fell back to bare `*`, hydrate author profiles so the app still
-      // gets names/avatars (formatPost reads `p.profiles`).
-      if (select === POST_SELECT_MIN && rows.length > 0 && !rows[0]?.profiles) {
-        await hydratePostProfiles(rows);
-      }
-      return { data: rows, error: null };
-    }
-    lastError = error;
-    console.warn(`[posts] select failed:`, error.message);
-  }
-  return { data: [], error: lastError };
-}
-
-/** Attach `profiles` onto post rows when the embed select was unavailable. */
-async function hydratePostProfiles(posts: any[]): Promise<void> {
-  const ids = Array.from(new Set(posts.map((p) => p?.user_id).filter(Boolean)));
-  if (ids.length === 0) return;
-  const { data: profiles } = await supabaseAdmin.from("profiles").select("*").in("id", ids);
-  const byId = new Map((profiles ?? []).map((p: any) => [p.id, p]));
-  for (const post of posts) {
-    if (!post.profiles && post.user_id) post.profiles = byId.get(post.user_id) ?? null;
-  }
-}
 
 // The set of authors who have privately starred `viewerId` as a close friend.
 // Read with the admin client because RLS restricts `close_friends` rows to their
@@ -85,24 +37,6 @@ async function getWhoStarredMe(viewerId: string): Promise<Set<string>> {
   } catch {
     return new Set();
   }
-}
-
-// Attach the nested `original` moment to any repath posts. Uses admin so
-// originals are still attached when user-JWT RLS is broken; feed privacy is
-// already applied before this runs. No-ops when nothing references an original.
-async function attachOriginals(_userClient: any, posts: any[]) {
-  const originalIds = Array.from(
-    new Set((posts ?? []).map((p) => p?.repath_of).filter(Boolean))
-  );
-  if (originalIds.length === 0) return posts;
-  const { data: originals } = await loadPosts((select) =>
-    supabaseAdmin.from("posts").select(select).in("id", originalIds)
-  );
-  const byId = new Map((originals ?? []).map((o: any) => [o.id, o]));
-  for (const p of posts) {
-    if (p?.repath_of) p.original = byId.get(p.repath_of) ?? null;
-  }
-  return posts;
 }
 
 postsRouter.get("/", async (c) => {
@@ -328,42 +262,44 @@ async function collectInteractedPostIds(userId: string): Promise<string[]> {
     }
   };
 
-  const { data: myReactions, error: reactionsError } = await supabaseAdmin
-    .from("reactions")
-    .select("post_id")
-    .eq("user_id", userId)
-    .order("created_at", { ascending: false })
-    .limit(200);
+  const [reactionsResult, commentsResult, repathsResult] = await Promise.all([
+    supabaseAdmin
+      .from("reactions")
+      .select("post_id")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(200),
+    supabaseAdmin
+      .from("comments")
+      .select("post_id")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(200),
+    supabaseAdmin
+      .from("posts")
+      .select("repath_of")
+      .eq("user_id", userId)
+      .not("repath_of", "is", null)
+      .order("created_at", { ascending: false })
+      .limit(200),
+  ]);
+
+  const { data: myReactions, error: reactionsError } = reactionsResult;
   if (reactionsError) {
     console.error("[posts/interacted] reactions query failed:", reactionsError.message);
   } else {
     for (const r of myReactions ?? []) add((r as any).post_id);
   }
 
-  const { data: myComments, error: commentsError } = await supabaseAdmin
-    .from("comments")
-    .select("post_id")
-    .eq("user_id", userId)
-    .order("created_at", { ascending: false })
-    .limit(200);
+  const { data: myComments, error: commentsError } = commentsResult;
   if (commentsError) {
-    // Older / partial schemas may lack comments — don't fail the whole tab.
     console.warn("[posts/interacted] comments query failed:", commentsError.message);
   } else {
     for (const row of myComments ?? []) add((row as any).post_id);
   }
 
-  // Moments I repathed (the ORIGINAL id), so the Liked/Interacted tab shows the
-  // moment I engaged with, not my reshare row.
-  const { data: myRepaths, error: repathError } = await supabaseAdmin
-    .from("posts")
-    .select("repath_of")
-    .eq("user_id", userId)
-    .not("repath_of", "is", null)
-    .order("created_at", { ascending: false })
-    .limit(200);
+  const { data: myRepaths, error: repathError } = repathsResult;
   if (repathError) {
-    // repath_of may not exist yet — ignore.
     if (!/repath_of|column/i.test(repathError.message ?? "")) {
       console.warn("[posts/interacted] repaths query failed:", repathError.message);
     }
@@ -385,12 +321,13 @@ async function handleInteractedMoments(c: any) {
   const orderedPostIds = await collectInteractedPostIds(userId);
   if (orderedPostIds.length === 0) return c.json({ data: [] });
 
-  const blockedIds = await getBlockedIds(userId);
+  const [blockedIds, allowedAuthors] = await Promise.all([
+    getBlockedIds(userId),
+    getAllowedAuthorIds(userClient, userId),
+  ]);
   const blockedSet = new Set(blockedIds);
   const allowedUserIds = new Set(
-    (await getAllowedAuthorIds(userClient, userId)).filter(
-      (id) => id === userId || !blockedSet.has(id)
-    )
+    allowedAuthors.filter((id) => id === userId || !blockedSet.has(id))
   );
 
   const { data: posts, error: postsError } = await loadPosts((select) =>
@@ -524,6 +461,13 @@ postsRouter.post("/", async (c) => {
       return c.json({ error: { message: "Failed to repath moment" } }, 500);
     }
 
+    // Reload via loadPosts so nested profile embeds never leave original blank.
+    if (post?.id) {
+      const { data: rows } = await loadPosts((select) =>
+        supabaseAdmin.from("posts").select(select).eq("id", post.id).limit(1)
+      );
+      if (rows[0]) post = rows[0];
+    }
     if (post?.repath_of) await attachOriginals(userClient, [post]);
 
     // Notify the original moment owner (activity feed + push). post_id is the

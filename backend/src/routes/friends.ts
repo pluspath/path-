@@ -91,15 +91,37 @@ friendsRouter.get("/", async (c) => {
 
   const userClient = createUserClient(token);
 
-  // Blocked-in-either-direction ids are hidden from friends, requests, and
-  // suggestions throughout this response.
-  const blockedSet = new Set(await getBlockedIds(userId));
+  // Parallelize friendships + blocks + close-friends (was a long waterfall).
+  const [
+    blockedIds,
+    acceptedFriendshipsResult,
+    pendingFriendshipsResult,
+    pendingSentResult,
+    closeFriendSet,
+  ] = await Promise.all([
+    getBlockedIds(userId),
+    userClient
+      .from("friendships")
+      .select("id, requester_id, receiver_id")
+      .eq("status", "accepted")
+      .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
+    userClient
+      .from("friendships")
+      .select("id, requester_id, created_at")
+      .eq("receiver_id", userId)
+      .eq("status", "pending"),
+    userClient
+      .from("friendships")
+      .select("id, receiver_id")
+      .eq("requester_id", userId)
+      .eq("status", "pending"),
+    getCloseFriendIds(supabaseAdmin, userId),
+  ]);
 
-  const { data: acceptedFriendships } = await userClient
-    .from("friendships")
-    .select("id, requester_id, receiver_id")
-    .eq("status", "accepted")
-    .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`);
+  const blockedSet = new Set(blockedIds);
+  const { data: acceptedFriendships } = acceptedFriendshipsResult;
+  const { data: pendingFriendships } = pendingFriendshipsResult;
+  const { data: pendingSentFriendships } = pendingSentResult;
 
   const friendIds = (acceptedFriendships ?? [])
     .map((f: any) => (f.requester_id === userId ? f.receiver_id : f.requester_id))
@@ -112,35 +134,28 @@ friendsRouter.get("/", async (c) => {
     friendshipIdByFriend[otherId] = f.id;
   }
 
-  // Which of my friends I've privately starred as close friends.
-  const closeFriendSet = await getCloseFriendIds(userClient, userId);
-
-  const { data: pendingFriendships } = await userClient
-    .from("friendships")
-    .select("id, requester_id, created_at")
-    .eq("receiver_id", userId)
-    .eq("status", "pending");
-
   const pendingRequesterIds = (pendingFriendships ?? [])
     .map((f: any) => f.requester_id)
     .filter((id: string) => !blockedSet.has(id));
 
-  const { data: pendingSentFriendships } = await userClient
-    .from("friendships")
-    .select("id, receiver_id")
-    .eq("requester_id", userId)
-    .eq("status", "pending");
-
   const pendingSentIds = (pendingSentFriendships ?? []).map((f: any) => f.receiver_id);
 
   const allIds = [...new Set([...friendIds, ...pendingRequesterIds])];
+  const excludeIds = [userId, ...friendIds, ...pendingRequesterIds, ...pendingSentIds, ...blockedSet];
+
+  const [profilesResult, suggestedResult] = await Promise.all([
+    allIds.length > 0
+      ? supabaseAdmin.from("profiles").select("*").in("id", allIds)
+      : Promise.resolve({ data: [] as any[] }),
+    supabaseAdmin
+      .from("profiles")
+      .select("*")
+      .not("id", "in", `(${excludeIds.join(",")})`)
+      .limit(5),
+  ]);
 
   let profileMap: Record<string, any> = {};
-  if (allIds.length > 0) {
-    // Admin client so half-broken profiles RLS cannot omit name/username/location.
-    const { data: profiles } = await supabaseAdmin.from("profiles").select("*").in("id", allIds);
-    for (const p of profiles ?? []) profileMap[p.id] = p;
-  }
+  for (const p of profilesResult.data ?? []) profileMap[p.id] = p;
 
   const friends = friendIds
     .map((id: string) => profileMap[id])
@@ -149,7 +164,6 @@ friendsRouter.get("/", async (c) => {
       ...formatProfile(p),
       friendshipStatus: "friends" as const,
       friendshipId: friendshipIdByFriend[p.id],
-      // The star state — single source of truth, read from `close_friends`.
       isCloseFriend: closeFriendSet.has(p.id),
     }));
   const requests = (pendingFriendships ?? [])
@@ -161,14 +175,13 @@ friendsRouter.get("/", async (c) => {
       createdAt: f.created_at,
     }));
 
-  const excludeIds = [userId, ...friendIds, ...pendingRequesterIds, ...pendingSentIds, ...blockedSet];
-  const { data: suggested } = await userClient
-    .from("profiles")
-    .select("*")
-    .not("id", "in", `(${excludeIds.join(",")})`)
-    .limit(5);
-
-  return c.json({ data: { friends, requests, suggested: (suggested ?? []).map(formatProfile) } });
+  return c.json({
+    data: {
+      friends,
+      requests,
+      suggested: (suggestedResult.data ?? []).map(formatProfile),
+    },
+  });
 });
 
 friendsRouter.post("/request/:userId", async (c) => {

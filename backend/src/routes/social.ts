@@ -3,6 +3,7 @@ import { createUserClient, supabaseAdmin } from "../supabase";
 import { formatPost } from "./users";
 import { sanitizeSearchQuery } from "../lib/auth-helpers";
 import { getBlockedIds } from "../lib/blocks";
+import { attachOriginals } from "../lib/load-posts";
 import { env } from "../env";
 import type { HonoVariables } from "../types";
 
@@ -59,9 +60,11 @@ socialRouter.get("/trending", async (c) => {
     })
     .sort((a, b) => b.score - a.score)
     .slice(0, 30)
-    .map(({ post }) => formatPost(post));
+    .map(({ post }) => post);
 
-  return c.json({ data: scored });
+  await attachOriginals(null, scored);
+
+  return c.json({ data: scored.map((post) => formatPost(post)) });
 });
 
 /** GET /api/social/saved — bookmarked posts */
@@ -189,6 +192,8 @@ socialRouter.get("/liked-moments", async (c) => {
     (a: any, b: any) =>
       new Date(b.created_at ?? 0).getTime() - new Date(a.created_at ?? 0).getTime()
   );
+
+  await attachOriginals(null, visible);
 
   return c.json({
     data: visible.map((p: any) => formatPost(p, userId, blockedIds)),
