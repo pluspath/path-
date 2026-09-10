@@ -118,20 +118,28 @@ notificationsRouter.get("/", async (c) => {
     for (const p of profiles ?? []) profileMap[p.id] = p;
   }
 
-  // For friend_request notifications, fetch the friendship ID so mobile can accept/decline
+  // For friend_request notifications, fetch friendship IDs in one query.
   const friendRequestNotifs = (notifications ?? []).filter((n: any) => n.type === "friend_request");
   let friendshipMap: Record<string, string> = {};
   if (friendRequestNotifs.length > 0) {
-    for (const n of friendRequestNotifs) {
-      if (n.from_user_id) {
-        const { data: fs } = await supabaseAdmin
-          .from("friendships")
-          .select("id, status")
-          .eq("requester_id", n.from_user_id)
-          .eq("receiver_id", userId)
-          .eq("status", "pending")
-          .maybeSingle();
-        if (fs) friendshipMap[n.id] = fs.id;
+    const requesterIds = [
+      ...new Set(friendRequestNotifs.map((n: any) => n.from_user_id).filter(Boolean)),
+    ] as string[];
+    if (requesterIds.length > 0) {
+      const { data: friendships } = await supabaseAdmin
+        .from("friendships")
+        .select("id, requester_id, status")
+        .eq("receiver_id", userId)
+        .eq("status", "pending")
+        .in("requester_id", requesterIds);
+      const byRequester: Record<string, string> = {};
+      for (const fs of friendships ?? []) {
+        byRequester[fs.requester_id] = fs.id;
+      }
+      for (const n of friendRequestNotifs) {
+        if (n.from_user_id && byRequester[n.from_user_id]) {
+          friendshipMap[n.id] = byRequester[n.from_user_id];
+        }
       }
     }
   }

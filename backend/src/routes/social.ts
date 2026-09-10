@@ -126,7 +126,9 @@ socialRouter.get("/liked-moments", async (c) => {
   const { data: myReactions, error: reactionsError } = await supabaseAdmin
     .from("reactions")
     .select("post_id")
-    .eq("user_id", userId);
+    .eq("user_id", userId)
+    .order("created_at", { ascending: false })
+    .limit(200);
 
   if (reactionsError) {
     console.error("[social/liked-moments] reactions query failed:", reactionsError.message);
@@ -137,14 +139,18 @@ socialRouter.get("/liked-moments", async (c) => {
   const { data: myComments } = await supabaseAdmin
     .from("comments")
     .select("post_id")
-    .eq("user_id", userId);
+    .eq("user_id", userId)
+    .order("created_at", { ascending: false })
+    .limit(200);
   for (const row of myComments ?? []) add((row as any).post_id);
 
   const { data: myRepaths } = await supabaseAdmin
     .from("posts")
     .select("repath_of")
     .eq("user_id", userId)
-    .not("repath_of", "is", null);
+    .not("repath_of", "is", null)
+    .order("created_at", { ascending: false })
+    .limit(200);
   for (const row of myRepaths ?? []) add((row as any).repath_of);
 
   if (orderedPostIds.length === 0) return c.json({ data: [] });

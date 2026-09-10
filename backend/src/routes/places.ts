@@ -17,6 +17,9 @@ placesRouter.post(
     })
   ),
   async (c) => {
+    const userId = c.get("userId");
+    if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
+
     const { latitude, longitude, radius } = c.req.valid("json");
     const apiKey = await getGooglePlacesApiKey();
     if (!apiKey) {

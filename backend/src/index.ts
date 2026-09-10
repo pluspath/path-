@@ -189,13 +189,25 @@ app.get("/__marketing", (c) =>
         // Critical posts RLS — fixes 42501 on POST /api/posts when policies were never applied
         "ALTER TABLE public.posts ENABLE ROW LEVEL SECURITY;",
         'DROP POLICY IF EXISTS "Anyone can view posts" ON public.posts;',
+        'DROP POLICY IF EXISTS "Authenticated users can view posts" ON public.posts;',
         'DROP POLICY IF EXISTS "Users can create posts" ON public.posts;',
         'DROP POLICY IF EXISTS "Users can update own posts" ON public.posts;',
         'DROP POLICY IF EXISTS "Users can delete own posts" ON public.posts;',
-        'CREATE POLICY "Anyone can view posts" ON public.posts FOR SELECT USING (true);',
+        // Authenticated-only SELECT — anon key must not read all moments via PostgREST.
+        // API feed routes use the service role and enforce audience/friends themselves.
+        'CREATE POLICY "Authenticated users can view posts" ON public.posts FOR SELECT TO authenticated USING (true);',
         `CREATE POLICY "Users can create posts" ON public.posts FOR INSERT TO authenticated WITH CHECK (auth.uid() = user_id);`,
         `CREATE POLICY "Users can update own posts" ON public.posts FOR UPDATE TO authenticated USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);`,
         `CREATE POLICY "Users can delete own posts" ON public.posts FOR DELETE TO authenticated USING (auth.uid() = user_id);`,
+        // Hot-path indexes for feed / likes / close friends
+        "CREATE INDEX IF NOT EXISTS idx_posts_user_created ON public.posts (user_id, created_at DESC);",
+        "CREATE INDEX IF NOT EXISTS idx_posts_audience_created ON public.posts (audience, created_at DESC);",
+        "CREATE INDEX IF NOT EXISTS idx_posts_repath_of ON public.posts (repath_of) WHERE repath_of IS NOT NULL;",
+        "CREATE INDEX IF NOT EXISTS idx_reactions_user ON public.reactions (user_id);",
+        "CREATE INDEX IF NOT EXISTS idx_reactions_post ON public.reactions (post_id);",
+        "CREATE INDEX IF NOT EXISTS idx_comments_user ON public.comments (user_id);",
+        "CREATE INDEX IF NOT EXISTS idx_comments_post ON public.comments (post_id);",
+        "CREATE INDEX IF NOT EXISTS idx_close_friends_friend ON public.close_friends (friend_id);",
         // Refresh PostgREST schema cache after column/policy changes
         "NOTIFY pgrst, 'reload schema';",
         // Saved posts (minimal bootstrap if 006 not applied yet)

@@ -32,6 +32,9 @@ function clientsFor(accessToken?: string | null) {
   return [accessToken ? createUserClient(accessToken) : supabaseAdmin];
 }
 
+const BLOCK_CACHE_TTL_MS = 30_000;
+const blockIdCache = new Map<string, { ids: string[]; expires: number }>();
+
 /** Persist a block row. Tries common table/column shapes used across environments. */
 async function insertBlockRow(
   db: any,
@@ -123,39 +126,56 @@ async function clearNormalFriendship(
 }
 
 export async function getBlockedIds(userId: string, client: any = supabaseAdmin): Promise<string[]> {
+  const cached = blockIdCache.get(userId);
+  if (cached && cached.expires > Date.now()) return cached.ids;
+
   const others = new Set<string>();
 
+  const tableQueries: Promise<{ data: any[] | null; error: any }>[] = [];
   for (const table of ["user_blocks", "blocks"] as const) {
-    const queries = [
+    tableQueries.push(
       client.from(table).select("*").eq("blocker_id", userId),
       client.from(table).select("*").eq("blocked_id", userId),
       client.from(table).select("*").eq("user_id", userId),
-      client.from(table).select("*").eq("blocked_user_id", userId),
-    ];
-    for (const q of queries) {
-      const { data: rows, error } = await q;
-      if (error || !rows) continue;
-      for (const row of rows) {
-        const blocker = row.blocker_id ?? row.user_id ?? row.blocker;
-        const blocked = row.blocked_id ?? row.blocked_user_id ?? row.blocked;
-        if (blocker === userId && blocked && blocked !== userId) others.add(blocked);
-        if (blocked === userId && blocker && blocker !== userId) others.add(blocker);
-      }
+      client.from(table).select("*").eq("blocked_user_id", userId)
+    );
+  }
+  tableQueries.push(
+    client
+      .from("friendships")
+      .select("requester_id, receiver_id, status")
+      .eq("status", "blocked")
+      .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`)
+  );
+
+  const results = await Promise.all(tableQueries);
+
+  for (let i = 0; i < results.length - 1; i++) {
+    const { data: rows, error } = results[i];
+    if (error || !rows) continue;
+    for (const row of rows) {
+      const blocker = row.blocker_id ?? row.user_id ?? row.blocker;
+      const blocked = row.blocked_id ?? row.blocked_user_id ?? row.blocked;
+      if (blocker === userId && blocked && blocked !== userId) others.add(blocked);
+      if (blocked === userId && blocker && blocker !== userId) others.add(blocker);
     }
   }
 
-  const { data: friendshipBlocks } = await client
-    .from("friendships")
-    .select("requester_id, receiver_id, status")
-    .eq("status", "blocked")
-    .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`);
-
+  const friendshipBlocks = results[results.length - 1]?.data;
   for (const row of friendshipBlocks ?? []) {
     const otherId = row.requester_id === userId ? row.receiver_id : row.requester_id;
     if (otherId && otherId !== userId) others.add(otherId);
   }
 
-  return Array.from(others);
+  const ids = Array.from(others);
+  blockIdCache.set(userId, { ids, expires: Date.now() + BLOCK_CACHE_TTL_MS });
+  return ids;
+}
+
+/** Drop cached block list after create/remove so the next read is fresh. */
+export function invalidateBlockedIdsCache(userId?: string): void {
+  if (userId) blockIdCache.delete(userId);
+  else blockIdCache.clear();
 }
 
 export async function isBlocked(
@@ -180,7 +200,11 @@ export async function createBlock(
   // and the friendship returns to whatever it was (usually still accepted).
   for (const db of clients) {
     const inserted = await insertBlockRow(db, blockerId, blockedId);
-    if (inserted.ok) return { ok: true };
+    if (inserted.ok) {
+      invalidateBlockedIdsCache(blockerId);
+      invalidateBlockedIdsCache(blockedId);
+      return { ok: true };
+    }
     lastError = inserted.message;
   }
 
@@ -201,6 +225,8 @@ export async function removeBlock(
   }
 
   // Do NOT touch friendships — friends stay friends after unblock.
+  invalidateBlockedIdsCache(blockerId);
+  invalidateBlockedIdsCache(blockedId);
   return { ok: true };
 }
 

@@ -117,12 +117,18 @@ postsRouter.get("/", async (c) => {
   // moments from ACCEPTED (mutual) friends. Pending/requested relationships
   // must never expose any moments — for every moment type, including the
   // "Joined Path+" auto-moments.
-  // Use admin for friendships too — same RLS empty-result trap as posts.
-  const { data: acceptedFriendships, error: friendsErr } = await supabaseAdmin
-    .from("friendships")
-    .select("requester_id, receiver_id")
-    .eq("status", "accepted")
-    .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`);
+  // Parallelize the hot-path lookups that used to run as a waterfall.
+  const [friendshipsResult, blockedIds, whoStarredMe] = await Promise.all([
+    supabaseAdmin
+      .from("friendships")
+      .select("requester_id, receiver_id")
+      .eq("status", "accepted")
+      .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
+    getBlockedIds(userId),
+    getWhoStarredMe(userId),
+  ]);
+
+  const { data: acceptedFriendships, error: friendsErr } = friendshipsResult;
   if (friendsErr) {
     console.error("[posts] friendships query failed:", friendsErr.message);
   }
@@ -133,43 +139,43 @@ postsRouter.get("/", async (c) => {
 
   // Self + accepted friends. (Always include self even with no friends yet.)
   // Then remove anyone blocked in either direction (self is never blocked).
-  const blockedIds = await getBlockedIds(userId);
   const blockedSet = new Set(blockedIds);
   const allowedUserIds = Array.from(new Set([userId, ...friendIds])).filter(
     (id): id is string => typeof id === "string" && id.length > 0 && (id === userId || !blockedSet.has(id))
   );
 
-  // Lazily detect birthdays (the viewer's + their friends') and create the
-  // birthday moment + friend notifications before loading the feed, so a fresh
-  // birthday moment shows up in this same response. Idempotent (once per year).
-  try {
-    await ensureBirthdayMoments(userId, friendIds);
-  } catch (e) {
+  // Birthday ensure is idempotent but can add latency — run in background so
+  // the feed response isn't blocked. Next refresh will pick up new moments.
+  void ensureBirthdayMoments(userId, friendIds).catch((e) => {
     console.warn("[posts] birthday ensure failed:", e instanceof Error ? e.message : e);
-  }
+  });
 
-  const { data: posts, error: postsErr } = await loadPosts((select) =>
-    supabaseAdmin
-      .from("posts")
-      .select(select)
-      .in("user_id", allowedUserIds)
-      .order("created_at", { ascending: false })
-      .limit(50)
-  );
+  const friendIdSet = new Set(friendIds);
+  const [friendFeed, publicFeed] = await Promise.all([
+    loadPosts((select) =>
+      supabaseAdmin
+        .from("posts")
+        .select(select)
+        .in("user_id", allowedUserIds)
+        .order("created_at", { ascending: false })
+        .limit(50)
+    ),
+    loadPosts((select) =>
+      supabaseAdmin
+        .from("posts")
+        .select(select)
+        .eq("audience", "public")
+        .order("created_at", { ascending: false })
+        .limit(40)
+    ),
+  ]);
+
+  const { data: posts, error: postsErr } = friendFeed;
   if (postsErr) {
     console.error("[posts] feed query failed:", postsErr.message);
   }
 
-  // Public moments from non-friends appear in the home feed when audience is "public".
-  const friendIdSet = new Set(friendIds);
-  const { data: publicPosts } = await loadPosts((select) =>
-    supabaseAdmin
-      .from("posts")
-      .select(select)
-      .eq("audience", "public")
-      .order("created_at", { ascending: false })
-      .limit(40)
-  );
+  const { data: publicPosts } = publicFeed;
 
   const publicFromOthers = (publicPosts ?? []).filter(
     (p: any) =>
@@ -191,7 +197,6 @@ postsRouter.get("/", async (c) => {
   // RLS hides other users' close_friends rows). A post with audience='close' is
   // delivered only to the author's starred close friends; 'private' is author-
   // only; everything else (incl. a missing `audience` column) behaves as today.
-  const whoStarredMe = await getWhoStarredMe(userId);
   const visible = (allPosts ?? []).filter((p: any) => {
     if (p.user_id === userId) return true; // my own moments always show
     const audience = p.audience ?? "friends";
@@ -326,7 +331,9 @@ async function collectInteractedPostIds(userId: string): Promise<string[]> {
   const { data: myReactions, error: reactionsError } = await supabaseAdmin
     .from("reactions")
     .select("post_id")
-    .eq("user_id", userId);
+    .eq("user_id", userId)
+    .order("created_at", { ascending: false })
+    .limit(200);
   if (reactionsError) {
     console.error("[posts/interacted] reactions query failed:", reactionsError.message);
   } else {
@@ -336,7 +343,9 @@ async function collectInteractedPostIds(userId: string): Promise<string[]> {
   const { data: myComments, error: commentsError } = await supabaseAdmin
     .from("comments")
     .select("post_id")
-    .eq("user_id", userId);
+    .eq("user_id", userId)
+    .order("created_at", { ascending: false })
+    .limit(200);
   if (commentsError) {
     // Older / partial schemas may lack comments — don't fail the whole tab.
     console.warn("[posts/interacted] comments query failed:", commentsError.message);
@@ -350,7 +359,9 @@ async function collectInteractedPostIds(userId: string): Promise<string[]> {
     .from("posts")
     .select("repath_of")
     .eq("user_id", userId)
-    .not("repath_of", "is", null);
+    .not("repath_of", "is", null)
+    .order("created_at", { ascending: false })
+    .limit(200);
   if (repathError) {
     // repath_of may not exist yet — ignore.
     if (!/repath_of|column/i.test(repathError.message ?? "")) {

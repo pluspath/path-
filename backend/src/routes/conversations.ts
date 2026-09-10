@@ -7,6 +7,42 @@ import type { HonoVariables } from "../types";
 
 const conversationsRouter = new Hono<{ Variables: HonoVariables }>();
 
+/**
+ * Unread counts in one round-trip: fetch messages from others for all
+ * conversations, then count in memory against each last_read_at.
+ * Replaces per-conversation COUNT queries (N+1).
+ */
+async function computeUnreadCounts(
+  db: any,
+  userId: string,
+  participations: { conversation_id: string; last_read_at?: string | null }[]
+): Promise<Record<string, number>> {
+  const result: Record<string, number> = {};
+  const lastReadByConv: Record<string, string | null> = {};
+  const ids: string[] = [];
+  for (const p of participations) {
+    ids.push(p.conversation_id);
+    result[p.conversation_id] = 0;
+    lastReadByConv[p.conversation_id] = p.last_read_at ?? null;
+  }
+  if (ids.length === 0) return result;
+
+  const { data: rows } = await db
+    .from("messages")
+    .select("conversation_id, created_at")
+    .in("conversation_id", ids)
+    .neq("sender_id", userId);
+
+  for (const m of rows ?? []) {
+    const convId = m.conversation_id as string;
+    const lastRead = lastReadByConv[convId];
+    if (!lastRead || m.created_at > lastRead) {
+      result[convId] = (result[convId] ?? 0) + 1;
+    }
+  }
+  return result;
+}
+
 function formatProfile(p: any) {
   return {
     id: p.id,
@@ -275,26 +311,14 @@ conversationsRouter.get("/", async (c) => {
     for (const p of profiles ?? []) profilesById[p.id] = formatProfile(p);
 
     const lastMsgByConv: Record<string, any> = {};
-    const unreadByConv: Record<string, number> = {};
-    for (const id of visibleIds) unreadByConv[id] = 0;
-
     for (const m of recentMsgs ?? []) {
       if (!lastMsgByConv[m.conversation_id]) lastMsgByConv[m.conversation_id] = m;
     }
 
-    // Exact unread counts from last_read_at (same logic as /unread-counts).
-    await Promise.all(
-      visibleIds.map(async (convId) => {
-        const lastRead = lastReadByConv[convId];
-        let query = db
-          .from("messages")
-          .select("*", { count: "exact", head: true })
-          .eq("conversation_id", convId)
-          .neq("sender_id", userId);
-        if (lastRead) query = query.gt("created_at", lastRead);
-        const { count } = await query;
-        unreadByConv[convId] = count ?? 0;
-      })
+    const unreadByConv = await computeUnreadCounts(
+      db,
+      userId,
+      visibleIds.map((id) => ({ conversation_id: id, last_read_at: lastReadByConv[id] ?? null }))
     );
 
     const result = visibleConversations.map((conv: any) => {
@@ -372,14 +396,24 @@ conversationsRouter.get("/:id", async (c) => {
     otherUser = profile ? formatProfile(profile) : null;
   }
 
-  const { data: msgs } = await db
+  // Paginate: newest page first (default 100), then reverse to chronological.
+  const rawLimit = Number(c.req.query("limit") ?? 100);
+  const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.floor(rawLimit), 1), 200) : 100;
+  const before = c.req.query("before"); // ISO timestamp cursor (exclusive)
+
+  let msgQuery = db
     .from("messages")
     .select("*")
     .eq("conversation_id", id)
-    .order("created_at", { ascending: true });
+    .order("created_at", { ascending: false })
+    .limit(limit);
+  if (before) msgQuery = msgQuery.lt("created_at", before);
 
-  const last = msgs?.[msgs.length - 1];
-  const mapped = await attachReplyPreviews(db, (msgs ?? []).map((m: any) => mapMessage(m)), msgs ?? []);
+  const { data: newestFirst } = await msgQuery;
+  const msgs = (newestFirst ?? []).slice().reverse();
+
+  const last = msgs.length > 0 ? msgs[msgs.length - 1] : null;
+  const mapped = await attachReplyPreviews(db, msgs.map((m: any) => mapMessage(m)), msgs);
 
   return c.json({
     data: {
@@ -408,22 +442,7 @@ conversationsRouter.post("/unread-counts", async (c) => {
     .select("conversation_id, last_read_at")
     .eq("user_id", userId);
 
-  const result: Record<string, number> = {};
-
-  await Promise.all(
-    (participations ?? []).map(async (p: any) => {
-      let query = db
-        .from("messages")
-        .select("*", { count: "exact", head: true })
-        .eq("conversation_id", p.conversation_id)
-        .neq("sender_id", userId);
-      // No last_read_at yet => all messages from others are unread.
-      if (p.last_read_at) query = query.gt("created_at", p.last_read_at);
-
-      const { count } = await query;
-      result[p.conversation_id] = count ?? 0;
-    })
-  );
+  const result = await computeUnreadCounts(db, userId, participations ?? []);
 
   return c.json({ data: result });
 });
