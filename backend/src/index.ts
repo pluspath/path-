@@ -184,6 +184,16 @@ app.get("/__marketing", (c) =>
         `CREATE POLICY "Participants can view participants" ON public.conversation_participants FOR SELECT TO authenticated USING (public.is_conversation_participant(conversation_id));`,
         'DROP POLICY IF EXISTS "Participants can update own row" ON public.conversation_participants;',
         `CREATE POLICY "Participants can update own row" ON public.conversation_participants FOR UPDATE TO authenticated USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);`,
+        // Messages SELECT without recursive RLS (required for Realtime delivery)
+        'DROP POLICY IF EXISTS "Participants can view messages" ON public.messages;',
+        `CREATE POLICY "Participants can view messages" ON public.messages FOR SELECT TO authenticated USING (public.is_conversation_participant(conversation_id));`,
+        // Ensure chat tables are in the realtime publication (ignore if already added)
+        `DO $$ BEGIN
+          ALTER PUBLICATION supabase_realtime ADD TABLE public.messages;
+        EXCEPTION WHEN duplicate_object THEN NULL; END $$;`,
+        `DO $$ BEGIN
+          ALTER PUBLICATION supabase_realtime ADD TABLE public.conversation_participants;
+        EXCEPTION WHEN duplicate_object THEN NULL; END $$;`,
         // Posts bucket: images + video + chat audio (voice/music DMs)
         `UPDATE storage.buckets SET file_size_limit = 52428800, allowed_mime_types = ARRAY['image/jpeg','image/jpg','image/png','image/webp','image/gif','video/mp4','video/quicktime','video/webm','audio/mpeg','audio/mp3','audio/mp4','audio/m4a','audio/aac','audio/wav','audio/webm','audio/x-m4a','audio/x-wav','audio/3gpp','audio/amr','audio/ogg'] WHERE id = 'Posts' OR name = 'Posts';`,
         // Critical posts RLS — fixes 42501 on POST /api/posts when policies were never applied
