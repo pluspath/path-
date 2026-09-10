@@ -530,6 +530,57 @@ usersRouter.post("/me/push-deactivate", async (c) => {
   return c.body(null, 204);
 });
 
+// POST /api/me/push-register — save Expo push token for this device (idempotent).
+usersRouter.post("/me/push-register", async (c) => {
+  const userId = c.get("userId");
+  if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const body = await c.req.json().catch(() => ({}));
+  const pushToken =
+    typeof body.push_token === "string"
+      ? body.push_token.trim()
+      : typeof body.pushToken === "string"
+        ? body.pushToken.trim()
+        : "";
+  const deviceId =
+    typeof body.device_id === "string" && body.device_id.trim()
+      ? body.device_id.trim()
+      : typeof body.deviceId === "string" && body.deviceId.trim()
+        ? body.deviceId.trim()
+        : null;
+  const platform =
+    typeof body.platform === "string" && body.platform.trim()
+      ? body.platform.trim().toLowerCase()
+      : "unknown";
+
+  if (!pushToken.startsWith("ExponentPushToken") || !deviceId) {
+    return c.json(
+      {
+        error: {
+          message:
+            "push_token (ExponentPushToken…) and device_id are required",
+        },
+      },
+      400
+    );
+  }
+
+  await upsertUserDevice(supabaseAdmin, userId, {
+    pushToken,
+    platform,
+    deviceId,
+  });
+
+  const status = await getPushStatusForUser(supabaseAdmin, userId);
+  return c.json({
+    data: {
+      ok: true,
+      message: "Push token registered",
+      ...status,
+    },
+  });
+});
+
 // GET /api/me/push-status — diagnostic summary (no secrets, no full tokens).
 usersRouter.get("/me/push-status", async (c) => {
   const userId = c.get("userId");

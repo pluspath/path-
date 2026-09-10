@@ -109,7 +109,9 @@ async function fetchPushReceipts(ticketIds: string[]): Promise<Record<string, an
   }
 }
 
-async function waitForReceipt(ticketId: string, attempts = 5, delayMs = 1500): Promise<any> {
+async function waitForReceipt(ticketId: string, attempts = 4, delayMs = 1000): Promise<any> {
+  // Keep this short: Settings → Test Push waits on the HTTP response, and
+  // reverse proxies often time out around 5–10s.
   for (let i = 0; i < attempts; i++) {
     await new Promise((r) => setTimeout(r, delayMs));
     const receipts = await fetchPushReceipts([ticketId]);
@@ -191,7 +193,18 @@ export async function deactivateUserDevices(
   deviceId?: string | null
 ): Promise<void> {
   const now = new Date().toISOString();
+  let deactivatedToken: string | null = null;
   try {
+    if (deviceId) {
+      const { data: row } = await client
+        .from("user_devices")
+        .select("push_token")
+        .eq("user_id", userId)
+        .eq("device_id", deviceId)
+        .maybeSingle();
+      if (isExpoPushToken(row?.push_token)) deactivatedToken = row.push_token;
+    }
+
     let query = client
       .from("user_devices")
       .update({ is_active: false, updated_at: now })
@@ -207,6 +220,31 @@ export async function deactivateUserDevices(
       .from("profiles")
       .update({ push_token: null, push_notifications_enabled: false })
       .eq("id", userId);
+    return;
+  }
+
+  // Clear legacy profiles.push_token when it matched this device, or when no
+  // active devices remain (avoids ghost tokens after single-device logout).
+  try {
+    const { data: stillActive } = await client
+      .from("user_devices")
+      .select("push_token")
+      .eq("user_id", userId)
+      .eq("is_active", true)
+      .limit(1);
+    if (!stillActive?.length) {
+      await client.from("profiles").update({ push_token: null }).eq("id", userId);
+      return;
+    }
+    if (deactivatedToken) {
+      await client
+        .from("profiles")
+        .update({ push_token: null })
+        .eq("id", userId)
+        .eq("push_token", deactivatedToken);
+    }
+  } catch (e) {
+    console.warn("[push] clear legacy profile token:", e);
   }
 }
 
