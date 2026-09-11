@@ -60,6 +60,52 @@ export function stringifyPushData(data?: Record<string, unknown>): Record<string
   return out;
 }
 
+/**
+ * Build a user-visible Expo Push message.
+ *
+ * Critical for iOS Lock Screen / banners:
+ * - Always send non-empty title + body (alert payload, not data-only)
+ * - interruptionLevel: "active" (NOT "passive" — passive = Notification Center only)
+ * - Never set contentAvailable for normal alerts (that makes background/silent pushes)
+ * - Ping uses a distinct category + custom sound (bundled as nudge.wav in the app)
+ */
+export function buildExpoPushMessage(
+  pushToken: string,
+  title: string,
+  body: string,
+  data?: Record<string, unknown>
+): Record<string, unknown> {
+  const safeTitle = (title || "").trim() || "Path+";
+  const safeBody = (body || "").trim() || "You have a new notification";
+  const type = typeof data?.type === "string" ? data.type : "";
+  const isPing = type === "ping";
+
+  const stringData = stringifyPushData({
+    ...data,
+    type: type || (isPing ? "ping" : "default"),
+    categoryId: isPing ? "PING" : "DEFAULT",
+    title: safeTitle,
+    body: safeBody,
+  });
+
+  return {
+    to: pushToken,
+    title: safeTitle,
+    body: safeBody,
+    data: stringData,
+    // iOS: lights screen + can play sound. "passive" = NC-only (no banner/Lock Screen).
+    interruptionLevel: "active",
+    priority: "high",
+    badge: 1,
+    // Do NOT set contentAvailable — that yields background/silent delivery.
+    sound: isPing ? "nudge.wav" : "default",
+    categoryId: isPing ? "PING" : "DEFAULT",
+    // Android channels registered in use-push-notifications.
+    channelId: isPing ? "ping" : "default",
+    ...(isPing ? { relevanceScore: 1 } : {}),
+  };
+}
+
 async function deactivatePushToken(client: any, pushToken: string): Promise<void> {
   if (!pushToken) return;
   try {
@@ -380,27 +426,17 @@ export async function sendPushNotificationDetailed(
     return { ok: false, tokenSuffix: suffix, message: "Push notifications disabled in Admin settings" };
   }
 
-  const stringData = stringifyPushData({
-    ...data,
-    title: title || (typeof data?.title === "string" ? data.title : undefined),
-    body: body || (typeof data?.body === "string" ? data.body : undefined),
-  });
+  const message = buildExpoPushMessage(pushToken, title, body, data);
+  const notifType = typeof data?.type === "string" ? data.type : "default";
+  console.log(
+    `[push] Sending type=${notifType} sound=${String(message.sound)} category=${String(message.categoryId)} to ${suffix}`
+  );
 
   try {
     const res = await fetch(EXPO_PUSH_URL, {
       method: "POST",
       headers: pushHeaders(),
-      body: JSON.stringify({
-        to: pushToken,
-        title,
-        body,
-        data: stringData,
-        sound: "default",
-        priority: "high",
-        channelId: "default",
-        // Visible iOS banner (avoid silent/content-available-only pushes).
-        badge: 1,
-      }),
+      body: JSON.stringify(message),
     });
 
     const json: any = await res.json().catch(() => null);

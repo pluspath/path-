@@ -214,7 +214,11 @@ function notifyParticipantsInBackground(
           }
 
           const pushTitle =
-            data?.type === "message" ? `New message from ${senderName}` : senderName;
+            data?.type === "ping"
+              ? `👋 ${senderName}`
+              : data?.type === "message"
+                ? `New message from ${senderName}`
+                : senderName;
           await sendPushToUser(db, participant.user_id, pushTitle, body, data);
         })
       );
