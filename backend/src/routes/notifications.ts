@@ -6,6 +6,7 @@ import {
   getPushStatusForUser,
   sendPushNotificationDetailed,
 } from "../lib/push";
+import { resolveAvatarUrl } from "../lib/avatar";
 import type { HonoVariables } from "../types";
 
 const notificationsRouter = new Hono<{ Variables: HonoVariables }>();
@@ -153,9 +154,11 @@ notificationsRouter.get("/", async (c) => {
             id: profileMap[n.from_user_id].id,
             name: profileMap[n.from_user_id].full_name ?? "",
             username: profileMap[n.from_user_id].username ?? "",
-            avatar:
-              profileMap[n.from_user_id].avatar_url ??
-              `https://api.dicebear.com/7.x/avataaars/svg?seed=${n.from_user_id}`,
+            avatar: resolveAvatarUrl(
+              profileMap[n.from_user_id].id,
+              profileMap[n.from_user_id].avatar_url,
+              profileMap[n.from_user_id].gender
+            ),
           }
         : { id: "system", name: "Path+", username: "", avatar: "" },
       message: n.message,

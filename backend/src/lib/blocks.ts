@@ -1,5 +1,6 @@
 import { supabaseAdmin, createUserClient } from "../supabase";
 import { env } from "../env";
+import { resolveAvatarUrl } from "./avatar";
 
 function isMissingRelation(error: any): boolean {
   const msg = String(error?.message ?? "");
@@ -269,7 +270,7 @@ export async function listBlockedProfiles(
 
   const { data: profiles } = await db
     .from("profiles")
-    .select("id, username, full_name, avatar_url")
+    .select("id, username, full_name, avatar_url, gender")
     .in("id", blockedIds);
 
   const byId: Record<string, any> = {};
@@ -282,6 +283,6 @@ export async function listBlockedProfiles(
       id: p.id,
       username: p.username ?? "",
       name: p.full_name ?? "",
-      avatar: p.avatar_url ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${p.id}`,
+      avatar: resolveAvatarUrl(p.id, p.avatar_url, p.gender),
     }));
 }

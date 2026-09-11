@@ -9,6 +9,7 @@ import { encodeImages } from "../lib/images";
 import { getBlockedIds } from "../lib/blocks";
 import { parseDurationToMinutes } from "../lib/duration";
 import { POST_SELECT, loadPosts, attachOriginals } from "../lib/load-posts";
+import { resolveAvatarUrl } from "../lib/avatar";
 import type { HonoVariables } from "../types";
 
 const postsRouter = new Hono<{ Variables: HonoVariables }>();
@@ -957,7 +958,7 @@ postsRouter.get("/:id/views", async (c) => {
   if (viewerIds.length > 0) {
     const { data: profs } = await supabaseAdmin
       .from("profiles")
-      .select("id, full_name, avatar_url")
+      .select("id, full_name, avatar_url, gender")
       .in("id", viewerIds);
     profilesById = Object.fromEntries((profs ?? []).map((p: any) => [p.id, p]));
   }
@@ -965,8 +966,11 @@ postsRouter.get("/:id/views", async (c) => {
   const viewers = (views ?? []).map((v: any) => ({
     userId: v.user_id,
     userName: profilesById[v.user_id]?.full_name ?? "",
-    userAvatar:
-      profilesById[v.user_id]?.avatar_url ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${v.user_id}`,
+    userAvatar: resolveAvatarUrl(
+      v.user_id,
+      profilesById[v.user_id]?.avatar_url,
+      profilesById[v.user_id]?.gender
+    ),
   }));
 
   return c.json({ data: { seenCount: viewers.length, friendTotal, viewers } });
@@ -1020,7 +1024,7 @@ postsRouter.get("/:id/comments", async (c) => {
 
   const { data: comments, error } = await supabaseAdmin
     .from("comments")
-    .select("id, post_id, user_id, content, created_at, profiles:user_id(id, full_name, avatar_url)")
+    .select("id, post_id, user_id, content, created_at, profiles:user_id(id, full_name, avatar_url, gender)")
     .eq("post_id", id)
     .order("created_at", { ascending: true });
 
@@ -1047,7 +1051,11 @@ postsRouter.get("/:id/comments", async (c) => {
     user: {
       id: comment.user_id,
       name: comment.profiles?.full_name ?? "",
-      avatar: comment.profiles?.avatar_url ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${comment.user_id}`,
+      avatar: resolveAvatarUrl(
+        comment.user_id,
+        comment.profiles?.avatar_url,
+        comment.profiles?.gender
+      ),
     },
   }));
 
@@ -1101,7 +1109,7 @@ postsRouter.post("/:id/comments", async (c) => {
 
   const { data: profile } = await supabaseAdmin
     .from("profiles")
-    .select("id, full_name, avatar_url")
+    .select("id, full_name, avatar_url, gender")
     .eq("id", userId)
     .single();
 
@@ -1144,7 +1152,11 @@ postsRouter.post("/:id/comments", async (c) => {
     user: {
       id: userId,
       name: (profile as any)?.full_name ?? "",
-      avatar: (profile as any)?.avatar_url ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${userId}`,
+      avatar: resolveAvatarUrl(
+        userId,
+        (profile as any)?.avatar_url,
+        (profile as any)?.gender
+      ),
     },
   };
 
@@ -1245,7 +1257,7 @@ postsRouter.patch("/:id/comments/:commentId", async (c) => {
     .from("comments")
     .update({ content })
     .eq("id", commentId)
-    .select("id, post_id, user_id, content, created_at, profiles:user_id(id, full_name, avatar_url)")
+    .select("id, post_id, user_id, content, created_at, profiles:user_id(id, full_name, avatar_url, gender)")
     .single();
 
   if (updateError || !updated) {
@@ -1263,7 +1275,7 @@ postsRouter.patch("/:id/comments/:commentId", async (c) => {
     user: {
       id: u.user_id,
       name: u.profiles?.full_name ?? "",
-      avatar: u.profiles?.avatar_url ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${u.user_id}`,
+      avatar: resolveAvatarUrl(u.user_id, u.profiles?.avatar_url, u.profiles?.gender),
     },
   };
 

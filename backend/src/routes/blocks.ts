@@ -3,6 +3,7 @@ import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
 import { createUserClient, supabaseAdmin } from "../supabase";
 import { isUuid } from "../lib/auth-helpers";
+import { resolveAvatarUrl } from "../lib/avatar";
 import type { HonoVariables } from "../types";
 
 const blocksRouter = new Hono<{ Variables: HonoVariables }>();
@@ -46,7 +47,7 @@ blocksRouter.get("/", async (c) => {
               id: p.id,
               name: p.full_name ?? "",
               username: p.username ?? "",
-              avatar: p.avatar_url ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${p.id}`,
+              avatar: resolveAvatarUrl(p.id, p.avatar_url, p.gender),
             }
           : { id: b.blocked_id, name: "User", username: "", avatar: "" },
         createdAt: b.created_at,

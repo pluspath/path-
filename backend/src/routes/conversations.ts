@@ -3,6 +3,7 @@ import { supabaseAdmin } from "../supabase";
 import { sendPushToUser } from "../lib/push";
 import { encodeImages, decodeImages } from "../lib/images";
 import { getBlockedIds, isBlocked } from "../lib/blocks";
+import { resolveAvatarUrl } from "../lib/avatar";
 import type { HonoVariables } from "../types";
 
 const conversationsRouter = new Hono<{ Variables: HonoVariables }>();
@@ -48,7 +49,7 @@ function formatProfile(p: any) {
     id: p.id,
     name: p.full_name ?? "",
     username: p.username ?? "",
-    avatar: p.avatar_url ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${p.id}`,
+    avatar: resolveAvatarUrl(p.id, p.avatar_url, p.gender),
     bio: p.bio ?? "",
     location: p.location ?? "",
     birthday: p.birthday ?? "",

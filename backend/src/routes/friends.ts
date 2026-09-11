@@ -3,6 +3,7 @@ import { createUserClient, supabaseAdmin } from "../supabase";
 import { sendPushToUser } from "../lib/push";
 import { ensureFriendshipMoments } from "../lib/systemMoments";
 import { getBlockedIds, isBlocked } from "../lib/blocks";
+import { resolveAvatarUrl } from "../lib/avatar";
 import type { HonoVariables } from "../types";
 
 const friendsRouter = new Hono<{ Variables: HonoVariables }>();
@@ -69,7 +70,7 @@ function formatProfile(p: any) {
     id: p.id,
     name: String(p.full_name ?? p.name ?? "").trim(),
     username: String(p.username ?? "").trim(),
-    avatar: p.avatar_url ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${p.id}`,
+    avatar: resolveAvatarUrl(p.id, p.avatar_url, p.gender),
     bio: p.bio ?? "",
     location: String(p.location ?? "").trim(),
     // Raw birthday is private — never exposed in friend lists / suggestions.

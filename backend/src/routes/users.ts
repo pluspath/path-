@@ -6,6 +6,7 @@ import { decodeImages } from "../lib/images";
 import { getBlockedIds } from "../lib/blocks";
 import { formatDuration } from "../lib/duration";
 import { upsertUserDevice, deactivateUserDevices, getPushTokensForUser, getPushStatusForUser, sendPushNotificationDetailed } from "../lib/push";
+import { isCustomAvatar, defaultAvatarForGender, resolveAvatarUrl } from "../lib/avatar";
 import type { HonoVariables, Profile } from "../types";
 
 const usersRouter = new Hono<{ Variables: HonoVariables }>();
@@ -43,7 +44,7 @@ function formatProfile(p: any, postCount = 0, friendCount = 0, viewerId?: string
     name,
     username,
     email: "",
-    avatar: p.avatar_url ?? p.avatar ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${p.id}`,
+    avatar: resolveAvatarUrl(p.id, p.avatar_url ?? p.avatar, p.gender),
     bio: p.bio ?? "",
     location,
     // Raw birthday is private — only ever returned to the profile owner.
@@ -383,9 +384,17 @@ usersRouter.post("/set-gender", async (c) => {
 
   // Use service role so a missing/strict profiles UPDATE policy cannot block
   // this one-time write after we have already authenticated the caller.
+  const updatePayload: Record<string, unknown> = { gender };
+  // Apply a gender-matched default avatar only when the user has not uploaded
+  // a custom profile picture.
+  const currentAvatar = (user as any).avatar_url ?? null;
+  if (!isCustomAvatar(currentAvatar)) {
+    updatePayload.avatar_url = defaultAvatarForGender(userId, gender);
+  }
+
   const { data: updated, error } = await supabaseAdmin
     .from("profiles")
-    .update({ gender })
+    .update(updatePayload)
     .eq("id", userId)
     .select()
     .single();

@@ -4,6 +4,7 @@ import { formatPost } from "./users";
 import { sanitizeSearchQuery } from "../lib/auth-helpers";
 import { getBlockedIds } from "../lib/blocks";
 import { attachOriginals } from "../lib/load-posts";
+import { resolveAvatarUrl } from "../lib/avatar";
 import { env } from "../env";
 import type { HonoVariables } from "../types";
 
@@ -421,7 +422,7 @@ socialRouter.get("/search", async (c) => {
           id: p.id,
           name: p.full_name ?? "",
           username: p.username ?? "",
-          avatar: p.avatar_url ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${p.id}`,
+          avatar: resolveAvatarUrl(p.id, p.avatar_url, p.gender),
           bio: p.bio ?? "",
           friendshipStatus,
           friendshipId,

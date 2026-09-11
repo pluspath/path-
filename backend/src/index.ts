@@ -23,6 +23,7 @@ import { bootstrapAdminSystem } from "./admin/bootstrap";
 import { apiLimiter, authLimiter } from "./lib/rate-limit";
 import { secureHeadersMiddleware } from "./admin/middlewares/secure-headers";
 import { backfillJoinedPosts } from "./lib/joined";
+import { backfillGenderAvatars } from "./lib/avatar";
 import { env, supabaseProjectRef } from "./env";
 import {
   purgeExpiredDeletionAccounts,
@@ -296,6 +297,9 @@ app.get("/__marketing", (c) =>
   // One-time idempotent backfill: ensure every existing user has a "Joined
   // Path+" moment as the oldest item on their timeline.
   await backfillJoinedPosts();
+
+  // Apply gender-matched default avatars for users who never uploaded a custom photo.
+  await backfillGenderAvatars();
 
   // Purge accounts past the deletion grace window, then every 6 hours.
   const runPurge = async () => {
