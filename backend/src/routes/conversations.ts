@@ -12,6 +12,9 @@ const conversationsRouter = new Hono<{ Variables: HonoVariables }>();
  * Unread counts in one round-trip: fetch messages from others for all
  * conversations, then count in memory against each last_read_at.
  * Replaces per-conversation COUNT queries (N+1).
+ *
+ * When every participation has a last_read_at, only fetch messages newer than
+ * the earliest last_read — dramatically smaller payloads for active users.
  */
 async function computeUnreadCounts(
   db: any,
@@ -28,11 +31,22 @@ async function computeUnreadCounts(
   }
   if (ids.length === 0) return result;
 
-  const { data: rows } = await db
+  const lastReads = participations.map((p) => p.last_read_at).filter(Boolean) as string[];
+  const allHaveLastRead = lastReads.length === participations.length;
+  const minLastRead = allHaveLastRead
+    ? lastReads.reduce((a, b) => (a < b ? a : b))
+    : null;
+
+  let query = db
     .from("messages")
     .select("conversation_id, created_at")
     .in("conversation_id", ids)
     .neq("sender_id", userId);
+  if (minLastRead) {
+    query = query.gt("created_at", minLastRead);
+  }
+
+  const { data: rows } = await query;
 
   for (const m of rows ?? []) {
     const convId = m.conversation_id as string;
@@ -305,7 +319,10 @@ conversationsRouter.get("/", async (c) => {
 
     const { data: profiles } =
       otherUserIds.length > 0
-        ? await db.from("profiles").select("*").in("id", otherUserIds)
+        ? await db
+            .from("profiles")
+            .select("id, full_name, username, avatar_url, gender, bio, location, birthday, cover_url, created_at")
+            .in("id", otherUserIds)
         : { data: [] as any[] };
 
     const profilesById: Record<string, any> = {};

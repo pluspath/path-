@@ -93,7 +93,7 @@ postsRouter.get("/", async (c) => {
         .select(select)
         .in("user_id", allowedUserIds)
         .order("created_at", { ascending: false })
-        .limit(50)
+        .limit(40)
     ),
     loadPosts((select) =>
       supabaseAdmin
@@ -101,7 +101,7 @@ postsRouter.get("/", async (c) => {
         .select(select)
         .eq("audience", "public")
         .order("created_at", { ascending: false })
-        .limit(40)
+        .limit(20)
     ),
   ]);
 
@@ -319,7 +319,7 @@ async function handleInteractedMoments(c: any) {
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const userClient = createUserClient(token);
-  const orderedPostIds = await collectInteractedPostIds(userId);
+  const orderedPostIds = (await collectInteractedPostIds(userId)).slice(0, 60);
   if (orderedPostIds.length === 0) return c.json({ data: [] });
 
   const [blockedIds, allowedAuthors] = await Promise.all([
@@ -1035,11 +1035,33 @@ postsRouter.get("/:id/comments", async (c) => {
 
   const blockedSet = userId ? new Set(await getBlockedIds(userId)) : null;
 
+  // Friendship vs post owner is the same for every comment on a friends-audience
+  // post — resolve once instead of N identical DB round-trips.
+  const audience = postRow.audience ?? "friends";
+  let friendsOk = true;
+  if (audience === "friends" && userId && userId !== postRow.user_id) {
+    friendsOk = await isAcceptedFriend(userId, postRow.user_id);
+  }
+
   const visibleComments: any[] = [];
   for (const comment of comments ?? []) {
     if (blockedSet?.has(comment.user_id)) continue;
-    const allowed = await canViewerSeeComment(userId, postRow, comment.user_id, whoStarredMe);
-    if (allowed) visibleComments.push(comment);
+    if (!userId) continue;
+    if (userId === postRow.user_id || userId === comment.user_id) {
+      visibleComments.push(comment);
+      continue;
+    }
+    if (audience === "private") continue;
+    if (audience === "close") {
+      if (whoStarredMe.has(postRow.user_id)) visibleComments.push(comment);
+      continue;
+    }
+    if (audience === "public") {
+      visibleComments.push(comment);
+      continue;
+    }
+    // friends (default)
+    if (friendsOk) visibleComments.push(comment);
   }
 
   const formatted = visibleComments.map((comment: any) => ({

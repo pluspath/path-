@@ -917,11 +917,15 @@ usersRouter.get("/:id/posts", async (c) => {
     if (!allowed) return c.json({ error: { message: "Moments are private" } }, 403);
   }
 
+  const limitRaw = Number(c.req.query("limit") ?? 50);
+  const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(Math.floor(limitRaw), 1), 100) : 50;
+
   const { data: posts, error: postsErr } = await supabaseAdmin
     .from("posts")
     .select("*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(avatar_url))")
     .eq("user_id", id)
-    .order("created_at", { ascending: false });
+    .order("created_at", { ascending: false })
+    .limit(limit);
 
   let all = posts ?? [];
   if (postsErr) {
@@ -930,14 +934,16 @@ usersRouter.get("/:id/posts", async (c) => {
       .from("posts")
       .select("*, profiles!user_id(*)")
       .eq("user_id", id)
-      .order("created_at", { ascending: false });
+      .order("created_at", { ascending: false })
+      .limit(limit);
     all = basic ?? [];
     if (basicErr || !basic) {
       const { data: min, error: minErr } = await supabaseAdmin
         .from("posts")
         .select("*")
         .eq("user_id", id)
-        .order("created_at", { ascending: false });
+        .order("created_at", { ascending: false })
+        .limit(limit);
       if (minErr) console.error("[users/posts] query failed:", minErr.message);
       all = min ?? [];
       if (all.length > 0 && !all[0]?.profiles) {
