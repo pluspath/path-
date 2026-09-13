@@ -92,6 +92,63 @@ function notInList(ids: string[]): string {
   return `(${unique.map((id) => `"${id}"`).join(",")})`;
 }
 
+function chunkIds<T>(items: T[], size: number): T[][] {
+  if (items.length === 0) return [];
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
+/**
+ * Count how many of `myFriendIds` each non-excluded person shares as friends
+ * (friends-of-friends). Higher count = stronger mutual connection.
+ */
+async function buildMutualFriendCounts(
+  myFriendIds: string[],
+  excludeIds: string[]
+): Promise<Map<string, number>> {
+  const counts = new Map<string, number>();
+  if (myFriendIds.length === 0) return counts;
+
+  const excluded = new Set(excludeIds);
+  const myFriends = new Set(myFriendIds);
+
+  for (const chunk of chunkIds(myFriendIds, 80)) {
+    const [asRequester, asReceiver] = await Promise.all([
+      supabaseAdmin
+        .from("friendships")
+        .select("requester_id, receiver_id")
+        .eq("status", "accepted")
+        .in("requester_id", chunk),
+      supabaseAdmin
+        .from("friendships")
+        .select("requester_id, receiver_id")
+        .eq("status", "accepted")
+        .in("receiver_id", chunk),
+    ]);
+
+    if (asRequester.error) {
+      console.warn("[friends/discover] mutual requester query failed:", asRequester.error.message);
+    }
+    if (asReceiver.error) {
+      console.warn("[friends/discover] mutual receiver query failed:", asReceiver.error.message);
+    }
+
+    for (const row of [...(asRequester.data ?? []), ...(asReceiver.data ?? [])]) {
+      const a = row.requester_id as string;
+      const b = row.receiver_id as string;
+      // Candidate is the side that is NOT already my friend.
+      if (myFriends.has(a) && !myFriends.has(b) && !excluded.has(b)) {
+        counts.set(b, (counts.get(b) ?? 0) + 1);
+      } else if (myFriends.has(b) && !myFriends.has(a) && !excluded.has(a)) {
+        counts.set(a, (counts.get(a) ?? 0) + 1);
+      }
+    }
+  }
+
+  return counts;
+}
+
 async function loadDiscoverProfiles(
   excludeIds: string[],
   offset: number,
@@ -123,6 +180,83 @@ async function loadDiscoverProfiles(
   const excluded = new Set(excludeIds);
   const filtered = (all ?? []).filter((p: any) => p?.id && !excluded.has(p.id));
   return { rows: filtered.slice(offset, offset + limit), error: null };
+}
+
+type RankedDiscoverRow = { profile: any; mutualFriends: number };
+
+/**
+ * People on Path+: mutual friends first (higher count first), then everyone else.
+ * Pagination is over this ranked sequence so scrolling stays consistent.
+ */
+async function loadRankedDiscoverProfiles(
+  excludeIds: string[],
+  myFriendIds: string[],
+  offset: number,
+  limit: number
+): Promise<{ rows: RankedDiscoverRow[]; error: any | null; mutualTotal: number }> {
+  const mutualCounts = await buildMutualFriendCounts(myFriendIds, excludeIds);
+  const mutualSorted = Array.from(mutualCounts.entries()).sort((a, b) => {
+    if (b[1] !== a[1]) return b[1] - a[1];
+    return a[0].localeCompare(b[0]);
+  });
+  const mutualIds = mutualSorted.map(([id]) => id);
+  const mutualTotal = mutualIds.length;
+
+  const pageIds: string[] = [];
+  const pageMutual = new Map<string, number>();
+
+  if (offset < mutualTotal) {
+    for (const id of mutualIds.slice(offset, offset + limit)) {
+      pageIds.push(id);
+      pageMutual.set(id, mutualCounts.get(id) ?? 0);
+    }
+  }
+
+  const stillNeed = limit - pageIds.length;
+  let fillError: any | null = null;
+  const fillProfiles: any[] = [];
+
+  if (stillNeed > 0) {
+    const nonMutualOffset = Math.max(0, offset - mutualTotal);
+    const fillExclude = [...excludeIds, ...mutualIds];
+    const filled = await loadDiscoverProfiles(fillExclude, nonMutualOffset, stillNeed);
+    fillError = filled.error;
+    for (const p of filled.rows ?? []) {
+      if (!p?.id || pageMutual.has(p.id)) continue;
+      pageIds.push(p.id);
+      pageMutual.set(p.id, 0);
+      fillProfiles.push(p);
+    }
+  }
+
+  if (pageIds.length === 0) {
+    return { rows: [], error: fillError, mutualTotal };
+  }
+
+  const needFetch = pageIds.filter((id) => !fillProfiles.some((p) => p.id === id));
+  let fetched: any[] = [];
+  if (needFetch.length > 0) {
+    const { data, error } = await supabaseAdmin.from("profiles").select("*").in("id", needFetch);
+    if (error) {
+      console.warn("[friends/discover] ranked profile fetch failed:", error.message);
+      return { rows: [], error, mutualTotal };
+    }
+    fetched = data ?? [];
+  }
+
+  const profileById = new Map<string, any>();
+  for (const p of [...fetched, ...fillProfiles]) {
+    if (p?.id) profileById.set(p.id, p);
+  }
+
+  const rows: RankedDiscoverRow[] = [];
+  for (const id of pageIds) {
+    const profile = profileById.get(id);
+    if (!profile) continue;
+    rows.push({ profile, mutualFriends: pageMutual.get(id) ?? 0 });
+  }
+
+  return { rows, error: null, mutualTotal };
 }
 
 friendsRouter.get("/", async (c) => {
@@ -189,7 +323,7 @@ friendsRouter.get("/", async (c) => {
     allIds.length > 0
       ? supabaseAdmin.from("profiles").select("*").in("id", allIds)
       : Promise.resolve({ data: [] as any[] }),
-    loadDiscoverProfiles(excludeIds, 0, 40),
+    loadRankedDiscoverProfiles(excludeIds, friendIds, 0, 40),
   ]);
 
   if (suggestedLoad.error) {
@@ -219,8 +353,12 @@ friendsRouter.get("/", async (c) => {
     .filter((r: any) => r.user && !isDeletionHiddenProfile(profileMap[r.user.id] ?? null));
 
   const suggested = (suggestedLoad.rows ?? [])
-    .filter((p: any) => !isDeletionHiddenProfile(p))
-    .map((p: any) => ({ ...formatProfile(p), friendshipStatus: "none" as const }));
+    .filter((r) => !isDeletionHiddenProfile(r.profile))
+    .map((r) => ({
+      ...formatProfile(r.profile),
+      friendshipStatus: "none" as const,
+      mutualFriends: r.mutualFriends,
+    }));
 
   return c.json({
     data: {
@@ -279,7 +417,7 @@ friendsRouter.get("/discover", async (c) => {
   const pendingSentIds = (pendingSentResult.data ?? []).map((f: any) => f.receiver_id);
   const excludeIds = [userId, ...friendIds, ...pendingRequesterIds, ...pendingSentIds, ...blockedSet];
 
-  const { rows, error } = await loadDiscoverProfiles(excludeIds, offset, limit);
+  const { rows, error } = await loadRankedDiscoverProfiles(excludeIds, friendIds, offset, limit);
 
   if (error) {
     console.error("[friends/discover] query failed:", error.message);
@@ -287,10 +425,11 @@ friendsRouter.get("/discover", async (c) => {
   }
 
   const users = (rows ?? [])
-    .filter((p: any) => !isDeletionHiddenProfile(p))
-    .map((p: any) => ({
-      ...formatProfile(p),
+    .filter((r) => !isDeletionHiddenProfile(r.profile))
+    .map((r) => ({
+      ...formatProfile(r.profile),
       friendshipStatus: "none" as const,
+      mutualFriends: r.mutualFriends,
     }));
   const hasMore = (rows ?? []).length === limit;
   const nextOffset = offset + limit;
