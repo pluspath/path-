@@ -134,11 +134,12 @@ export async function getBlockedIds(userId: string, client: any = supabaseAdmin)
 
   const tableQueries: Promise<{ data: any[] | null; error: any }>[] = [];
   for (const table of ["user_blocks", "blocks"] as const) {
+    // Lean id-only selects per column shape (avoid select("*") on the hot path).
     tableQueries.push(
-      client.from(table).select("*").eq("blocker_id", userId),
-      client.from(table).select("*").eq("blocked_id", userId),
-      client.from(table).select("*").eq("user_id", userId),
-      client.from(table).select("*").eq("blocked_user_id", userId)
+      client.from(table).select("blocked_id").eq("blocker_id", userId),
+      client.from(table).select("blocker_id").eq("blocked_id", userId),
+      client.from(table).select("blocked_user_id").eq("user_id", userId),
+      client.from(table).select("user_id").eq("blocked_user_id", userId)
     );
   }
   tableQueries.push(
@@ -154,11 +155,13 @@ export async function getBlockedIds(userId: string, client: any = supabaseAdmin)
   for (let i = 0; i < results.length - 1; i++) {
     const { data: rows, error } = results[i];
     if (error || !rows) continue;
+    const shape = i % 4;
     for (const row of rows) {
-      const blocker = row.blocker_id ?? row.user_id ?? row.blocker;
-      const blocked = row.blocked_id ?? row.blocked_user_id ?? row.blocked;
-      if (blocker === userId && blocked && blocked !== userId) others.add(blocked);
-      if (blocked === userId && blocker && blocker !== userId) others.add(blocker);
+      if (shape === 0 && row.blocked_id && row.blocked_id !== userId) others.add(row.blocked_id);
+      else if (shape === 1 && row.blocker_id && row.blocker_id !== userId) others.add(row.blocker_id);
+      else if (shape === 2 && row.blocked_user_id && row.blocked_user_id !== userId) {
+        others.add(row.blocked_user_id);
+      } else if (shape === 3 && row.user_id && row.user_id !== userId) others.add(row.user_id);
     }
   }
 

@@ -4,6 +4,7 @@ import { sendPushToUser } from "../lib/push";
 import { ensureFriendshipMoments } from "../lib/systemMoments";
 import { getBlockedIds, isBlocked } from "../lib/blocks";
 import { resolveAvatarUrl } from "../lib/avatar";
+import { isDeletionHiddenProfile } from "../lib/account-deletion";
 import type { HonoVariables } from "../types";
 
 const friendsRouter = new Hono<{ Variables: HonoVariables }>();
@@ -160,7 +161,7 @@ friendsRouter.get("/", async (c) => {
 
   const friends = friendIds
     .map((id: string) => profileMap[id])
-    .filter(Boolean)
+    .filter((p: any) => p && !isDeletionHiddenProfile(p))
     .map((p: any) => ({
       ...formatProfile(p),
       friendshipStatus: "friends" as const,
@@ -174,13 +175,16 @@ friendsRouter.get("/", async (c) => {
       user: profileMap[f.requester_id] ? formatProfile(profileMap[f.requester_id]) : { id: f.requester_id, name: "Unknown" },
       mutualFriends: 0,
       createdAt: f.created_at,
-    }));
+    }))
+    .filter((r: any) => r.user && !isDeletionHiddenProfile(profileMap[r.user.id] ?? null));
 
   return c.json({
     data: {
       friends,
       requests,
-      suggested: (suggestedResult.data ?? []).map(formatProfile),
+      suggested: (suggestedResult.data ?? [])
+        .filter((p: any) => !isDeletionHiddenProfile(p))
+        .map(formatProfile),
     },
   });
 });
@@ -197,6 +201,15 @@ friendsRouter.post("/request/:userId", async (c) => {
   // Can't send a request to (or from) someone in a block relationship.
   if (await isBlocked(userId, targetId)) {
     return c.json({ error: { message: "Unable to send request" } }, 403);
+  }
+
+  const { data: targetProfile } = await supabaseAdmin
+    .from("profiles")
+    .select("status, suspended_reason")
+    .eq("id", targetId)
+    .maybeSingle();
+  if (!targetProfile || isDeletionHiddenProfile(targetProfile)) {
+    return c.json({ error: { message: "User not found" } }, 404);
   }
 
   const userClient = createUserClient(token);

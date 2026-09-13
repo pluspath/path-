@@ -200,10 +200,15 @@ export async function sendPasswordResetOtpEmail(email: string, otp: string): Pro
   if (!result.ok) throw new Error(result.message);
 }
 
-export async function sendAccountDeletionEmail(email: string, fullName: string): Promise<void> {
+export async function sendAccountDeletionEmail(
+  email: string,
+  fullName: string,
+  username?: string
+): Promise<void> {
   const config = await getEmailConfig();
   if (!config.templates.accountDeletion.enabled) return;
   const name = fullName || "there";
+  const handle = (username || "").trim();
   const result = await sendEmail({
     to: email,
     subject: config.templates.accountDeletion.subject,
@@ -211,23 +216,68 @@ export async function sendAccountDeletionEmail(email: string, fullName: string):
       <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto; padding: 32px;">
         <h2 style="color: #0A1F44; margin-bottom: 8px;">Hi ${escapeHtml(name)},</h2>
         <p style="color: #475569; line-height: 1.6; margin-bottom: 16px;">
-          Your Path+ account has been suspended for <strong>30 days</strong> as requested.
-          During this period your profile and data are kept but hidden from other users.
+          You requested deletion of your Path+ account. A <strong>30-day grace period</strong> has started.
         </p>
         <p style="color: #475569; line-height: 1.6; margin-bottom: 16px;">
-          If you sign in again within 30 days, your account will be <strong>reactivated automatically</strong>
-          and deletion will be cancelled.
+          <strong>What happens now:</strong>
         </p>
-        <p style="color: #475569; line-height: 1.6; margin-bottom: 24px;">
-          If you do not sign in within 30 days, your account and associated data will be
-          permanently deleted from our servers.
+        <ul style="color: #475569; line-height: 1.7; padding-left: 20px; margin-bottom: 16px;">
+          <li>Your profile, posts, and moments are <strong>hidden from other users</strong>.</li>
+          <li>Your username${handle ? ` (<strong>@${escapeHtml(handle)}</strong>)` : ""} stays reserved and <strong>cannot be claimed by anyone else</strong> during these 30 days.</li>
+          <li>Sign in to Path+ within 30 days to <strong>cancel deletion and reactivate</strong> your account automatically.</li>
+        </ul>
+        <p style="color: #475569; line-height: 1.6; margin-bottom: 16px;">
+          On day 29 we will email you a final reminder. If you do not sign in within 30 days,
+          your account, content, username, and related data will be <strong>permanently deleted</strong>
+          and the username will become available again.
         </p>
-        <p style="color: #94A3B8; font-size: 13px;">If you did not request this, contact privacy@pathplus.store immediately.</p>
+        <p style="color: #94A3B8; font-size: 13px;">If you did not request this, sign in to Path+ immediately or contact privacy@pathplus.store.</p>
       </div>
     `,
   });
   if (!result.ok) {
     console.error("[account-deletion] suspension email failed:", result.message);
+  }
+}
+
+/** Day-29 reminder: permanent wipe of data + username is about to happen. */
+export async function sendAccountDeletionReminderEmail(
+  email: string,
+  fullName: string,
+  username?: string
+): Promise<void> {
+  const config = await getEmailConfig();
+  if (!config.templates.accountDeletion.enabled) return;
+  const name = fullName || "there";
+  const handle = (username || "").trim();
+  const result = await sendEmail({
+    to: email,
+    subject: "Reminder: your Path+ account will be permanently deleted tomorrow",
+    html: `
+      <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto; padding: 32px;">
+        <h2 style="color: #0A1F44; margin-bottom: 8px;">Hi ${escapeHtml(name)},</h2>
+        <p style="color: #475569; line-height: 1.6; margin-bottom: 16px;">
+          This is a reminder that your Path+ account deletion grace period ends <strong>tomorrow</strong>.
+        </p>
+        <p style="color: #475569; line-height: 1.6; margin-bottom: 16px;">
+          If you do not sign in before then, the following will be <strong>permanently removed</strong>:
+        </p>
+        <ul style="color: #475569; line-height: 1.7; padding-left: 20px; margin-bottom: 16px;">
+          <li>Your profile and account</li>
+          <li>Your posts, moments, and related content</li>
+          <li>Your friendships and other account data</li>
+          <li>Your username${handle ? ` (<strong>@${escapeHtml(handle)}</strong>)` : ""}, which will then become available for others to claim</li>
+        </ul>
+        <p style="color: #475569; line-height: 1.6; margin-bottom: 24px;">
+          To keep your account, <strong>sign in to Path+ now</strong>. Signing in within the grace period
+          cancels deletion and restores your account automatically.
+        </p>
+        <p style="color: #94A3B8; font-size: 13px;">If you need help, contact privacy@pathplus.store.</p>
+      </div>
+    `,
+  });
+  if (!result.ok) {
+    console.error("[account-deletion] reminder email failed:", result.message);
   }
 }
 

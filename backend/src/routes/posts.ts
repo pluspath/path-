@@ -10,6 +10,10 @@ import { getBlockedIds } from "../lib/blocks";
 import { parseDurationToMinutes } from "../lib/duration";
 import { POST_SELECT, loadPosts, attachOriginals } from "../lib/load-posts";
 import { resolveAvatarUrl } from "../lib/avatar";
+import {
+  filterDeletionHiddenPosts,
+  getDeletionHiddenUserIds,
+} from "../lib/account-deletion";
 import type { HonoVariables } from "../types";
 
 const postsRouter = new Hono<{ Variables: HonoVariables }>();
@@ -140,8 +144,15 @@ postsRouter.get("/", async (c) => {
     return true; // 'public' | 'friends' | unknown
   });
 
-  await attachOriginals(userClient, visible);
-  const formatted = visible.map((p) => formatPost(p, userId ?? undefined, blockedIds));
+  // Hide content from accounts in the 30-day deletion grace window.
+  // Parallelize attachOriginals with the (cached) deletion-hidden lookup.
+  const [deletionHidden] = await Promise.all([
+    getDeletionHiddenUserIds(),
+    attachOriginals(userClient, visible),
+  ]);
+  const visibleAfterDeletion = filterDeletionHiddenPosts(visible, deletionHidden, userId);
+
+  const formatted = visibleAfterDeletion.map((p) => formatPost(p, userId ?? undefined, blockedIds));
   await refreshFriendshipAvatars(formatted); // always show friends' CURRENT avatars
   return c.json({ data: formatted });
 });
@@ -187,13 +198,28 @@ postsRouter.get("/hashtags", async (c) => {
 
   const prefix = (c.req.query("q") ?? "").replace(/^#+/, "").trim().toLowerCase();
 
-  // Pull recent posts that actually contain a hashtag and tally distinct tags.
+  // Prefer the hashtags table (maintained on post create) — avoids scanning 1000 posts.
+  let query = supabaseAdmin
+    .from("hashtags")
+    .select("tag, post_count")
+    .order("post_count", { ascending: false })
+    .limit(10);
+  if (prefix) query = query.ilike("tag", `${prefix}%`);
+
+  const { data: tags, error } = await query;
+  if (!error && tags && tags.length > 0) {
+    return c.json({
+      data: tags.map((t: { tag: string }) => String(t.tag ?? "").replace(/^#/, "").toLowerCase()).filter(Boolean),
+    });
+  }
+
+  // Fallback for environments without hashtags table / empty table.
   const { data: rows } = await supabaseAdmin
     .from("posts")
     .select("content")
     .ilike("content", "%#%")
     .order("created_at", { ascending: false })
-    .limit(1000);
+    .limit(200);
 
   const counts = new Map<string, number>();
   for (const r of rows ?? []) {
@@ -343,12 +369,17 @@ async function handleInteractedMoments(c: any) {
   const visible = (posts ?? []).filter((p: any) => allowedUserIds.has(p.user_id));
   await attachOriginals(userClient, visible);
 
-  visible.sort(
+  const deletionHidden = await getDeletionHiddenUserIds();
+  const visibleAfterDeletion = filterDeletionHiddenPosts(visible, deletionHidden, userId);
+
+  visibleAfterDeletion.sort(
     (a: any, b: any) =>
       new Date(b.created_at ?? 0).getTime() - new Date(a.created_at ?? 0).getTime()
   );
 
-  return c.json({ data: visible.map((p: any) => formatPost(p, userId, blockedIds)) });
+  return c.json({
+    data: visibleAfterDeletion.map((p: any) => formatPost(p, userId, blockedIds)),
+  });
 }
 
 // GET /api/posts/reacted — moments the CURRENT user has interacted with
@@ -379,6 +410,14 @@ postsRouter.get("/:id", async (c) => {
   const blockedIds = userId ? await getBlockedIds(userId) : [];
   if (post.user_id !== userId && blockedIds.includes(post.user_id)) {
     return c.json({ error: { message: "Post not found" } }, 404);
+  }
+
+  // Deletion grace window: author's content is inaccessible to others.
+  if (post.user_id !== userId) {
+    const hidden = await getDeletionHiddenUserIds();
+    if (hidden.has(post.user_id)) {
+      return c.json({ error: { message: "Post not found" } }, 404);
+    }
   }
 
   return c.json({ data: formatPost(post, userId ?? undefined, blockedIds) });
@@ -623,21 +662,21 @@ postsRouter.post("/", async (c) => {
       }));
       await userClient.from("notifications").insert(notifications);
 
-      // Push each friend about the sleep moment (in-app + push).
-      for (const n of notifications) {
-        await sendPushToUser(
-          supabaseAdmin,
-          n.user_id,
-          "Sleep Update",
-          n.message,
-          { type: "sleep", postId: post.id, fromUserId: userId }
-        );
-      }
+      // Push in background — never block create-post on Expo fan-out.
+      void Promise.allSettled(
+        notifications.map((n: { user_id: string; message: string }) =>
+          sendPushToUser(supabaseAdmin, n.user_id, "Sleep Update", n.message, {
+            type: "sleep",
+            postId: post.id,
+            fromUserId: userId,
+          })
+        )
+      );
     }
   }
 
-  // Notify anyone @mentioned in the moment's text.
-  await notifyMentions({
+  // Mentions can be slow (resolve + push); don't hold the create response.
+  void notifyMentions({
     authorId: userId,
     authorName: user.full_name,
     content: post.content,

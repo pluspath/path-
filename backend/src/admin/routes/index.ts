@@ -10,6 +10,7 @@ import { friendshipsRoutes } from "./friendships.routes";
 import { notificationsRoutes } from "./notifications.routes";
 import { reportsRoutes } from "./reports.routes";
 import { deletionRequestsRoutes } from "./deletion-requests.routes";
+import { usernamesRoutes } from "./usernames.routes";
 import { settingsRoutes, cmsRoutes } from "./settings.routes";
 import { externalServicesRoutes } from "./external-services.routes";
 import { filesRoutes } from "./files.routes";
@@ -95,6 +96,8 @@ adminRouter.get("/", (c) =>
         "friendships",
         "notifications",
         "reports",
+        "deletion-requests",
+        "usernames",
         "settings",
         "external-services",
         "cms",
@@ -119,6 +122,7 @@ adminRouter.route("/friendships", friendshipsRoutes);
 adminRouter.route("/notifications", notificationsRoutes);
 adminRouter.route("/reports", reportsRoutes);
 adminRouter.route("/deletion-requests", deletionRequestsRoutes);
+adminRouter.route("/usernames", usernamesRoutes);
 adminRouter.route("/settings", settingsRoutes);
 adminRouter.route("/external-services", externalServicesRoutes);
 adminRouter.route("/cms", cmsRoutes);

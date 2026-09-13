@@ -395,7 +395,7 @@ function UsersPageInner() {
                       variant="destructive"
                       disabled={busy}
                       onClick={() => {
-                        if (!confirm("Delete this user permanently?")) return;
+                        if (!confirm("Delete this user permanently? All posts, moments, friendships, and the username will be removed.")) return;
                         void runAction(
                           () => api.delete(`/users/${selected.profile.id}`),
                           "User deleted"

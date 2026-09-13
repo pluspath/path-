@@ -297,51 +297,47 @@ conversationsRouter.get("/", async (c) => {
       ...new Set(visibleIds.map((id: string) => otherUserIdByConv[id]).filter(Boolean)),
     ];
 
-    // Prefer selecting only widely-present columns (avoid failing the whole inbox
-    // when a legacy `text` column is missing or renamed).
-    let recentMsgs: any[] | null = null;
-    {
-      const primary = await db
-        .from("messages")
-        .select("id, conversation_id, content, created_at, sender_id, type")
-        .in("conversation_id", visibleIds)
-        .order("created_at", { ascending: false })
-        .limit(Math.min(visibleIds.length * 40, 800));
-      if (primary.error) {
-        console.warn("[conversations] messages select fallback:", primary.error.message);
-        const fallback = await db
-          .from("messages")
-          .select("*")
-          .in("conversation_id", visibleIds)
-          .order("created_at", { ascending: false })
-          .limit(Math.min(visibleIds.length * 40, 800));
-        recentMsgs = fallback.data;
-      } else {
-        recentMsgs = primary.data;
-      }
-    }
-
-    const { data: profiles } =
+    // One newest message per conversation + profiles + unread in parallel.
+    const [lastMsgResults, profilesResult, unreadByConv] = await Promise.all([
+      Promise.all(
+        visibleIds.map((convId: string) =>
+          db
+            .from("messages")
+            .select("id, conversation_id, content, created_at, sender_id, type")
+            .eq("conversation_id", convId)
+            .order("created_at", { ascending: false })
+            .limit(1)
+            .maybeSingle()
+            .then((r: { data: any }) => r.data)
+            .catch(() => null)
+        )
+      ),
       otherUserIds.length > 0
-        ? await db
+        ? db
             .from("profiles")
-            .select("id, full_name, username, avatar_url, gender, bio, location, birthday, cover_url, created_at")
+            .select(
+              "id, full_name, username, avatar_url, gender, bio, location, birthday, cover_url, created_at"
+            )
             .in("id", otherUserIds)
-        : { data: [] as any[] };
+        : Promise.resolve({ data: [] as any[] }),
+      computeUnreadCounts(
+        db,
+        userId,
+        visibleIds.map((id: string) => ({
+          conversation_id: id,
+          last_read_at: lastReadByConv[id] ?? null,
+        }))
+      ),
+    ]);
 
+    const profiles = profilesResult.data;
     const profilesById: Record<string, any> = {};
     for (const p of profiles ?? []) profilesById[p.id] = formatProfile(p);
 
     const lastMsgByConv: Record<string, any> = {};
-    for (const m of recentMsgs ?? []) {
-      if (!lastMsgByConv[m.conversation_id]) lastMsgByConv[m.conversation_id] = m;
+    for (const m of lastMsgResults) {
+      if (m?.conversation_id) lastMsgByConv[m.conversation_id] = m;
     }
-
-    const unreadByConv = await computeUnreadCounts(
-      db,
-      userId,
-      visibleIds.map((id) => ({ conversation_id: id, last_read_at: lastReadByConv[id] ?? null }))
-    );
 
     const result = visibleConversations.map((conv: any) => {
       const otherUserId = otherUserIdByConv[conv.id];

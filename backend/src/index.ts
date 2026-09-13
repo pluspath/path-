@@ -27,6 +27,7 @@ import { backfillGenderAvatars } from "./lib/avatar";
 import { env, supabaseProjectRef } from "./env";
 import {
   purgeExpiredDeletionAccounts,
+  sendPendingDeletionReminders,
   reactivateDeletionSuspendedAccount,
   DELETION_SUSPEND_REASON,
   isDeletionGracePeriod,
@@ -145,6 +146,18 @@ app.get("/__marketing", (c) =>
           admin_note TEXT
         );`,
         "CREATE INDEX IF NOT EXISTS idx_account_deletion_status ON public.account_deletion_requests (status, created_at DESC);",
+        "ALTER TABLE public.account_deletion_requests ADD COLUMN IF NOT EXISTS reminder_sent_at TIMESTAMPTZ;",
+        // Allow self-serve deletion status "suspended" (older CHECK only had pending/approved/…).
+        `DO $$ BEGIN
+          ALTER TABLE public.account_deletion_requests DROP CONSTRAINT IF EXISTS account_deletion_requests_status_check;
+        EXCEPTION WHEN undefined_object THEN NULL;
+        END $$;`,
+        `DO $$ BEGIN
+          ALTER TABLE public.account_deletion_requests
+            ADD CONSTRAINT account_deletion_requests_status_check
+            CHECK (status IN ('pending', 'approved', 'rejected', 'done', 'cancelled', 'suspended'));
+        EXCEPTION WHEN duplicate_object THEN NULL;
+        END $$;`,
         // Hot-path indexes for messaging performance
         "CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON public.messages (conversation_id, created_at DESC);",
         "CREATE INDEX IF NOT EXISTS idx_conversation_participants_user ON public.conversation_participants (user_id);",
@@ -301,8 +314,14 @@ app.get("/__marketing", (c) =>
   // Apply gender-matched default avatars for users who never uploaded a custom photo.
   await backfillGenderAvatars();
 
-  // Purge accounts past the deletion grace window, then every 6 hours.
-  const runPurge = async () => {
+  // Purge accounts past the deletion grace window + send day-29 reminders, then every 6 hours.
+  const runDeletionJobs = async () => {
+    try {
+      const reminded = await sendPendingDeletionReminders();
+      if (reminded > 0) console.log(`[account-deletion] Sent ${reminded} day-29 reminder(s)`);
+    } catch (e) {
+      console.warn("[account-deletion] Reminder cron error:", e instanceof Error ? e.message : e);
+    }
     try {
       const n = await purgeExpiredDeletionAccounts();
       if (n > 0) console.log(`[account-deletion] Cron purged ${n} account(s)`);
@@ -310,8 +329,8 @@ app.get("/__marketing", (c) =>
       console.warn("[account-deletion] Cron purge error:", e instanceof Error ? e.message : e);
     }
   };
-  await runPurge();
-  setInterval(runPurge, 6 * 60 * 60 * 1000);
+  await runDeletionJobs();
+  setInterval(runDeletionJobs, 6 * 60 * 60 * 1000);
 
   const runAuthCleanup = async () => {
     try {
@@ -444,6 +463,13 @@ app.use("/api/admin/*", secureHeadersMiddleware);
 app.use("/api/*", apiLimiter);
 app.use("/api/auth/*", authLimiter);
 
+/** Short-lived auth+profile cache — cuts JWT/profile RTT on bursty mobile traffic. */
+const AUTH_CACHE_TTL_MS = 45_000;
+const authProfileCache = new Map<
+  string,
+  { userId: string; profile: any; expires: number }
+>();
+
 app.use("*", async (c, next) => {
   c.set("user", null);
   c.set("userId", null);
@@ -453,6 +479,15 @@ app.use("*", async (c, next) => {
   if (authHeader?.startsWith("Bearer ")) {
     const token = authHeader.slice(7);
     try {
+      const cached = authProfileCache.get(token);
+      if (cached && cached.expires > Date.now()) {
+        c.set("userId", cached.userId);
+        c.set("accessToken", token);
+        c.set("user", cached.profile);
+        await next();
+        return;
+      }
+
       const { data: { user: authUser }, error } = await supabase.auth.getUser(token);
 
       if (authUser && !error) {
@@ -465,7 +500,7 @@ app.use("*", async (c, next) => {
         let { data: profile, error: profileErr } = await supabaseAdmin
           .from("profiles")
           .select(
-            "id, full_name, username, avatar_url, bio, location, birthday, gender, cover_url, created_at, show_age, show_zodiac, username_changed, push_notifications_enabled, email_notifications_enabled, post_visibility, push_token, status, suspended_at, suspended_reason"
+            "id, full_name, username, avatar_url, bio, location, birthday, gender, cover_url, created_at, show_age, show_zodiac, username_changed, push_notifications_enabled, email_notifications_enabled, post_visibility, status, suspended_at, suspended_reason"
           )
           .eq("id", authUser.id)
           .maybeSingle();
@@ -493,6 +528,7 @@ app.use("*", async (c, next) => {
               profile.status = "active";
               profile.suspended_at = null;
               profile.suspended_reason = null;
+              authProfileCache.delete(token);
             } else {
               return c.json({ error: { message: "Account no longer available" } }, 403);
             }
@@ -501,7 +537,19 @@ app.use("*", async (c, next) => {
           }
         }
 
-        c.set("user", profile ?? { id: authUser.id, full_name: authUser.user_metadata?.full_name ?? "Someone" });
+        const sessionUser =
+          profile ?? { id: authUser.id, full_name: authUser.user_metadata?.full_name ?? "Someone" };
+        c.set("user", sessionUser);
+        authProfileCache.set(token, {
+          userId: authUser.id,
+          profile: sessionUser,
+          expires: Date.now() + AUTH_CACHE_TTL_MS,
+        });
+        // Bound cache size for long-running processes.
+        if (authProfileCache.size > 5_000) {
+          const first = authProfileCache.keys().next().value;
+          if (first) authProfileCache.delete(first);
+        }
       } else if (error) {
         console.warn(`[auth] Token rejected: ${error.message}`);
       }

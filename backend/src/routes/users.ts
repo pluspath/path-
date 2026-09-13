@@ -7,6 +7,7 @@ import { getBlockedIds } from "../lib/blocks";
 import { formatDuration } from "../lib/duration";
 import { upsertUserDevice, deactivateUserDevices, getPushTokensForUser, getPushStatusForUser, sendPushNotificationDetailed } from "../lib/push";
 import { isCustomAvatar, defaultAvatarForGender, resolveAvatarUrl } from "../lib/avatar";
+import { isDeletionHiddenProfile } from "../lib/account-deletion";
 import type { HonoVariables, Profile } from "../types";
 
 const usersRouter = new Hono<{ Variables: HonoVariables }>();
@@ -200,10 +201,11 @@ usersRouter.get("/search", async (c) => {
   }
 
   // Hide users blocked in either direction from discovery results.
+  // Also hide accounts in the 30-day deletion grace window (content inaccessible).
   const blockedSet = new Set(await getBlockedIds(userId));
 
   const results = (profiles ?? [])
-    .filter((p: any) => !blockedSet.has(p.id))
+    .filter((p: any) => !blockedSet.has(p.id) && !isDeletionHiddenProfile(p) && p.id !== userId)
     .map((p: any) => {
     const fs = friendshipByUser[p.id];
     let friendshipStatus: 'none' | 'pending_sent' | 'pending_received' | 'friends' = 'none';
@@ -265,6 +267,10 @@ usersRouter.get("/by-username/:username", async (c) => {
   }
 
   if (!match) return c.json({ data: null });
+  // Deletion grace: profile inaccessible, but username stays reserved (check endpoint still taken).
+  if (match.id !== userId && isDeletionHiddenProfile(match)) {
+    return c.json({ data: null });
+  }
   return c.json({ data: formatProfile(match, 0, 0, userId ?? undefined) });
 });
 
@@ -705,7 +711,7 @@ usersRouter.post("/me/deletion-request", async (c) => {
       status: "suspended",
       suspendedAt: now,
       message:
-        "Your account is suspended for 30 days. Sign in within 30 days to reactivate. After that, it will be permanently deleted.",
+        "Your account is suspended for 30 days. Content is hidden and your username stays reserved. Sign in within 30 days to reactivate. On day 29 you will get a reminder; after 30 days everything is permanently deleted.",
     },
   });
 });
@@ -777,6 +783,12 @@ usersRouter.get("/:id", async (c) => {
     console.warn("[users] GET /:id profile error:", profileErr.message);
   }
   if (!targetProfile) return c.json({ error: { message: "User not found" } }, 404);
+
+  // During the 30-day deletion grace window, content/profile are inaccessible to others.
+  // Username remains reserved on the profile row until permanent purge.
+  if (id !== userId && isDeletionHiddenProfile(targetProfile)) {
+    return c.json({ error: { message: "User not found" } }, 404);
+  }
 
   // If identity fields are blank on the profile row, fill from auth metadata
   // (older accounts / partial upserts) without inventing new values.
@@ -897,6 +909,12 @@ usersRouter.get("/:id/posts", async (c) => {
   if (!ownerProfile) return c.json({ data: [] });
 
   const isOwner = !!userId && userId === id;
+
+  // Deletion grace window: moments/posts are inaccessible to everyone else.
+  if (!isOwner && isDeletionHiddenProfile(ownerProfile)) {
+    return c.json({ data: [] });
+  }
+
   const isFriend = isOwner ? true : userId ? await areFriends(userId, id) : false;
 
   if (section === "posts") {

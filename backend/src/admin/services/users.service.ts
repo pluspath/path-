@@ -1,4 +1,5 @@
 import { supabaseAdmin } from "../../supabase";
+import { permanentlyDeleteUser } from "../../lib/account-deletion";
 import { dataRepository } from "../repositories/data.repository";
 import { logRepository } from "../repositories/log.repository";
 import { toCsv, toPaginated } from "../utils/pagination";
@@ -109,12 +110,11 @@ export const usersService = {
   },
 
   async delete(id: string, actor: { id: string; name: string }) {
-    try {
-      await supabaseAdmin.auth.admin.deleteUser(id);
-    } catch (e) {
-      console.warn("[admin] auth deleteUser failed, deleting profile only", e);
+    // Full cascade: posts, moments, friendships, notifications, profile, auth — frees username.
+    const result = await permanentlyDeleteUser(id);
+    if (!result.ok) {
+      throw new Error(result.error ?? "Failed to permanently delete user");
     }
-    await dataRepository.deleteProfile(id);
     await logRepository.create({
       category: "admin_activity",
       action: "user_delete",

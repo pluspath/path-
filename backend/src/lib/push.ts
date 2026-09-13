@@ -73,12 +73,17 @@ export function buildExpoPushMessage(
   pushToken: string,
   title: string,
   body: string,
-  data?: Record<string, unknown>
+  data?: Record<string, unknown>,
+  opts?: { badge?: number }
 ): Record<string, unknown> {
   const safeTitle = (title || "").trim() || "Path+";
   const safeBody = (body || "").trim() || "You have a new notification";
   const type = typeof data?.type === "string" ? data.type : "";
   const isPing = type === "ping";
+  const badge =
+    typeof opts?.badge === "number" && Number.isFinite(opts.badge)
+      ? Math.max(1, Math.min(99, Math.floor(opts.badge)))
+      : 1;
 
   const stringData = stringifyPushData({
     ...data,
@@ -96,7 +101,7 @@ export function buildExpoPushMessage(
     // iOS: lights screen + can play sound. "passive" = NC-only (no banner/Lock Screen).
     interruptionLevel: "active",
     priority: "high",
-    badge: 1,
+    badge,
     // Do NOT set contentAvailable — that yields background/silent delivery.
     sound: isPing ? "nudge.wav" : "default",
     categoryId: isPing ? "PING" : "DEFAULT",
@@ -104,6 +109,27 @@ export function buildExpoPushMessage(
     channelId: isPing ? "ping" : "default",
     ...(isPing ? { relevanceScore: 1 } : {}),
   };
+}
+
+/** Unread in-app notifications — drives the iOS/Android app-icon badge on push. */
+export async function getUnreadNotificationBadgeCount(
+  client: any,
+  userId: string
+): Promise<number> {
+  try {
+    const { count, error } = await client
+      .from("notifications")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", userId)
+      .eq("read", false);
+    if (error) {
+      console.warn("[push] unread badge count failed:", error.message);
+      return 1;
+    }
+    return Math.max(1, count ?? 1);
+  } catch {
+    return 1;
+  }
 }
 
 async function deactivatePushToken(client: any, pushToken: string): Promise<void> {
@@ -413,7 +439,7 @@ export async function sendPushNotificationDetailed(
   body: string,
   data?: Record<string, unknown>,
   client?: any,
-  opts?: { waitForReceipt?: boolean }
+  opts?: { waitForReceipt?: boolean; badge?: number }
 ): Promise<PushDeliveryResult> {
   const suffix = pushToken ? tokenSuffix(pushToken) : "none";
 
@@ -426,10 +452,10 @@ export async function sendPushNotificationDetailed(
     return { ok: false, tokenSuffix: suffix, message: "Push notifications disabled in Admin settings" };
   }
 
-  const message = buildExpoPushMessage(pushToken, title, body, data);
+  const message = buildExpoPushMessage(pushToken, title, body, data, { badge: opts?.badge });
   const notifType = typeof data?.type === "string" ? data.type : "default";
   console.log(
-    `[push] Sending type=${notifType} sound=${String(message.sound)} category=${String(message.categoryId)} to ${suffix}`
+    `[push] Sending type=${notifType} sound=${String(message.sound)} category=${String(message.categoryId)} badge=${String(message.badge)} to ${suffix}`
   );
 
   try {
@@ -534,9 +560,10 @@ export async function sendPushNotification(
   title: string,
   body: string,
   data?: Record<string, unknown>,
-  client?: any
+  client?: any,
+  opts?: { badge?: number }
 ): Promise<void> {
-  await sendPushNotificationDetailed(pushToken, title, body, data, client);
+  await sendPushNotificationDetailed(pushToken, title, body, data, client, { badge: opts?.badge });
 }
 
 /** Send a push to every active device belonging to a user. Never throws. */
@@ -553,11 +580,12 @@ export async function sendPushToUser(
       console.log(`[push] No active tokens for user ${userId.slice(0, 8)}… — skipped`);
       return;
     }
+    const badge = await getUnreadNotificationBadgeCount(client, userId);
     console.log(
-      `[push] Sending "${title}" to user ${userId.slice(0, 8)}… (${tokens.length} device(s))`
+      `[push] Sending "${title}" to user ${userId.slice(0, 8)}… (${tokens.length} device(s), badge=${badge})`
     );
     await Promise.all(
-      tokens.map((token) => sendPushNotification(token, title, body, data, client))
+      tokens.map((token) => sendPushNotification(token, title, body, data, client, { badge }))
     );
   } catch (e) {
     console.error("[push] sendPushToUser error:", e);

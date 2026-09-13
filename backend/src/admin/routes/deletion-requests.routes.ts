@@ -55,7 +55,9 @@ deletionRequestsRoutes.post("/:id/approve", requirePermission("users:delete"), a
       .single();
 
     if (error || !reqRow) return fail(c, "Request not found", 404);
-    if (reqRow.status !== "pending" && reqRow.status !== "approved") {
+    // Self-serve flow stores "suspended"; legacy admin queue used "pending"/"approved".
+    const approvable = ["pending", "approved", "suspended"];
+    if (!approvable.includes(String(reqRow.status ?? ""))) {
       return fail(c, `Cannot approve request in status ${reqRow.status}`, 400);
     }
 
@@ -70,6 +72,7 @@ deletionRequestsRoutes.post("/:id/approve", requirePermission("users:delete"), a
       })
       .eq("id", id);
 
+    // Cascade-deletes posts, moments, friendships, profile, auth — username becomes available.
     await usersService.delete(userId, { id: actor.id, name: actor.name });
 
     await supabaseAdmin
@@ -103,12 +106,22 @@ deletionRequestsRoutes.post("/:id/reject", requirePermission("users:delete"), as
 
     const { data: reqRow } = await supabaseAdmin
       .from("account_deletion_requests")
-      .select("id, status")
+      .select("id, status, user_id")
       .eq("id", id)
       .maybeSingle();
 
     if (!reqRow) return fail(c, "Request not found", 404);
-    if (reqRow.status !== "pending") return fail(c, "Only pending requests can be rejected", 400);
+    if (reqRow.status !== "pending" && reqRow.status !== "suspended") {
+      return fail(c, "Only pending or suspended requests can be rejected", 400);
+    }
+
+    // Rejecting a suspended self-serve deletion reactivates the account.
+    if (reqRow.status === "suspended" && reqRow.user_id) {
+      await supabaseAdmin
+        .from("profiles")
+        .update({ status: "active", suspended_at: null, suspended_reason: null })
+        .eq("id", reqRow.user_id);
+    }
 
     const { data, error } = await supabaseAdmin
       .from("account_deletion_requests")

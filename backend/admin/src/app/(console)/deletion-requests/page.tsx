@@ -29,7 +29,7 @@ export default function DeletionRequestsPage() {
   const [rows, setRows] = useState<DeletionRequest[]>([]);
   const [meta, setMeta] = useState({ total: 0, page: 1, limit: 20, totalPages: 1 });
   const [page, setPage] = useState(1);
-  const [status, setStatus] = useState("pending");
+  const [status, setStatus] = useState("suspended");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -53,7 +53,7 @@ export default function DeletionRequestsPage() {
   }, [load]);
 
   async function approve(id: string) {
-    if (!confirm("Approve and permanently delete this account?")) return;
+    if (!confirm("Approve and permanently delete this account? All posts, moments, and friendships will be removed and the username will be freed.")) return;
     try {
       await api.post(`/deletion-requests/${id}/approve`, {});
       toast.success("Account deleted");
@@ -66,12 +66,15 @@ export default function DeletionRequestsPage() {
   async function reject(id: string) {
     try {
       await api.post(`/deletion-requests/${id}/reject`, { note: "Rejected by admin" });
-      toast.success("Request rejected");
+      toast.success("Request rejected — account reactivated if it was suspended");
       await load();
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Reject failed");
     }
   }
+
+  const canAct = (statusValue?: string | null) =>
+    statusValue === "pending" || statusValue === "suspended";
 
   const columns: Column<DeletionRequest>[] = [
     {
@@ -92,7 +95,9 @@ export default function DeletionRequestsPage() {
     {
       key: "status",
       header: "Status",
-      cell: (r) => <Badge variant={r.status === "pending" ? "danger" : "muted"}>{r.status}</Badge>,
+      cell: (r) => (
+        <Badge variant={canAct(r.status) ? "danger" : "muted"}>{r.status}</Badge>
+      ),
     },
     {
       key: "created",
@@ -103,13 +108,13 @@ export default function DeletionRequestsPage() {
       key: "actions",
       header: "Actions",
       cell: (r) =>
-        r.status === "pending" && hasPermission("users:delete") ? (
+        canAct(r.status) && hasPermission("users:delete") ? (
           <div className="flex gap-2">
             <Button size="sm" onClick={() => void approve(r.id)}>
-              Approve
+              Delete now
             </Button>
             <Button size="sm" variant="outline" onClick={() => void reject(r.id)}>
-              Reject
+              Keep account
             </Button>
           </div>
         ) : (
@@ -122,11 +127,11 @@ export default function DeletionRequestsPage() {
     <div className="space-y-6">
       <PageHeader
         title="Account deletions"
-        description="Users who requested account deletion. Approve to permanently remove the account."
+        description="Approve to permanently remove the account and free the username. Self-serve requests appear as suspended."
       />
 
       <div className="flex gap-2">
-        {["pending", "done", "rejected", "all"].map((s) => (
+        {["suspended", "pending", "done", "rejected", "cancelled", "all"].map((s) => (
           <Button
             key={s}
             size="sm"

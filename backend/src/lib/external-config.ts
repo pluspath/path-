@@ -38,7 +38,7 @@ const DEFAULT_TEMPLATES = {
   signupOtp: { subject: "Your verification code", enabled: true },
   passwordResetOtp: { subject: "Your Path+ password reset code", enabled: true },
   accountDeletion: {
-    subject: "Your Path+ account is suspended for 30 days",
+    subject: "Your Path+ account deletion — 30-day grace period started",
     enabled: true,
   },
 };
