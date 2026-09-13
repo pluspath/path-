@@ -6,7 +6,7 @@ import { decodeImages } from "../lib/images";
 import { getBlockedIds } from "../lib/blocks";
 import { formatDuration } from "../lib/duration";
 import { upsertUserDevice, deactivateUserDevices, getPushTokensForUser, getPushStatusForUser, sendPushNotificationDetailed } from "../lib/push";
-import { isCustomAvatar, defaultAvatarForGender, resolveAvatarUrl } from "../lib/avatar";
+import { isCustomAvatar, defaultAvatarForGender, resolveAvatarUrl, normalizeGender } from "../lib/avatar";
 import { isDeletionHiddenProfile } from "../lib/account-deletion";
 import type { HonoVariables, Profile } from "../types";
 
@@ -110,10 +110,12 @@ export function formatReactions(rawReactions: any[], viewerId?: string, ownerId?
       userId: r.user_id,
       type: baseReactionType(r.type),
       locked: isReactionLocked(r.type),
-      userAvatar:
-        r.profiles?.avatar_url && String(r.profiles.avatar_url).length > 0
-          ? r.profiles.avatar_url
-          : undefined,
+      // Always resolve to a raster URL — raw SVG defaults render blank in expo-image.
+      userAvatar: resolveAvatarUrl(
+        r.user_id,
+        r.profiles?.avatar_url,
+        r.profiles?.gender
+      ),
     }));
 }
 
@@ -370,9 +372,8 @@ usersRouter.get("/me", async (c) => {
   return c.json({ data: formatProfile(profile, postsResult.count ?? 0, friendsResult.count ?? 0, userId) });
 });
 
-// POST /api/set-gender — optional one-time gender selection.
-// Gender is NOT required to create or use an account (Apple 5.1.1(v)).
-// Refuses to overwrite an existing gender once set.
+// POST /api/set-gender — optional gender selection (Apple 5.1.1(v)).
+// Also repairs a mismatched default avatar when gender is already set.
 usersRouter.post("/set-gender", async (c) => {
   const user = c.get("user");
   const userId = c.get("userId");
@@ -380,19 +381,17 @@ usersRouter.post("/set-gender", async (c) => {
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const body = await c.req.json().catch(() => ({}));
-  const gender = body?.gender;
-  if (gender !== "Male" && gender !== "Female") {
+  const gender = normalizeGender(body?.gender);
+  if (!gender) {
     return c.json({ error: { message: "Gender must be Male or Female" } }, 400);
   }
-  if ((user as any).gender) {
+
+  const existingGender = normalizeGender((user as any).gender);
+  if (existingGender && existingGender !== gender) {
     return c.json({ error: { message: "Gender already set" } }, 409);
   }
 
-  // Use service role so a missing/strict profiles UPDATE policy cannot block
-  // this one-time write after we have already authenticated the caller.
   const updatePayload: Record<string, unknown> = { gender };
-  // Apply a gender-matched default avatar only when the user has not uploaded
-  // a custom profile picture.
   const currentAvatar = (user as any).avatar_url ?? null;
   if (!isCustomAvatar(currentAvatar)) {
     updatePayload.avatar_url = defaultAvatarForGender(userId, gender);
@@ -940,7 +939,7 @@ usersRouter.get("/:id/posts", async (c) => {
 
   const { data: posts, error: postsErr } = await supabaseAdmin
     .from("posts")
-    .select("*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(avatar_url))")
+    .select("*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(avatar_url, gender))")
     .eq("user_id", id)
     .order("created_at", { ascending: false })
     .limit(limit);

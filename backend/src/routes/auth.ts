@@ -18,7 +18,7 @@ import {
   confirmPasswordReset,
   purgeExpiredPasswordResetOtps,
 } from "../lib/password-reset-otp";
-import { defaultAvatarForGender } from "../lib/avatar";
+import { defaultAvatarForGender, normalizeGender } from "../lib/avatar";
 
 const authRouter = new Hono();
 
@@ -149,10 +149,11 @@ authRouter.post("/verify-otp", async (c) => {
     username: pending.username,
     full_name: pending.full_name,
   };
-  if (pending.gender) {
-    profileRow.gender = pending.gender;
+  const gender = normalizeGender(pending.gender);
+  if (gender) {
+    profileRow.gender = gender;
     // Gender-matched default avatar until the user uploads their own photo.
-    profileRow.avatar_url = defaultAvatarForGender(userId, pending.gender);
+    profileRow.avatar_url = defaultAvatarForGender(userId, gender);
   }
   if (pending.birthday) profileRow.birthday = pending.birthday;
 

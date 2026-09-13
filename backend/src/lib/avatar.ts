@@ -1,18 +1,64 @@
 import { supabaseAdmin } from "../supabase";
 
-/** DiceBear Avataaars hair styles that read as typically male. */
-const MALE_TOP =
-  "shortFlat,shortRound,shortWaved,shortCurly,sides,theCaesar,theCaesarAndSidePart,dreads01,dreads02,shaggy,shaggyMullet";
+/** Short male hair styles only — never long hair. */
+const MALE_TOPS = [
+  "shortFlat",
+  "shortRound",
+  "shortWaved",
+  "shortCurly",
+  "sides",
+  "theCaesar",
+  "theCaesarAndSidePart",
+] as const;
 
-/** DiceBear Avataaars hair styles that read as typically female. */
-const FEMALE_TOP =
-  "bob,bun,curly,curvy,bigHair,longButNotTooLong,miaWallace,straight01,straight02,straightAndStrand,dreads,frida,froBand";
+/** Clearly feminine / long hair styles. */
+const FEMALE_TOPS = [
+  "bob",
+  "bun",
+  "curly",
+  "curvy",
+  "bigHair",
+  "longButNotTooLong",
+  "miaWallace",
+  "straight01",
+  "straight02",
+  "straightAndStrand",
+  "frida",
+  "froBand",
+] as const;
+
+const MALE_FACIAL_HAIR = ["beardLight", "beardMedium", "moustacheFancy"] as const;
 
 export type ProfileGender = "Male" | "Female";
 
 export function normalizeGender(gender: unknown): ProfileGender | null {
   if (gender === "Male" || gender === "Female") return gender;
+  // Tolerate lowercase from older clients / DB rows.
+  if (typeof gender === "string") {
+    const g = gender.trim().toLowerCase();
+    if (g === "male") return "Male";
+    if (g === "female") return "Female";
+  }
   return null;
+}
+
+function pickStable<T extends string>(seed: string, options: readonly T[]): T {
+  let h = 2166136261;
+  for (let i = 0; i < seed.length; i++) {
+    h ^= seed.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return options[Math.abs(h) % options.length];
+}
+
+/**
+ * expo-image (esp. iOS) often renders DiceBear SVG endpoints as blank.
+ * Prefer PNG for every DiceBear HTTP avatar URL.
+ */
+export function ensureRasterAvatarUrl(url: string): string {
+  const trimmed = url.trim();
+  if (!/dicebear\.com/i.test(trimmed)) return trimmed;
+  return trimmed.replace(/\/svg(\?|$)/i, "/png$1");
 }
 
 /** True when the user uploaded (or otherwise set) a real profile photo. */
@@ -20,7 +66,6 @@ export function isCustomAvatar(url: string | null | undefined): boolean {
   if (!url || typeof url !== "string") return false;
   const trimmed = url.trim();
   if (!trimmed) return false;
-  // Auto-generated placeholders (legacy neutral + gendered defaults).
   if (trimmed.includes("dicebear.com")) return false;
   return true;
 }
@@ -29,39 +74,47 @@ export function isDefaultAvatar(url: string | null | undefined): boolean {
   return !isCustomAvatar(url);
 }
 
-/** Gender-aware DiceBear default. Neutral when gender is unknown. */
+/**
+ * Gender-aware DiceBear default as PNG.
+ * Uses ONE explicit `top` value (not a comma list) — DiceBear can ignore
+ * invalid multi-value strings and fall back to long-hair styles.
+ */
 export function defaultAvatarForGender(
   userId: string,
   gender?: string | null
 ): string {
-  const seed = encodeURIComponent(String(userId || "user"));
+  const id = String(userId || "user");
   const g = normalizeGender(gender);
+  const seed = encodeURIComponent(g ? `${id}-${g}` : id);
+
   if (g === "Male") {
-    return `https://api.dicebear.com/7.x/avataaars/svg?seed=${seed}&top=${MALE_TOP}&facialHairProbability=35`;
+    const top = pickStable(id, MALE_TOPS);
+    const facialHair = pickStable(`${id}-fh`, MALE_FACIAL_HAIR);
+    return `https://api.dicebear.com/7.x/avataaars/png?seed=${seed}&size=128&top=${top}&facialHairProbability=55&facialHair=${facialHair}`;
   }
   if (g === "Female") {
-    return `https://api.dicebear.com/7.x/avataaars/svg?seed=${seed}&top=${FEMALE_TOP}&facialHairProbability=0`;
+    const top = pickStable(id, FEMALE_TOPS);
+    return `https://api.dicebear.com/7.x/avataaars/png?seed=${seed}&size=128&top=${top}&facialHairProbability=0`;
   }
-  return `https://api.dicebear.com/7.x/avataaars/svg?seed=${seed}`;
+  return `https://api.dicebear.com/7.x/avataaars/png?seed=${seed}&size=128`;
 }
 
 /**
  * Prefer a custom upload; otherwise return the gender-based default.
- * Safe for API formatters that previously fell back to a neutral DiceBear URL.
+ * Always returns a raster-friendly URL (DiceBear PNG, not SVG).
  */
 export function resolveAvatarUrl(
   userId: string,
   avatarUrl?: string | null,
   gender?: string | null
 ): string {
-  if (isCustomAvatar(avatarUrl)) return String(avatarUrl).trim();
+  if (isCustomAvatar(avatarUrl)) return ensureRasterAvatarUrl(String(avatarUrl).trim());
   return defaultAvatarForGender(userId, gender);
 }
 
 /**
  * If the profile still has a default/empty avatar, persist the gender-based
- * default. Never overwrites a manually uploaded photo. Does not create an
- * avatar_change moment (callers must not treat this as a user edit).
+ * default. Never overwrites a manually uploaded photo.
  */
 export async function ensureGenderDefaultAvatar(
   userId: string,
@@ -77,7 +130,7 @@ export async function ensureGenderDefaultAvatar(
 
   const { error } = await supabaseAdmin
     .from("profiles")
-    .update({ avatar_url: next })
+    .update({ avatar_url: next, gender: g })
     .eq("id", userId);
 
   if (error) {
@@ -95,8 +148,7 @@ export async function backfillGenderAvatars(): Promise<{ updated: number }> {
   try {
     const { data: profiles, error } = await supabaseAdmin
       .from("profiles")
-      .select("id, gender, avatar_url")
-      .in("gender", ["Male", "Female"]);
+      .select("id, gender, avatar_url");
 
     if (error || !profiles) {
       console.error("[avatar] backfill: failed to load profiles:", error?.message);
@@ -105,13 +157,15 @@ export async function backfillGenderAvatars(): Promise<{ updated: number }> {
 
     let updated = 0;
     for (const p of profiles) {
+      const g = normalizeGender(p.gender);
+      if (!g) continue;
       if (isCustomAvatar(p.avatar_url)) continue;
-      const next = defaultAvatarForGender(p.id, p.gender);
-      if (p.avatar_url === next) continue;
+      const next = defaultAvatarForGender(p.id, g);
+      if (p.avatar_url === next && p.gender === g) continue;
 
       const { error: updErr } = await supabaseAdmin
         .from("profiles")
-        .update({ avatar_url: next })
+        .update({ avatar_url: next, gender: g })
         .eq("id", p.id);
 
       if (updErr) {

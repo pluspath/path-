@@ -1,4 +1,5 @@
 import { supabaseAdmin } from "../supabase";
+import { resolveAvatarUrl } from "./avatar";
 
 // System moments are special posts created automatically by the app. Like the
 // "Joined Path+" moment, they cannot be edited or deleted, are scoped to
@@ -178,11 +179,13 @@ export async function refreshFriendshipAvatars(posts: any[]): Promise<void> {
 
     const { data: profiles } = await supabaseAdmin
       .from("profiles")
-      .select("id, avatar_url")
+      .select("id, avatar_url, gender")
       .in("id", Array.from(friendIds));
 
-    const avatarById: Record<string, string | null> = {};
-    for (const pr of profiles ?? []) avatarById[pr.id] = pr.avatar_url ?? null;
+    const avatarById: Record<string, string> = {};
+    for (const pr of profiles ?? []) {
+      avatarById[pr.id] = resolveAvatarUrl(pr.id, pr.avatar_url, pr.gender);
+    }
 
     for (const p of posts ?? []) {
       if (p?.type !== FRIENDSHIP_TYPE || !Array.isArray(p.friends)) continue;

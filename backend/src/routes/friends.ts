@@ -153,7 +153,8 @@ friendsRouter.get("/", async (c) => {
       .from("profiles")
       .select("*")
       .not("id", "in", `(${excludeIds.join(",")})`)
-      .limit(5),
+      .order("created_at", { ascending: false })
+      .limit(100),
   ]);
 
   let profileMap: Record<string, any> = {};

@@ -2,7 +2,7 @@ import { supabaseAdmin } from "../supabase";
 
 // Explicit FK hints — after `repath_of`, bare `profiles(*)` is ambiguous.
 export const POST_SELECT =
-  "*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(avatar_url))";
+  "*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(avatar_url, gender))";
 export const POST_SELECT_BASIC = "*, profiles!user_id(*)";
 export const POST_SELECT_MIN = "*";
 
