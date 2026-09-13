@@ -85,6 +85,46 @@ function formatProfile(p: any) {
   };
 }
 
+/** Build a PostgREST `not.in.(…)` value; quote UUIDs for safe parsing. */
+function notInList(ids: string[]): string {
+  const unique = Array.from(new Set(ids.filter(Boolean)));
+  if (unique.length === 0) return "()";
+  return `(${unique.map((id) => `"${id}"`).join(",")})`;
+}
+
+async function loadDiscoverProfiles(
+  excludeIds: string[],
+  offset: number,
+  limit: number
+): Promise<{ rows: any[]; error: any | null }> {
+  const exclude = notInList(excludeIds);
+
+  const { data, error } = await supabaseAdmin
+    .from("profiles")
+    .select("*")
+    .filter("id", "not.in", exclude)
+    .order("created_at", { ascending: false })
+    .range(offset, offset + limit - 1);
+
+  if (!error) return { rows: data ?? [], error: null };
+
+  console.warn("[friends/discover] not.in filter failed, falling back:", error.message);
+
+  // Fallback: load a wider newest window and drop excluded ids in memory.
+  const windowEnd = Math.min(Math.max(offset + limit + excludeIds.length + 40, 80), 300) - 1;
+  const { data: all, error: fallbackError } = await supabaseAdmin
+    .from("profiles")
+    .select("*")
+    .order("created_at", { ascending: false })
+    .range(0, windowEnd);
+
+  if (fallbackError) return { rows: [], error: fallbackError };
+
+  const excluded = new Set(excludeIds);
+  const filtered = (all ?? []).filter((p: any) => p?.id && !excluded.has(p.id));
+  return { rows: filtered.slice(offset, offset + limit), error: null };
+}
+
 friendsRouter.get("/", async (c) => {
   const user = c.get("user");
   const userId = c.get("userId");
@@ -145,17 +185,16 @@ friendsRouter.get("/", async (c) => {
   const allIds = [...new Set([...friendIds, ...pendingRequesterIds])];
   const excludeIds = [userId, ...friendIds, ...pendingRequesterIds, ...pendingSentIds, ...blockedSet];
 
-  const [profilesResult, suggestedResult] = await Promise.all([
+  const [profilesResult, suggestedLoad] = await Promise.all([
     allIds.length > 0
       ? supabaseAdmin.from("profiles").select("*").in("id", allIds)
       : Promise.resolve({ data: [] as any[] }),
-    supabaseAdmin
-      .from("profiles")
-      .select("*")
-      .not("id", "in", `(${excludeIds.join(",")})`)
-      .order("created_at", { ascending: false })
-      .limit(7),
+    loadDiscoverProfiles(excludeIds, 0, 40),
   ]);
+
+  if (suggestedLoad.error) {
+    console.warn("[friends] suggested load failed:", suggestedLoad.error.message);
+  }
 
   let profileMap: Record<string, any> = {};
   for (const p of profilesResult.data ?? []) profileMap[p.id] = p;
@@ -179,59 +218,19 @@ friendsRouter.get("/", async (c) => {
     }))
     .filter((r: any) => r.user && !isDeletionHiddenProfile(profileMap[r.user.id] ?? null));
 
+  const suggested = (suggestedLoad.rows ?? [])
+    .filter((p: any) => !isDeletionHiddenProfile(p))
+    .map((p: any) => ({ ...formatProfile(p), friendshipStatus: "none" as const }));
+
   return c.json({
     data: {
       friends,
       requests,
-      suggested: (suggestedResult.data ?? [])
-        .filter((p: any) => !isDeletionHiddenProfile(p))
-        .map((p: any) => ({ ...formatProfile(p), friendshipStatus: "none" as const })),
-      suggestedHasMore: (suggestedResult.data ?? []).length >= 7,
+      suggested,
+      suggestedHasMore: suggested.length >= 40,
     },
   });
 });
-
-/** Build a PostgREST `not.in.(…)` value; quote UUIDs for safe parsing. */
-function notInList(ids: string[]): string {
-  const unique = Array.from(new Set(ids.filter(Boolean)));
-  if (unique.length === 0) return "()";
-  return `(${unique.map((id) => `"${id}"`).join(",")})`;
-}
-
-async function loadDiscoverProfiles(
-  excludeIds: string[],
-  offset: number,
-  limit: number
-): Promise<{ rows: any[]; error: any | null }> {
-  const exclude = notInList(excludeIds);
-
-  // Preferred: exclude at the DB. Fall back to in-memory filter if PostgREST
-  // rejects the not.in filter (malformed / size limits).
-  const { data, error } = await supabaseAdmin
-    .from("profiles")
-    .select("*")
-    .filter("id", "not.in", exclude)
-    .order("created_at", { ascending: false })
-    .range(offset, offset + limit - 1);
-
-  if (!error) return { rows: data ?? [], error: null };
-
-  console.warn("[friends/discover] not.in filter failed, falling back:", error.message);
-
-  // Fallback: page a wider window and drop excluded ids in memory.
-  const window = Math.min(Math.max(limit * 8, offset + limit + limit), 200);
-  const { data: all, error: fallbackError } = await supabaseAdmin
-    .from("profiles")
-    .select("*")
-    .order("created_at", { ascending: false })
-    .range(0, window - 1);
-
-  if (fallbackError) return { rows: [], error: fallbackError };
-
-  const excluded = new Set(excludeIds);
-  const filtered = (all ?? []).filter((p: any) => !excluded.has(p.id));
-  return { rows: filtered.slice(offset, offset + limit), error: null };
-}
 
 /** Paginated directory of other members (excludes self, friends, pending, blocked). */
 friendsRouter.get("/discover", async (c) => {
