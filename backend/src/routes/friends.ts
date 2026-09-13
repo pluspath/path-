@@ -154,7 +154,7 @@ friendsRouter.get("/", async (c) => {
       .select("*")
       .not("id", "in", `(${excludeIds.join(",")})`)
       .order("created_at", { ascending: false })
-      .limit(100),
+      .limit(7),
   ]);
 
   let profileMap: Record<string, any> = {};
@@ -185,7 +185,87 @@ friendsRouter.get("/", async (c) => {
       requests,
       suggested: (suggestedResult.data ?? [])
         .filter((p: any) => !isDeletionHiddenProfile(p))
-        .map(formatProfile),
+        .map((p: any) => ({ ...formatProfile(p), friendshipStatus: "none" as const })),
+      suggestedHasMore: (suggestedResult.data ?? []).length >= 7,
+    },
+  });
+});
+
+/** Paginated directory of other members (excludes self, friends, pending, blocked). */
+friendsRouter.get("/discover", async (c) => {
+  const user = c.get("user");
+  const userId = c.get("userId");
+  const token = c.get("accessToken");
+  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const offset = Math.max(0, Number.parseInt(String(c.req.query("offset") ?? "0"), 10) || 0);
+  const limitRaw = Number.parseInt(String(c.req.query("limit") ?? "7"), 10);
+  const limit = Math.min(50, Math.max(1, Number.isFinite(limitRaw) ? limitRaw : 7));
+
+  const userClient = createUserClient(token);
+
+  const [
+    blockedIds,
+    acceptedFriendshipsResult,
+    pendingFriendshipsResult,
+    pendingSentResult,
+  ] = await Promise.all([
+    getBlockedIds(userId),
+    userClient
+      .from("friendships")
+      .select("requester_id, receiver_id")
+      .eq("status", "accepted")
+      .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
+    userClient
+      .from("friendships")
+      .select("requester_id")
+      .eq("receiver_id", userId)
+      .eq("status", "pending"),
+    userClient
+      .from("friendships")
+      .select("receiver_id")
+      .eq("requester_id", userId)
+      .eq("status", "pending"),
+  ]);
+
+  const blockedSet = new Set(blockedIds);
+  const friendIds = (acceptedFriendshipsResult.data ?? [])
+    .map((f: any) => (f.requester_id === userId ? f.receiver_id : f.requester_id))
+    .filter((id: string) => !blockedSet.has(id));
+  const pendingRequesterIds = (pendingFriendshipsResult.data ?? [])
+    .map((f: any) => f.requester_id)
+    .filter((id: string) => !blockedSet.has(id));
+  const pendingSentIds = (pendingSentResult.data ?? []).map((f: any) => f.receiver_id);
+  const excludeIds = [userId, ...friendIds, ...pendingRequesterIds, ...pendingSentIds, ...blockedSet];
+
+  const { data: rows, error } = await supabaseAdmin
+    .from("profiles")
+    .select("*")
+    .not("id", "in", `(${excludeIds.join(",")})`)
+    .order("created_at", { ascending: false })
+    .range(offset, offset + limit - 1);
+
+  if (error) {
+    console.error("[friends/discover] query failed:", error.message);
+    return c.json({ error: { message: "Failed to load people" } }, 500);
+  }
+
+  const users = (rows ?? [])
+    .filter((p: any) => !isDeletionHiddenProfile(p))
+    .map((p: any) => ({
+      ...formatProfile(p),
+      friendshipStatus: "none" as const,
+    }));
+  const hasMore = (rows ?? []).length === limit;
+  const nextOffset = offset + limit;
+
+  return c.json({
+    data: {
+      users,
+      offset,
+      limit,
+      nextOffset,
+      hasMore,
     },
   });
 });

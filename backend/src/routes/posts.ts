@@ -345,8 +345,20 @@ async function handleInteractedMoments(c: any) {
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const userClient = createUserClient(token);
+  const offset = Math.max(0, Number.parseInt(String(c.req.query("offset") ?? "0"), 10) || 0);
+  const limitParam = c.req.query("limit");
+  const paged = limitParam != null;
+  const limit = paged
+    ? Math.min(60, Math.max(1, Number.parseInt(String(limitParam), 10) || 10))
+    : 60;
+
   const orderedPostIds = (await collectInteractedPostIds(userId)).slice(0, 60);
-  if (orderedPostIds.length === 0) return c.json({ data: [] });
+  if (orderedPostIds.length === 0) {
+    if (paged) {
+      return c.json({ data: { posts: [], offset, limit, hasMore: false, total: 0 } });
+    }
+    return c.json({ data: [] });
+  }
 
   const [blockedIds, allowedAuthors] = await Promise.all([
     getBlockedIds(userId),
@@ -357,8 +369,44 @@ async function handleInteractedMoments(c: any) {
     allowedAuthors.filter((id) => id === userId || !blockedSet.has(id))
   );
 
+  // Lightweight pass: only id/user/created_at so we can sort + page before
+  // hydrating full post payloads (reactions, profiles, originals).
+  const { data: metaRows, error: metaError } = await supabaseAdmin
+    .from("posts")
+    .select("id, user_id, created_at")
+    .in("id", orderedPostIds);
+
+  if (metaError) {
+    console.error("[posts/reacted] meta query failed:", metaError.message);
+    return c.json({ error: { message: "Failed to load liked moments" } }, 500);
+  }
+
+  const deletionHidden = await getDeletionHiddenUserIds();
+  // Own posts still show even if the author is in the deletion-hidden set.
+  const metaFinal = (metaRows ?? []).filter((p: any) => {
+    if (!allowedUserIds.has(p.user_id)) return false;
+    if (p.user_id === userId) return true;
+    return !deletionHidden.has(p.user_id);
+  });
+
+  metaFinal.sort(
+    (a: any, b: any) =>
+      new Date(b.created_at ?? 0).getTime() - new Date(a.created_at ?? 0).getTime()
+  );
+
+  const total = metaFinal.length;
+  const pageMeta = metaFinal.slice(offset, offset + limit);
+  const pageIds = pageMeta.map((p: any) => p.id);
+
+  if (pageIds.length === 0) {
+    if (paged) {
+      return c.json({ data: { posts: [], offset, limit, hasMore: false, total } });
+    }
+    return c.json({ data: [] });
+  }
+
   const { data: posts, error: postsError } = await loadPosts((select) =>
-    supabaseAdmin.from("posts").select(select).in("id", orderedPostIds)
+    supabaseAdmin.from("posts").select(select).in("id", pageIds)
   );
 
   if (postsError) {
@@ -366,20 +414,24 @@ async function handleInteractedMoments(c: any) {
     return c.json({ error: { message: "Failed to load liked moments" } }, 500);
   }
 
-  const visible = (posts ?? []).filter((p: any) => allowedUserIds.has(p.user_id));
-  await attachOriginals(userClient, visible);
+  // Preserve newest-first order from metaFinal.
+  const byId = new Map((posts ?? []).map((p: any) => [p.id, p]));
+  const orderedPosts = pageIds.map((id) => byId.get(id)).filter(Boolean);
+  await attachOriginals(userClient, orderedPosts);
 
-  const deletionHidden = await getDeletionHiddenUserIds();
-  const visibleAfterDeletion = filterDeletionHiddenPosts(visible, deletionHidden, userId);
-
-  visibleAfterDeletion.sort(
-    (a: any, b: any) =>
-      new Date(b.created_at ?? 0).getTime() - new Date(a.created_at ?? 0).getTime()
-  );
-
-  return c.json({
-    data: visibleAfterDeletion.map((p: any) => formatPost(p, userId, blockedIds)),
-  });
+  const formatted = orderedPosts.map((p: any) => formatPost(p, userId, blockedIds));
+  if (paged) {
+    return c.json({
+      data: {
+        posts: formatted,
+        offset,
+        limit,
+        hasMore: offset + limit < total,
+        total,
+      },
+    });
+  }
+  return c.json({ data: formatted });
 }
 
 // GET /api/posts/reacted — moments the CURRENT user has interacted with
