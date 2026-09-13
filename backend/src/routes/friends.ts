@@ -191,6 +191,48 @@ friendsRouter.get("/", async (c) => {
   });
 });
 
+/** Build a PostgREST `not.in.(…)` value; quote UUIDs for safe parsing. */
+function notInList(ids: string[]): string {
+  const unique = Array.from(new Set(ids.filter(Boolean)));
+  if (unique.length === 0) return "()";
+  return `(${unique.map((id) => `"${id}"`).join(",")})`;
+}
+
+async function loadDiscoverProfiles(
+  excludeIds: string[],
+  offset: number,
+  limit: number
+): Promise<{ rows: any[]; error: any | null }> {
+  const exclude = notInList(excludeIds);
+
+  // Preferred: exclude at the DB. Fall back to in-memory filter if PostgREST
+  // rejects the not.in filter (malformed / size limits).
+  const { data, error } = await supabaseAdmin
+    .from("profiles")
+    .select("*")
+    .filter("id", "not.in", exclude)
+    .order("created_at", { ascending: false })
+    .range(offset, offset + limit - 1);
+
+  if (!error) return { rows: data ?? [], error: null };
+
+  console.warn("[friends/discover] not.in filter failed, falling back:", error.message);
+
+  // Fallback: page a wider window and drop excluded ids in memory.
+  const window = Math.min(Math.max(limit * 8, offset + limit + limit), 200);
+  const { data: all, error: fallbackError } = await supabaseAdmin
+    .from("profiles")
+    .select("*")
+    .order("created_at", { ascending: false })
+    .range(0, window - 1);
+
+  if (fallbackError) return { rows: [], error: fallbackError };
+
+  const excluded = new Set(excludeIds);
+  const filtered = (all ?? []).filter((p: any) => !excluded.has(p.id));
+  return { rows: filtered.slice(offset, offset + limit), error: null };
+}
+
 /** Paginated directory of other members (excludes self, friends, pending, blocked). */
 friendsRouter.get("/discover", async (c) => {
   const user = c.get("user");
@@ -238,12 +280,7 @@ friendsRouter.get("/discover", async (c) => {
   const pendingSentIds = (pendingSentResult.data ?? []).map((f: any) => f.receiver_id);
   const excludeIds = [userId, ...friendIds, ...pendingRequesterIds, ...pendingSentIds, ...blockedSet];
 
-  const { data: rows, error } = await supabaseAdmin
-    .from("profiles")
-    .select("*")
-    .not("id", "in", `(${excludeIds.join(",")})`)
-    .order("created_at", { ascending: false })
-    .range(offset, offset + limit - 1);
+  const { rows, error } = await loadDiscoverProfiles(excludeIds, offset, limit);
 
   if (error) {
     console.error("[friends/discover] query failed:", error.message);

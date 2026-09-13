@@ -169,28 +169,41 @@ export function formatPost(p: any, viewerId?: string, blockedIds: string[] = [])
 }
 
 // GET /api/search?q=...
+// Global people discovery (friends + non-friends).
+//   "@ali"  → username prefix search
+//   "ali"   → full_name contains search
 usersRouter.get("/search", async (c) => {
   const user = c.get("user");
   const userId = c.get("userId");
   const token = c.get("accessToken");
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
-  // Strip a leading "@" so "@ali" and "ali" search the same. PREFIX match
-  // (starts-with) on username OR full_name — one letter already lists everyone
-  // matching that prefix. This is GLOBAL discovery: it searches ALL users, not
-  // just the viewer's friends. (Privacy still governs what moments they can see
-  // once a profile is opened — this only finds the person.)
-  const q = (c.req.query("q") ?? "").replace(/^@+/, "").trim();
+  const rawQ = c.req.query("q") ?? "";
+  const usernameMode = /^\s*@/.test(rawQ);
+  // Strip leading @ and PostgREST / ilike metacharacters that break filters.
+  const q = rawQ
+    .replace(/^@+/, "")
+    .trim()
+    .replace(/[%_,.()\"'\\]/g, "")
+    .trim();
   if (q.length < 1) return c.json({ data: [] });
 
-  const userClient = createUserClient(token);
-  const { data: profiles } = await userClient
-    .from("profiles")
-    .select("*")
-    .or(`full_name.ilike.${q}%,username.ilike.${q}%`)
-    .limit(30);
+  // Use service role so RLS never blanks discovery (same as /friends/discover).
+  let profileQuery = supabaseAdmin.from("profiles").select("*").limit(40);
+  if (usernameMode) {
+    profileQuery = profileQuery.ilike("username", `${q}%`);
+  } else {
+    // Name search: match anywhere in the display name.
+    profileQuery = profileQuery.ilike("full_name", `%${q}%`);
+  }
 
-  // Fetch all friendships involving the current user
+  const { data: profiles, error: profileError } = await profileQuery;
+  if (profileError) {
+    console.error("[search] profiles query failed:", profileError.message);
+    return c.json({ error: { message: "Search failed" } }, 500);
+  }
+
+  const userClient = createUserClient(token);
   const { data: myFriendships } = await userClient
     .from("friendships")
     .select("id, requester_id, receiver_id, status")
@@ -202,26 +215,24 @@ usersRouter.get("/search", async (c) => {
     friendshipByUser[otherId] = { id: f.id, status: f.status, isSender: f.requester_id === userId };
   }
 
-  // Hide users blocked in either direction from discovery results.
-  // Also hide accounts in the 30-day deletion grace window (content inaccessible).
   const blockedSet = new Set(await getBlockedIds(userId));
 
   const results = (profiles ?? [])
     .filter((p: any) => !blockedSet.has(p.id) && !isDeletionHiddenProfile(p) && p.id !== userId)
     .map((p: any) => {
-    const fs = friendshipByUser[p.id];
-    let friendshipStatus: 'none' | 'pending_sent' | 'pending_received' | 'friends' = 'none';
-    let friendshipId: string | undefined;
-    if (fs) {
-      friendshipId = fs.id;
-      if (fs.status === 'accepted') {
-        friendshipStatus = 'friends';
-      } else if (fs.status === 'pending') {
-        friendshipStatus = fs.isSender ? 'pending_sent' : 'pending_received';
+      const fs = friendshipByUser[p.id];
+      let friendshipStatus: "none" | "pending_sent" | "pending_received" | "friends" = "none";
+      let friendshipId: string | undefined;
+      if (fs) {
+        friendshipId = fs.id;
+        if (fs.status === "accepted") {
+          friendshipStatus = "friends";
+        } else if (fs.status === "pending") {
+          friendshipStatus = fs.isSender ? "pending_sent" : "pending_received";
+        }
       }
-    }
-    return { ...formatProfile(p), friendshipStatus, friendshipId };
-  });
+      return { ...formatProfile(p, 0, 0, userId), friendshipStatus, friendshipId };
+    });
 
   return c.json({ data: results });
 });
