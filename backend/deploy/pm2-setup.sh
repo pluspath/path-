@@ -35,10 +35,16 @@ else
   pm2 start ecosystem.config.cjs
 fi
 
-pm2 save
+pm2 save --force
 
-echo "==> Enable start on server reboot (run the command PM2 prints if first time)"
-pm2 startup || true
+echo "==> Enable start on server reboot"
+if [[ "$(id -u)" -eq 0 ]]; then
+  bash "$ROOT/deploy/enable-boot.sh"
+else
+  echo "  Not root — run once as root to survive reboots:"
+  echo "    sudo bash deploy/enable-boot.sh"
+  pm2 startup || true
+fi
 
 echo ""
 echo "Status:"
@@ -51,4 +57,5 @@ echo "Useful commands:"
 echo "  pm2 status"
 echo "  pm2 logs"
 echo "  pm2 restart all --update-env"
-echo "  pm2 save"
+echo "  pm2 save --force"
+echo "  sudo bash deploy/enable-boot.sh   # one-time: auto-start after reboot"

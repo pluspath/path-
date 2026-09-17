@@ -26,12 +26,17 @@ Nginx proxies:
 | A | `api` | your VPS public IP |
 | A | `admin` | your VPS public IP |
 
-## 2. Apps (PM2)
+## 2. Apps (PM2) + auto-start on reboot
 
 ```bash
 cd /path/to/backend
 bash deploy/pm2-setup.sh
+# One-time (as root) — restores API + Admin after a full server reboot:
+sudo bash deploy/enable-boot.sh
 ```
+
+This enables nginx via systemd and registers PM2 (`pm2 save` + `pm2 startup`) so
+`pathplus-api` (:3000) and `pathplus-admin` (:3001) come back after reboot.
 
 ## 3. Nginx + SSL
 
