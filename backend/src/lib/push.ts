@@ -572,7 +572,8 @@ export async function sendPushToUser(
   userId: string,
   title: string,
   body: string,
-  data?: Record<string, unknown>
+  data?: Record<string, unknown>,
+  opts?: { badge?: number }
 ): Promise<void> {
   try {
     const tokens = await getPushTokensForUser(client, userId);
@@ -580,7 +581,11 @@ export async function sendPushToUser(
       console.log(`[push] No active tokens for user ${userId.slice(0, 8)}… — skipped`);
       return;
     }
-    const badge = await getUnreadNotificationBadgeCount(client, userId);
+    // Optional badge override skips the unread COUNT round-trip.
+    const badge =
+      typeof opts?.badge === "number" && Number.isFinite(opts.badge)
+        ? Math.max(1, Math.min(99, Math.floor(opts.badge)))
+        : await getUnreadNotificationBadgeCount(client, userId);
     console.log(
       `[push] Sending "${title}" to user ${userId.slice(0, 8)}… (${tokens.length} device(s), badge=${badge})`
     );

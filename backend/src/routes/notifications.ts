@@ -7,6 +7,7 @@ import {
   sendPushNotificationDetailed,
 } from "../lib/push";
 import { resolveAvatarUrl } from "../lib/avatar";
+import { parseLimit, parseCursor, encodeCursor } from "../lib/pagination";
 import type { HonoVariables } from "../types";
 
 const notificationsRouter = new Hono<{ Variables: HonoVariables }>();
@@ -96,23 +97,52 @@ notificationsRouter.get("/", async (c) => {
   const token = c.get("accessToken");
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
-  const { data: rawNotifications } = await supabaseAdmin
+  const limit = parseLimit(c.req.query("limit"), 20, 50);
+  const cursor = parseCursor(c.req.query("cursor"));
+  // Over-fetch a bit — ping/message + blocked filters drop rows after the query.
+  const fetchLimit = Math.min(limit * 3 + 10, 150);
+
+  let notifQuery = supabaseAdmin
     .from("notifications")
     .select("*")
     .eq("user_id", userId)
     .order("created_at", { ascending: false })
-    .limit(120);
+    .limit(fetchLimit);
+  if (cursor?.createdAt) {
+    notifQuery = notifQuery.lt("created_at", cursor.createdAt);
+  }
+
+  const { data: rawNotifications } = await notifQuery;
 
   // Hide notifications originating from a blocked user (either direction).
   const blockedSet = new Set(await getBlockedIds(userId));
-  const notifications = (rawNotifications ?? []).filter(
+  let notifications = (rawNotifications ?? []).filter(
     (n: any) =>
       (!n.from_user_id || !blockedSet.has(n.from_user_id)) &&
       n.type !== "ping" &&
       n.type !== "message"
   );
 
-  const fromUserIds = [...new Set((notifications ?? []).map((n: any) => n.from_user_id).filter(Boolean))];
+  // Id tiebreak when cursor includes `|id`.
+  if (cursor?.id) {
+    notifications = notifications.filter((n: any) => {
+      const t = new Date(n.created_at).getTime();
+      const ct = new Date(cursor.createdAt).getTime();
+      if (t < ct) return true;
+      if (t > ct) return false;
+      return String(n.id) < cursor.id!;
+    });
+  }
+
+  const hasMore = notifications.length > limit;
+  const page = hasMore ? notifications.slice(0, limit) : notifications;
+  const last = page.length > 0 ? page[page.length - 1] : null;
+  const nextCursor =
+    hasMore && last?.created_at
+      ? encodeCursor(String(last.created_at), String(last.id ?? ""))
+      : null;
+
+  const fromUserIds = [...new Set(page.map((n: any) => n.from_user_id).filter(Boolean))];
   let profileMap: Record<string, any> = {};
   if (fromUserIds.length > 0) {
     const { data: profiles } = await supabaseAdmin.from("profiles").select("*").in("id", fromUserIds as string[]);
@@ -120,7 +150,7 @@ notificationsRouter.get("/", async (c) => {
   }
 
   // For friend_request notifications, fetch friendship IDs in one query.
-  const friendRequestNotifs = (notifications ?? []).filter((n: any) => n.type === "friend_request");
+  const friendRequestNotifs = page.filter((n: any) => n.type === "friend_request");
   let friendshipMap: Record<string, string> = {};
   if (friendRequestNotifs.length > 0) {
     const requesterIds = [
@@ -138,15 +168,14 @@ notificationsRouter.get("/", async (c) => {
         byRequester[fs.requester_id] = fs.id;
       }
       for (const n of friendRequestNotifs) {
-        if (n.from_user_id && byRequester[n.from_user_id]) {
-          friendshipMap[n.id] = byRequester[n.from_user_id];
-        }
+        const fid = n.from_user_id ? byRequester[n.from_user_id] : undefined;
+        if (fid) friendshipMap[n.id] = fid;
       }
     }
   }
 
   return c.json({
-    data: (notifications ?? []).map((n: any) => ({
+    data: page.map((n: any) => ({
       id: n.id,
       type: n.type,
       user: n.from_user_id && profileMap[n.from_user_id]
@@ -167,6 +196,9 @@ notificationsRouter.get("/", async (c) => {
       read: n.read,
       createdAt: n.created_at,
     })),
+    nextCursor,
+    hasMore,
+    limit,
   });
 });
 

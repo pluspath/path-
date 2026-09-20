@@ -208,6 +208,12 @@ app.get("/__marketing", (c) =>
         `DO $$ BEGIN
           ALTER PUBLICATION supabase_realtime ADD TABLE public.conversation_participants;
         EXCEPTION WHEN duplicate_object THEN NULL; END $$;`,
+        `DO $$ BEGIN
+          ALTER PUBLICATION supabase_realtime ADD TABLE public.notifications;
+        EXCEPTION WHEN duplicate_object THEN NULL; END $$;`,
+        `DO $$ BEGIN
+          ALTER PUBLICATION supabase_realtime ADD TABLE public.friendships;
+        EXCEPTION WHEN duplicate_object THEN NULL; END $$;`,
         // Posts bucket: images + video + chat audio (voice/music DMs)
         `UPDATE storage.buckets SET file_size_limit = 52428800, allowed_mime_types = ARRAY['image/jpeg','image/jpg','image/png','image/webp','image/gif','video/mp4','video/quicktime','video/webm','audio/mpeg','audio/mp3','audio/mp4','audio/m4a','audio/aac','audio/wav','audio/webm','audio/x-m4a','audio/x-wav','audio/3gpp','audio/amr','audio/ogg'] WHERE id = 'Posts' OR name = 'Posts';`,
         // Critical posts RLS — fixes 42501 on POST /api/posts when policies were never applied
@@ -229,8 +235,14 @@ app.get("/__marketing", (c) =>
         "CREATE INDEX IF NOT EXISTS idx_posts_repath_of ON public.posts (repath_of) WHERE repath_of IS NOT NULL;",
         "CREATE INDEX IF NOT EXISTS idx_reactions_user ON public.reactions (user_id);",
         "CREATE INDEX IF NOT EXISTS idx_reactions_post ON public.reactions (post_id);",
+        "CREATE INDEX IF NOT EXISTS idx_reactions_user_created ON public.reactions (user_id, created_at DESC);",
         "CREATE INDEX IF NOT EXISTS idx_comments_user ON public.comments (user_id);",
         "CREATE INDEX IF NOT EXISTS idx_comments_post ON public.comments (post_id);",
+        "CREATE INDEX IF NOT EXISTS idx_comments_user_created ON public.comments (user_id, created_at DESC);",
+        "CREATE INDEX IF NOT EXISTS idx_comments_post_created ON public.comments (post_id, created_at ASC);",
+        "CREATE INDEX IF NOT EXISTS idx_notifications_user_unread ON public.notifications (user_id) WHERE read = false;",
+        "CREATE INDEX IF NOT EXISTS idx_friendships_receiver_status ON public.friendships (receiver_id, status);",
+        "CREATE INDEX IF NOT EXISTS idx_friendships_requester_status ON public.friendships (requester_id, status);",
         "CREATE INDEX IF NOT EXISTS idx_close_friends_friend ON public.close_friends (friend_id);",
         // Refresh PostgREST schema cache after column/policy changes
         "NOTIFY pgrst, 'reload schema';",

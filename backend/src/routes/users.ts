@@ -8,6 +8,7 @@ import { formatDuration } from "../lib/duration";
 import { upsertUserDevice, deactivateUserDevices, getPushTokensForUser, getPushStatusForUser, sendPushNotificationDetailed } from "../lib/push";
 import { isCustomAvatar, defaultAvatarForGender, resolveAvatarUrl, normalizeGender } from "../lib/avatar";
 import { isDeletionHiddenProfile } from "../lib/account-deletion";
+import { parseLimit, parseCursor, encodeCursor, isOlderThanCursor } from "../lib/pagination";
 import type { HonoVariables, Profile } from "../types";
 
 const usersRouter = new Hono<{ Variables: HonoVariables }>();
@@ -188,8 +189,12 @@ usersRouter.get("/search", async (c) => {
     .trim();
   if (q.length < 1) return c.json({ data: [] });
 
+  const limit = parseLimit(c.req.query("limit"), 20, 50);
+  const offset = Math.max(0, Number.parseInt(String(c.req.query("offset") ?? "0"), 10) || 0);
+
   // Use service role so RLS never blanks discovery (same as /friends/discover).
-  let profileQuery = supabaseAdmin.from("profiles").select("*").limit(40);
+  // Fetch limit+1 to detect hasMore (after block/deletion filters we may drop some).
+  let profileQuery = supabaseAdmin.from("profiles").select("*").range(offset, offset + limit);
   if (usernameMode) {
     profileQuery = profileQuery.ilike("username", `${q}%`);
   } else {
@@ -234,7 +239,9 @@ usersRouter.get("/search", async (c) => {
       return { ...formatProfile(p, 0, 0, userId), friendshipStatus, friendshipId };
     });
 
-  return c.json({ data: results });
+  const hasMore = (profiles ?? []).length > limit;
+  const page = hasMore ? results.slice(0, limit) : results;
+  return c.json({ data: page, hasMore, limit, offset, nextOffset: hasMore ? offset + limit : null });
 });
 
 // GET /api/by-username/:username
@@ -945,33 +952,51 @@ usersRouter.get("/:id/posts", async (c) => {
     if (!allowed) return c.json({ error: { message: "Moments are private" } }, 403);
   }
 
-  const limitRaw = Number(c.req.query("limit") ?? 50);
-  const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(Math.floor(limitRaw), 1), 100) : 50;
+  const limit = parseLimit(c.req.query("limit"), 50, 100);
+  const cursor = parseCursor(c.req.query("cursor"));
+  const offsetRaw = Number.parseInt(String(c.req.query("offset") ?? ""), 10);
+  const offset = Number.isFinite(offsetRaw) && offsetRaw > 0 ? offsetRaw : 0;
 
-  const { data: posts, error: postsErr } = await supabaseAdmin
-    .from("posts")
-    .select("*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(avatar_url, gender))")
-    .eq("user_id", id)
-    .order("created_at", { ascending: false })
-    .limit(limit);
+  const applyPaging = (q: any) => {
+    if (cursor?.createdAt) {
+      return q.lte("created_at", cursor.createdAt).limit(limit + 1);
+    }
+    if (offset > 0) {
+      // Inclusive range — fetch one extra row for hasMore.
+      return q.range(offset, offset + limit);
+    }
+    return q.limit(limit + 1);
+  };
+
+  let postsQuery = applyPaging(
+    supabaseAdmin
+      .from("posts")
+      .select("*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(avatar_url, gender))")
+      .eq("user_id", id)
+      .order("created_at", { ascending: false })
+  );
+
+  const { data: posts, error: postsErr } = await postsQuery;
 
   let all = posts ?? [];
   if (postsErr) {
     console.warn("[users/posts] nested select failed, retrying basic:", postsErr.message);
-    const { data: basic, error: basicErr } = await supabaseAdmin
-      .from("posts")
-      .select("*, profiles!user_id(*)")
-      .eq("user_id", id)
-      .order("created_at", { ascending: false })
-      .limit(limit);
-    all = basic ?? [];
-    if (basicErr || !basic) {
-      const { data: min, error: minErr } = await supabaseAdmin
+    const { data: basic, error: basicErr } = await applyPaging(
+      supabaseAdmin
         .from("posts")
-        .select("*")
+        .select("*, profiles!user_id(*)")
         .eq("user_id", id)
         .order("created_at", { ascending: false })
-        .limit(limit);
+    );
+    all = basic ?? [];
+    if (basicErr || !basic) {
+      const { data: min, error: minErr } = await applyPaging(
+        supabaseAdmin
+          .from("posts")
+          .select("*")
+          .eq("user_id", id)
+          .order("created_at", { ascending: false })
+      );
       if (minErr) console.error("[users/posts] query failed:", minErr.message);
       all = min ?? [];
       if (all.length > 0 && !all[0]?.profiles) {
@@ -981,6 +1006,12 @@ usersRouter.get("/:id/posts", async (c) => {
         for (const p of all) p.profiles = byId.get(p.user_id) ?? null;
       }
     }
+  }
+
+  if (cursor) {
+    all = all.filter((p: any) =>
+      isOlderThanCursor(String(p.created_at ?? ""), String(p.id ?? ""), cursor)
+    );
   }
 
   let visible = all;
@@ -1020,12 +1051,20 @@ usersRouter.get("/:id/posts", async (c) => {
     );
   }
 
-  const { attachOriginals } = await import("../lib/load-posts");
-  await attachOriginals(null, visible);
+  const hasMore = visible.length > limit;
+  const page = hasMore ? visible.slice(0, limit) : visible;
+  const last = page.length > 0 ? page[page.length - 1] : null;
+  const nextCursor =
+    hasMore && last?.created_at && last?.id
+      ? encodeCursor(String(last.created_at), String(last.id))
+      : null;
 
-  const formatted = visible.map((p) => formatPost(p, userId ?? undefined, blockedIds));
+  const { attachOriginals } = await import("../lib/load-posts");
+  await attachOriginals(null, page);
+
+  const formatted = page.map((p) => formatPost(p, userId ?? undefined, blockedIds));
   await refreshFriendshipAvatars(formatted);
-  return c.json({ data: formatted });
+  return c.json({ data: formatted, nextCursor, hasMore, limit });
 });
 
 export { usersRouter };

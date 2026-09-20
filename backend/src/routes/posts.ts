@@ -14,6 +14,12 @@ import {
   filterDeletionHiddenPosts,
   getDeletionHiddenUserIds,
 } from "../lib/account-deletion";
+import {
+  parseLimit,
+  parseCursor,
+  encodeCursor,
+  isOlderThanCursor,
+} from "../lib/pagination";
 import type { HonoVariables } from "../types";
 
 const postsRouter = new Hono<{ Variables: HonoVariables }>();
@@ -51,6 +57,10 @@ postsRouter.get("/", async (c) => {
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const userClient = createUserClient(token);
+  const limit = parseLimit(c.req.query("limit"), 20, 50);
+  const cursor = parseCursor(c.req.query("cursor"));
+  // Over-fetch so visibility/block filters still leave enough for one page.
+  const fetchLimit = Math.min(Math.max(limit * 2, limit + 10), 100);
 
   // Privacy: the home timeline shows ONLY the current user's own moments plus
   // moments from ACCEPTED (mutual) friends. Pending/requested relationships
@@ -90,23 +100,32 @@ postsRouter.get("/", async (c) => {
   });
 
   const friendIdSet = new Set(friendIds);
+
+  const buildFriendQuery = (select: string) => {
+    let q = supabaseAdmin
+      .from("posts")
+      .select(select)
+      .in("user_id", allowedUserIds)
+      .order("created_at", { ascending: false })
+      .limit(fetchLimit);
+    // lte + in-memory id tiebreak so same-timestamp rows aren't skipped.
+    if (cursor?.createdAt) q = q.lte("created_at", cursor.createdAt);
+    return q;
+  };
+  const buildPublicQuery = (select: string) => {
+    let q = supabaseAdmin
+      .from("posts")
+      .select(select)
+      .eq("audience", "public")
+      .order("created_at", { ascending: false })
+      .limit(fetchLimit);
+    if (cursor?.createdAt) q = q.lte("created_at", cursor.createdAt);
+    return q;
+  };
+
   const [friendFeed, publicFeed] = await Promise.all([
-    loadPosts((select) =>
-      supabaseAdmin
-        .from("posts")
-        .select(select)
-        .in("user_id", allowedUserIds)
-        .order("created_at", { ascending: false })
-        .limit(40)
-    ),
-    loadPosts((select) =>
-      supabaseAdmin
-        .from("posts")
-        .select(select)
-        .eq("audience", "public")
-        .order("created_at", { ascending: false })
-        .limit(20)
-    ),
+    loadPosts(buildFriendQuery),
+    loadPosts(buildPublicQuery),
   ]);
 
   const { data: posts, error: postsErr } = friendFeed;
@@ -127,16 +146,23 @@ postsRouter.get("/", async (c) => {
   for (const p of [...(posts ?? []), ...publicFromOthers]) {
     if (p?.id) mergedById.set(p.id, p);
   }
-  const allPosts = Array.from(mergedById.values()).sort(
+  let allPosts = Array.from(mergedById.values()).sort(
     (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
   );
+
+  // Id tiebreak when cursor includes `|id` (DB lt only filters created_at).
+  if (cursor) {
+    allPosts = allPosts.filter((p: any) =>
+      isOlderThanCursor(String(p.created_at ?? ""), String(p.id ?? ""), cursor)
+    );
+  }
 
   // Per-post audience enforcement. `whoStarredMe` = the set of authors who have
   // privately starred ME as a close friend (read with the admin client because
   // RLS hides other users' close_friends rows). A post with audience='close' is
   // delivered only to the author's starred close friends; 'private' is author-
   // only; everything else (incl. a missing `audience` column) behaves as today.
-  const visible = (allPosts ?? []).filter((p: any) => {
+  const visible = allPosts.filter((p: any) => {
     if (p.user_id === userId) return true; // my own moments always show
     const audience = p.audience ?? "friends";
     if (audience === "private") return false;
@@ -152,9 +178,17 @@ postsRouter.get("/", async (c) => {
   ]);
   const visibleAfterDeletion = filterDeletionHiddenPosts(visible, deletionHidden, userId);
 
-  const formatted = visibleAfterDeletion.map((p) => formatPost(p, userId ?? undefined, blockedIds));
+  const hasMore = visibleAfterDeletion.length > limit;
+  const page = hasMore ? visibleAfterDeletion.slice(0, limit) : visibleAfterDeletion;
+  const last = page.length > 0 ? page[page.length - 1] : null;
+  const nextCursor =
+    hasMore && last?.created_at && last?.id
+      ? encodeCursor(String(last.created_at), String(last.id))
+      : null;
+
+  const formatted = page.map((p) => formatPost(p, userId ?? undefined, blockedIds));
   await refreshFriendshipAvatars(formatted); // always show friends' CURRENT avatars
-  return c.json({ data: formatted });
+  return c.json({ data: formatted, nextCursor, hasMore, limit });
 });
 
 // Matches #hashtag tokens: latin + accented + Arabic letters, digits, underscore.
@@ -248,7 +282,10 @@ postsRouter.get("/hashtag/:tag", async (c) => {
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const normalized = (c.req.param("tag") ?? "").replace(/^#+/, "").trim().toLowerCase();
-  if (!normalized) return c.json({ data: [] });
+  if (!normalized) return c.json({ data: [], nextCursor: null, hasMore: false, limit: 20 });
+
+  const limit = parseLimit(c.req.query("limit"), 20, 50);
+  const cursor = parseCursor(c.req.query("cursor"));
 
   const userClient = createUserClient(token);
   const blockedIds = await getBlockedIds(userId);
@@ -257,24 +294,43 @@ postsRouter.get("/hashtag/:tag", async (c) => {
     (id) => id === userId || !blockedSet.has(id)
   );
 
-  // Candidate fetch: same privacy boundary + a cheap content prefilter. The
-  // exact token match happens in JS so "#foo" never matches "#foobar".
-  const { data: posts } = await loadPosts((select) =>
-    supabaseAdmin
+  // Over-fetch candidates — exact token match + cursor filter happen in JS.
+  const fetchLimit = Math.min(Math.max(limit * 4, 40), 200);
+
+  const { data: posts } = await loadPosts((select) => {
+    let q = supabaseAdmin
       .from("posts")
       .select(select)
       .in("user_id", allowedUserIds)
       .ilike("content", `%#${normalized}%`)
       .order("created_at", { ascending: false })
-      .limit(200)
-  );
+      .limit(fetchLimit);
+    if (cursor?.createdAt) q = q.lt("created_at", cursor.createdAt);
+    return q;
+  });
 
-  const matching = (posts ?? []).filter((p: any) =>
-    extractHashtags(p.content).includes(normalized)
-  );
-  await attachOriginals(userClient, matching);
+  const matching = (posts ?? []).filter((p: any) => {
+    if (!extractHashtags(p.content).includes(normalized)) return false;
+    if (!cursor) return true;
+    return isOlderThanCursor(String(p.created_at), String(p.id), cursor);
+  });
 
-  return c.json({ data: matching.map((p) => formatPost(p, userId ?? undefined, blockedIds)) });
+  const hasMore = matching.length > limit;
+  const page = hasMore ? matching.slice(0, limit) : matching;
+  await attachOriginals(userClient, page);
+
+  const last = page[page.length - 1];
+  const nextCursor =
+    hasMore && last?.created_at && last?.id
+      ? encodeCursor(String(last.created_at), String(last.id))
+      : null;
+
+  return c.json({
+    data: page.map((p) => formatPost(p, userId ?? undefined, blockedIds)),
+    nextCursor,
+    hasMore,
+    limit,
+  });
 });
 
 // Collect post ids the user has interacted with: reactions, comments, and
@@ -588,7 +644,7 @@ postsRouter.post("/", async (c) => {
           notificationId = inserted?.id;
         }
 
-        await sendPushToUser(
+        void sendPushToUser(
           supabaseAdmin,
           originalOwnerId,
           "New Repath",
@@ -913,7 +969,7 @@ postsRouter.post("/:id/reactions", async (c) => {
         read: false,
       }).select("id").single();
 
-      await sendPushToUser(
+      void sendPushToUser(
         supabaseAdmin,
         postOwner.user_id,
         isSheep ? "New Sheep" : "New Reaction",
@@ -1102,6 +1158,10 @@ postsRouter.get("/:id/comments", async (c) => {
   if (!user) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const { id } = c.req.param();
+  const limit = parseLimit(c.req.query("limit"), 30, 100);
+  // `before` / `cursor` = load older comments (exclusive). First page = newest.
+  const beforeRaw = c.req.query("before") ?? c.req.query("cursor");
+  const beforeCursor = parseCursor(beforeRaw);
 
   const { data: postRow } = await supabaseAdmin
     .from("posts")
@@ -1113,15 +1173,29 @@ postsRouter.get("/:id/comments", async (c) => {
 
   const whoStarredMe = userId ? await getWhoStarredMe(userId) : new Set<string>();
 
-  const { data: comments, error } = await supabaseAdmin
+  // Newest-first fetch (limit+1), then reverse to ascending for display.
+  let commentsQuery = supabaseAdmin
     .from("comments")
     .select("id, post_id, user_id, content, created_at, profiles:user_id(id, full_name, avatar_url, gender)")
     .eq("post_id", id)
-    .order("created_at", { ascending: true });
+    .order("created_at", { ascending: false })
+    .limit(limit + 1);
+  if (beforeCursor?.createdAt) {
+    commentsQuery = commentsQuery.lte("created_at", beforeCursor.createdAt);
+  }
+
+  const { data: commentsNewestFirst, error } = await commentsQuery;
 
   if (error) {
     console.error("Get comments error:", error);
     return c.json({ error: { message: "Failed to fetch comments" } }, 500);
+  }
+
+  let candidates = commentsNewestFirst ?? [];
+  if (beforeCursor) {
+    candidates = candidates.filter((comment: any) =>
+      isOlderThanCursor(String(comment.created_at ?? ""), String(comment.id ?? ""), beforeCursor)
+    );
   }
 
   const blockedSet = userId ? new Set(await getBlockedIds(userId)) : null;
@@ -1135,7 +1209,7 @@ postsRouter.get("/:id/comments", async (c) => {
   }
 
   const visibleComments: any[] = [];
-  for (const comment of comments ?? []) {
+  for (const comment of candidates) {
     if (blockedSet?.has(comment.user_id)) continue;
     if (!userId) continue;
     if (userId === postRow.user_id || userId === comment.user_id) {
@@ -1155,7 +1229,17 @@ postsRouter.get("/:id/comments", async (c) => {
     if (friendsOk) visibleComments.push(comment);
   }
 
-  const formatted = visibleComments.map((comment: any) => ({
+  const hasMore = visibleComments.length > limit;
+  const pageNewestFirst = hasMore ? visibleComments.slice(0, limit) : visibleComments;
+  // Ascending within the page (oldest → newest) for CommentsSheet.
+  const page = pageNewestFirst.slice().reverse();
+  const oldest = page.length > 0 ? page[0] : null;
+  const nextCursor =
+    hasMore && oldest?.created_at && oldest?.id
+      ? encodeCursor(String(oldest.created_at), String(oldest.id))
+      : null;
+
+  const formatted = page.map((comment: any) => ({
     id: comment.id,
     postId: comment.post_id,
     userId: comment.user_id,
@@ -1172,7 +1256,7 @@ postsRouter.get("/:id/comments", async (c) => {
     },
   }));
 
-  return c.json({ data: formatted });
+  return c.json({ data: formatted, nextCursor, hasMore, limit });
 });
 
 postsRouter.post("/:id/comments", async (c) => {
@@ -1239,7 +1323,7 @@ postsRouter.post("/:id/comments", async (c) => {
         read: false,
       }).select("id").single();
 
-      await sendPushToUser(
+      void sendPushToUser(
         supabaseAdmin,
         postOwner.user_id,
         "New Comment",
@@ -1273,9 +1357,8 @@ postsRouter.post("/:id/comments", async (c) => {
     },
   };
 
-  // Notify anyone @mentioned in the comment text. post_id points at the moment
-  // so tapping the notification opens the moment showing this comment.
-  await notifyMentions({
+  // Mentions (resolve + push) — don't hold the comment response.
+  void notifyMentions({
     authorId: userId,
     authorName: user.full_name,
     content: comment.content,

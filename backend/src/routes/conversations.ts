@@ -298,20 +298,15 @@ conversationsRouter.get("/", async (c) => {
     ];
 
     // One newest message per conversation + profiles + unread in parallel.
-    const [lastMsgResults, profilesResult, unreadByConv] = await Promise.all([
-      Promise.all(
-        visibleIds.map((convId: string) =>
-          db
-            .from("messages")
-            .select("id, conversation_id, content, created_at, sender_id, type")
-            .eq("conversation_id", convId)
-            .order("created_at", { ascending: false })
-            .limit(1)
-            .maybeSingle()
-            .then((r: { data: any }) => r.data)
-            .catch(() => null)
-        )
-      ),
+    // Batch last messages (avoid N+1 per conversation).
+    const msgLimit = Math.min(Math.max(visibleIds.length * 40, 40), 800);
+    const [lastMsgsResult, profilesResult, unreadByConv] = await Promise.all([
+      db
+        .from("messages")
+        .select("id, conversation_id, content, created_at, sender_id, type")
+        .in("conversation_id", visibleIds)
+        .order("created_at", { ascending: false })
+        .limit(msgLimit),
       otherUserIds.length > 0
         ? db
             .from("profiles")
@@ -335,8 +330,10 @@ conversationsRouter.get("/", async (c) => {
     for (const p of profiles ?? []) profilesById[p.id] = formatProfile(p);
 
     const lastMsgByConv: Record<string, any> = {};
-    for (const m of lastMsgResults) {
-      if (m?.conversation_id) lastMsgByConv[m.conversation_id] = m;
+    for (const m of lastMsgsResult.data ?? []) {
+      if (m?.conversation_id && !lastMsgByConv[m.conversation_id]) {
+        lastMsgByConv[m.conversation_id] = m;
+      }
     }
 
     const result = visibleConversations.map((conv: any) => {
@@ -424,13 +421,17 @@ conversationsRouter.get("/:id", async (c) => {
     .select("*")
     .eq("conversation_id", id)
     .order("created_at", { ascending: false })
-    .limit(limit);
+    .limit(limit + 1);
   if (before) msgQuery = msgQuery.lt("created_at", before);
 
   const { data: newestFirst } = await msgQuery;
-  const msgs = (newestFirst ?? []).slice().reverse();
+  const hasMore = (newestFirst ?? []).length > limit;
+  const pageNewestFirst = hasMore ? (newestFirst ?? []).slice(0, limit) : (newestFirst ?? []);
+  const msgs = pageNewestFirst.slice().reverse();
 
   const last = msgs.length > 0 ? msgs[msgs.length - 1] : null;
+  const oldest = msgs.length > 0 ? msgs[0] : null;
+  const nextBefore = hasMore && oldest?.created_at ? String(oldest.created_at) : null;
   const mapped = await attachReplyPreviews(db, msgs.map((m: any) => mapMessage(m)), msgs);
 
   return c.json({
@@ -442,6 +443,10 @@ conversationsRouter.get("/:id", async (c) => {
       unreadCount: 0,
       otherLastReadAt,
       messages: mapped,
+      hasMore,
+      nextBefore,
+      nextCursor: nextBefore,
+      limit,
     },
   });
 });

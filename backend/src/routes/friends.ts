@@ -497,7 +497,7 @@ friendsRouter.post("/request/:userId", async (c) => {
       read: false,
     }).select("id").single();
 
-    await sendPushToUser(
+    void sendPushToUser(
       supabaseAdmin,
       targetId,
       "Friend Request",
@@ -552,7 +552,7 @@ friendsRouter.post("/accept/:id", async (c) => {
       read: false,
     }).select("id").single();
 
-    await sendPushToUser(
+    void sendPushToUser(
       supabaseAdmin,
       friendship.requester_id,
       "Friend Request Accepted",
@@ -584,7 +584,7 @@ friendsRouter.post("/accept/:id", async (c) => {
       read: false,
     }).select("id").single();
 
-    await sendPushToUser(
+    void sendPushToUser(
       supabaseAdmin,
       userId,
       "New Friend",
