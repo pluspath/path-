@@ -370,68 +370,197 @@ conversationsRouter.get("/:id", async (c) => {
   // Always use service role for chat reads so both participants can open the
   // same conversation even when RLS on participants is incomplete.
   const db = supabaseAdmin;
-
   const { id } = c.req.param();
 
-  // Security: caller must be a participant (based on JWT userId, not a profile row).
+  // Security + my read cursor in one round-trip.
   const { data: participation } = await db
     .from("conversation_participants")
-    .select("user_id")
+    .select("user_id, last_read_at")
     .eq("conversation_id", id)
     .eq("user_id", userId)
     .maybeSingle();
 
   if (!participation) return c.json({ error: { message: "Not found" } }, 404);
+  const myLastReadAt: string | null = participation.last_read_at ?? null;
 
-  const { data: conv } = await db.from("conversations").select("*").eq("id", id).single();
+  const rawLimit = Number(c.req.query("limit") ?? 40);
+  const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.floor(rawLimit), 1), 100) : 40;
+  const before = c.req.query("before"); // older page (exclusive upper bound)
+  const after = c.req.query("after"); // newer page (exclusive lower bound)
+
+  const findFirstUnread = async (): Promise<{ id: string; created_at: string } | null> => {
+    let q = db
+      .from("messages")
+      .select("id, created_at")
+      .eq("conversation_id", id)
+      .neq("sender_id", userId)
+      .order("created_at", { ascending: true })
+      .limit(1);
+    if (myLastReadAt) q = q.gt("created_at", myLastReadAt);
+    const { data } = await q;
+    return (data?.[0] as { id: string; created_at: string } | undefined) ?? null;
+  };
+
+  type MsgPage = {
+    msgs: any[];
+    hasMore: boolean;
+    hasMoreNewer: boolean;
+    firstUnreadMessageId: string | null;
+    unreadCount: number;
+  };
+
+  const loadAfterPage = async (): Promise<MsgPage> => {
+    const { data } = await db
+      .from("messages")
+      .select("*")
+      .eq("conversation_id", id)
+      .gt("created_at", after!)
+      .order("created_at", { ascending: true })
+      .limit(limit + 1);
+    const rows = data ?? [];
+    const hasMoreNewer = rows.length > limit;
+    return {
+      msgs: hasMoreNewer ? rows.slice(0, limit) : rows,
+      hasMore: false,
+      hasMoreNewer,
+      firstUnreadMessageId: null,
+      unreadCount: 0,
+    };
+  };
+
+  const loadBeforePage = async (): Promise<MsgPage> => {
+    const { data } = await db
+      .from("messages")
+      .select("*")
+      .eq("conversation_id", id)
+      .lt("created_at", before!)
+      .order("created_at", { ascending: false })
+      .limit(limit + 1);
+    const newestFirst = data ?? [];
+    const hasMore = newestFirst.length > limit;
+    const pageNewestFirst = hasMore ? newestFirst.slice(0, limit) : newestFirst;
+    return {
+      msgs: pageNewestFirst.slice().reverse(),
+      hasMore,
+      hasMoreNewer: false,
+      firstUnreadMessageId: null,
+      unreadCount: 0,
+    };
+  };
+
+  const loadUnreadForward = async (
+    firstUnread: { id: string; created_at: string }
+  ): Promise<MsgPage> => {
+    const [{ data: forward }, olderCheck, countRes] = await Promise.all([
+      db
+        .from("messages")
+        .select("*")
+        .eq("conversation_id", id)
+        .gte("created_at", firstUnread.created_at)
+        .order("created_at", { ascending: true })
+        .limit(limit + 1),
+      db
+        .from("messages")
+        .select("id")
+        .eq("conversation_id", id)
+        .lt("created_at", firstUnread.created_at)
+        .limit(1)
+        .maybeSingle(),
+      (async () => {
+        let countQuery = db
+          .from("messages")
+          .select("id", { count: "exact", head: true })
+          .eq("conversation_id", id)
+          .neq("sender_id", userId);
+        if (myLastReadAt) countQuery = countQuery.gt("created_at", myLastReadAt);
+        return countQuery;
+      })(),
+    ]);
+    const rows = forward ?? [];
+    const hasMoreNewer = rows.length > limit;
+    return {
+      msgs: hasMoreNewer ? rows.slice(0, limit) : rows,
+      hasMore: !!olderCheck.data,
+      hasMoreNewer,
+      firstUnreadMessageId: firstUnread.id,
+      unreadCount: countRes.count ?? 0,
+    };
+  };
+
+  const loadNewestPage = async (): Promise<MsgPage> => {
+    const { data: newestFirst } = await db
+      .from("messages")
+      .select("*")
+      .eq("conversation_id", id)
+      .order("created_at", { ascending: false })
+      .limit(limit + 1);
+    const rows = newestFirst ?? [];
+    const hasMore = rows.length > limit;
+    const pageNewestFirst = hasMore ? rows.slice(0, limit) : rows;
+    return {
+      msgs: pageNewestFirst.slice().reverse(),
+      hasMore,
+      hasMoreNewer: false,
+      firstUnreadMessageId: null,
+      unreadCount: 0,
+    };
+  };
+
+  // Batch 1: conversation + other participants (+ first-unread or paginated messages).
+  const [convResult, othersResult, batch1] = await Promise.all([
+    db.from("conversations").select("*").eq("id", id).single(),
+    db
+      .from("conversation_participants")
+      .select("user_id, last_read_at")
+      .eq("conversation_id", id)
+      .neq("user_id", userId),
+    after
+      ? loadAfterPage()
+      : before
+        ? loadBeforePage()
+        : findFirstUnread(),
+  ]);
+
+  const conv = convResult.data;
   if (!conv) return c.json({ error: { message: "Not found" } }, 404);
 
-  // Other participant(s): grab their last_read_at so the client can render
-  // read receipts ("Read" under a sent message once they've read past it).
-  const { data: participants } = await db
-    .from("conversation_participants")
-    .select("user_id, last_read_at")
-    .eq("conversation_id", id)
-    .neq("user_id", userId);
-
-  const otherUserId = participants?.[0]?.user_id;
-  // For 1:1 this is the single other person; designed so group chats can later
-  // take the MIN across all others ("Read by ALL").
+  const participants = othersResult.data ?? [];
+  const otherUserId = participants[0]?.user_id;
   const otherLastReadAt =
-    (participants ?? []).reduce<string | null>((min, p: any) => {
+    participants.reduce<string | null>((min, p: any) => {
       const v = p.last_read_at ?? null;
-      if (v === null) return null; // someone hasn't read => not "read by all"
+      if (v === null) return null;
       if (min === undefined) return v;
       return min === null ? null : v < min ? v : min;
     }, undefined as any) ?? null;
 
-  let otherUser = null;
-  if (otherUserId) {
-    const { data: profile } = await db.from("profiles").select("*").eq("id", otherUserId).single();
+  // Batch 2: profile + initial message window (when not already paginating).
+  const profilePromise = otherUserId
+    ? db.from("profiles").select("*").eq("id", otherUserId).single()
+    : Promise.resolve({ data: null });
+
+  let msgPage: MsgPage;
+  let otherUser: ReturnType<typeof formatProfile> | null = null;
+  if (after || before) {
+    msgPage = batch1 as MsgPage;
+    const { data: profile } = await profilePromise;
     otherUser = profile ? formatProfile(profile) : null;
+  } else {
+    const firstUnread = batch1 as { id: string; created_at: string } | null;
+    const [profileResult, page] = await Promise.all([
+      profilePromise,
+      firstUnread ? loadUnreadForward(firstUnread) : loadNewestPage(),
+    ]);
+    msgPage = page;
+    otherUser = profileResult.data ? formatProfile(profileResult.data) : null;
   }
 
-  // Paginate: newest page first (default 100), then reverse to chronological.
-  const rawLimit = Number(c.req.query("limit") ?? 100);
-  const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.floor(rawLimit), 1), 200) : 100;
-  const before = c.req.query("before"); // ISO timestamp cursor (exclusive)
-
-  let msgQuery = db
-    .from("messages")
-    .select("*")
-    .eq("conversation_id", id)
-    .order("created_at", { ascending: false })
-    .limit(limit + 1);
-  if (before) msgQuery = msgQuery.lt("created_at", before);
-
-  const { data: newestFirst } = await msgQuery;
-  const hasMore = (newestFirst ?? []).length > limit;
-  const pageNewestFirst = hasMore ? (newestFirst ?? []).slice(0, limit) : (newestFirst ?? []);
-  const msgs = pageNewestFirst.slice().reverse();
-
+  const { msgs, hasMore, hasMoreNewer, firstUnreadMessageId, unreadCount } = msgPage;
   const last = msgs.length > 0 ? msgs[msgs.length - 1] : null;
   const oldest = msgs.length > 0 ? msgs[0] : null;
+  const newest = last;
   const nextBefore = hasMore && oldest?.created_at ? String(oldest.created_at) : null;
+  const nextAfter = hasMoreNewer && newest?.created_at ? String(newest.created_at) : null;
   const mapped = await attachReplyPreviews(db, msgs.map((m: any) => mapMessage(m)), msgs);
 
   return c.json({
@@ -440,11 +569,15 @@ conversationsRouter.get("/:id", async (c) => {
       user: otherUser ?? emptyUser(),
       lastMessage: last ? messagePreview(last.type, last.content) : "",
       lastMessageTime: conv.updated_at,
-      unreadCount: 0,
+      unreadCount,
+      myLastReadAt,
+      firstUnreadMessageId,
       otherLastReadAt,
       messages: mapped,
       hasMore,
+      hasMoreNewer,
       nextBefore,
+      nextAfter,
       nextCursor: nextBefore,
       limit,
     },
