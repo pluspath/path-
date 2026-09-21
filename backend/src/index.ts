@@ -36,11 +36,31 @@ import {
 import type { HonoVariables } from "./types";
 import { existsSync, readFileSync } from "fs";
 import { join, resolve } from "path";
+import { generateDefaultAvatarPng } from "./lib/default-avatar-gen";
 
 const app = new Hono<{ Variables: HonoVariables }>();
 
-// Shared stylized default avatars (public, long-cache). Used when a user has
-// not uploaded a custom profile photo. Files live in backend/public/default-avatars/.
+// Seed-generated stylized defaults (creative / varied — same idea as DiceBear).
+// GET /static/default-avatars/gen/:seed.png
+app.get("/static/default-avatars/gen/:seed", (c) => {
+  let seed = c.req.param("seed") ?? "user";
+  if (/\.png$/i.test(seed)) seed = seed.replace(/\.png$/i, "");
+  try {
+    seed = decodeURIComponent(seed);
+  } catch {
+    /* keep raw */
+  }
+  seed = seed.slice(0, 128) || "user";
+  const png = generateDefaultAvatarPng(seed);
+  return new Response(png, {
+    headers: {
+      "Content-Type": "image/png",
+      "Cache-Control": "public, max-age=31536000, immutable",
+    },
+  });
+});
+
+// Legacy fixed crops (kept for any already-persisted URLs during transition).
 const DEFAULT_AVATARS_DIR = resolve(import.meta.dir, "../public/default-avatars");
 app.get("/static/default-avatars/:name", (c) => {
   const name = c.req.param("name") ?? "";

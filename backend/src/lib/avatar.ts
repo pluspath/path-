@@ -1,9 +1,6 @@
 import { supabaseAdmin } from "../supabase";
 import { env } from "../env";
 
-/** How many stylized default photos are served from /static/default-avatars/. */
-export const DEFAULT_AVATAR_COUNT = 8;
-
 export type ProfileGender = "Male" | "Female";
 
 export function normalizeGender(gender: unknown): ProfileGender | null {
@@ -16,37 +13,30 @@ export function normalizeGender(gender: unknown): ProfileGender | null {
   return null;
 }
 
-function stableIndex(seed: string, count: number): number {
-  let h = 2166136261;
-  for (let i = 0; i < seed.length; i++) {
-    h ^= seed.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return Math.abs(h) % count;
-}
-
 function backendPublicBase(): string {
   return String(env.BACKEND_URL || "https://api.pathplus.store").replace(/\/+$/, "");
 }
 
 /**
- * True when the URL is one of Path+'s shared default avatar assets
- * (DiceBear legacy OR the new stylized /static/default-avatars/* set).
+ * True when the URL is a Path+ / legacy generated default (not a user upload).
+ *
+ * Covered:
+ * - empty / null
+ * - DiceBear (any style — legacy cartoon faces OR any old defaults)
+ * - Fixed cropped files from an earlier migration (`/static/default-avatars/01.jpg`)
+ * - Seed-generated stylized defaults (`/static/default-avatars/gen/<seed>.png`)
  */
 export function isKnownDefaultAvatarUrl(url: string | null | undefined): boolean {
   if (!url || typeof url !== "string") return true;
   const trimmed = url.trim();
   if (!trimmed) return true;
   if (/dicebear\.com/i.test(trimmed)) return true;
-  if (/\/static\/default-avatars\/\d{2}\.(jpe?g|png|webp)/i.test(trimmed)) return true;
-  if (/\/default-avatars\/\d{2}\.(jpe?g|png|webp)/i.test(trimmed)) return true;
+  if (/\/static\/default-avatars\//i.test(trimmed)) return true;
+  if (/\/default-avatars\//i.test(trimmed)) return true;
   return false;
 }
 
-/**
- * True when the user uploaded (or otherwise set) a real profile photo.
- * Anything that is NOT a known app default is treated as custom — never overwrite.
- */
+/** True when the user uploaded a real profile photo — never overwrite these. */
 export function isCustomAvatar(url: string | null | undefined): boolean {
   if (!url || typeof url !== "string") return false;
   const trimmed = url.trim();
@@ -58,7 +48,7 @@ export function isDefaultAvatar(url: string | null | undefined): boolean {
   return !isCustomAvatar(url);
 }
 
-/** DiceBear SVG → PNG (legacy URLs that may still appear in caches). */
+/** DiceBear SVG → PNG for any leftover legacy URLs in caches. */
 export function ensureRasterAvatarUrl(url: string): string {
   const trimmed = url.trim();
   if (!/dicebear\.com/i.test(trimmed)) return trimmed;
@@ -66,23 +56,17 @@ export function ensureRasterAvatarUrl(url: string): string {
 }
 
 /**
- * Stable stylized default photo for a user (01.jpg … 08.jpg).
- * Gender is accepted for call-site compatibility but does not change the pick —
- * assignment is deterministic from user id only.
+ * Seed-generated stylized default (creative / varied), same pattern as DiceBear:
+ * stable user id → stable illustration URL.
  */
 export function defaultAvatarForGender(
   userId: string,
   _gender?: string | null
 ): string {
-  const id = String(userId || "user");
-  const index = stableIndex(id, DEFAULT_AVATAR_COUNT) + 1; // 1..N
-  const file = `${String(index).padStart(2, "0")}.jpg`;
-  return `${backendPublicBase()}/static/default-avatars/${file}`;
+  const id = encodeURIComponent(String(userId || "user"));
+  return `${backendPublicBase()}/static/default-avatars/gen/${id}.png`;
 }
 
-/**
- * Prefer a custom upload; otherwise return the assigned stylized default.
- */
 export function resolveAvatarUrl(
   userId: string,
   avatarUrl?: string | null,
@@ -92,10 +76,6 @@ export function resolveAvatarUrl(
   return defaultAvatarForGender(userId, gender);
 }
 
-/**
- * If the profile still has a default/empty avatar, persist the stylized
- * default. Never overwrites a manually uploaded photo.
- */
 export async function ensureGenderDefaultAvatar(
   userId: string,
   gender: string | null | undefined,
@@ -112,7 +92,6 @@ export async function ensureGenderDefaultAvatar(
   if (g) payload.gender = g;
 
   const { error } = await supabaseAdmin.from("profiles").update(payload).eq("id", userId);
-
   if (error) {
     console.error("[avatar] ensureGenderDefaultAvatar failed:", error.message);
     return currentAvatarUrl ?? null;
@@ -121,8 +100,8 @@ export async function ensureGenderDefaultAvatar(
 }
 
 /**
- * Boot-time backfill: replace empty / DiceBear / outdated default avatar URLs
- * with the new stylized set. NEVER touches custom uploads.
+ * Replace empty / DiceBear / old fixed defaults with seed-generated stylized
+ * avatars. NEVER touches custom uploads.
  */
 export async function backfillGenderAvatars(): Promise<{
   updated: number;
@@ -148,6 +127,10 @@ export async function backfillGenderAvatars(): Promise<{
       }
 
       const next = defaultAvatarForGender(p.id, p.gender);
+      // Already on the generative endpoint — leave alone.
+      if (typeof p.avatar_url === "string" && p.avatar_url.includes("/static/default-avatars/gen/")) {
+        if (p.avatar_url === next) continue;
+      }
       if (p.avatar_url === next) continue;
 
       const { error: updErr } = await supabaseAdmin
