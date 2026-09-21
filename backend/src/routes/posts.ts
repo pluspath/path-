@@ -24,6 +24,16 @@ import type { HonoVariables } from "../types";
 
 const postsRouter = new Hono<{ Variables: HonoVariables }>();
 
+/** Author payload for comment list / create / edit responses. */
+function formatCommentUser(userId: string, profile: any) {
+  return {
+    id: userId,
+    name: String(profile?.full_name ?? profile?.name ?? "").trim(),
+    username: String(profile?.username ?? "").trim(),
+    avatar: resolveAvatarUrl(userId, profile?.avatar_url, profile?.gender),
+  };
+}
+
 // The set of authors who have privately starred `viewerId` as a close friend.
 // Read with the admin client because RLS restricts `close_friends` rows to their
 // owner. Used to deliver audience='close' moments only to the author's starred
@@ -1105,20 +1115,22 @@ postsRouter.get("/:id/views", async (c) => {
   if (viewerIds.length > 0) {
     const { data: profs } = await supabaseAdmin
       .from("profiles")
-      .select("id, full_name, avatar_url, gender")
+      .select("id, full_name, username, avatar_url, gender")
       .in("id", viewerIds);
     profilesById = Object.fromEntries((profs ?? []).map((p: any) => [p.id, p]));
   }
 
-  const viewers = (views ?? []).map((v: any) => ({
-    userId: v.user_id,
-    userName: profilesById[v.user_id]?.full_name ?? "",
-    userAvatar: resolveAvatarUrl(
-      v.user_id,
-      profilesById[v.user_id]?.avatar_url,
-      profilesById[v.user_id]?.gender
-    ),
-  }));
+  const viewers = (views ?? []).map((v: any) => {
+    const p = profilesById[v.user_id];
+    const name = String(p?.full_name ?? "").trim();
+    const username = String(p?.username ?? "").trim();
+    return {
+      userId: v.user_id,
+      userName: name || username,
+      username,
+      userAvatar: resolveAvatarUrl(v.user_id, p?.avatar_url, p?.gender),
+    };
+  });
 
   return c.json({ data: { seenCount: viewers.length, friendTotal, viewers } });
 });
@@ -1176,7 +1188,7 @@ postsRouter.get("/:id/comments", async (c) => {
   // Newest-first fetch (limit+1), then reverse to ascending for display.
   let commentsQuery = supabaseAdmin
     .from("comments")
-    .select("id, post_id, user_id, content, created_at, profiles:user_id(id, full_name, avatar_url, gender)")
+    .select("id, post_id, user_id, content, created_at, profiles:user_id(id, full_name, username, avatar_url, gender)")
     .eq("post_id", id)
     .order("created_at", { ascending: false })
     .limit(limit + 1);
@@ -1245,15 +1257,7 @@ postsRouter.get("/:id/comments", async (c) => {
     userId: comment.user_id,
     content: comment.content,
     createdAt: comment.created_at,
-    user: {
-      id: comment.user_id,
-      name: comment.profiles?.full_name ?? "",
-      avatar: resolveAvatarUrl(
-        comment.user_id,
-        comment.profiles?.avatar_url,
-        comment.profiles?.gender
-      ),
-    },
+    user: formatCommentUser(comment.user_id, comment.profiles),
   }));
 
   return c.json({ data: formatted, nextCursor, hasMore, limit });
@@ -1306,7 +1310,7 @@ postsRouter.post("/:id/comments", async (c) => {
 
   const { data: profile } = await supabaseAdmin
     .from("profiles")
-    .select("id, full_name, avatar_url, gender")
+    .select("id, full_name, username, avatar_url, gender")
     .eq("id", userId)
     .single();
 
@@ -1346,15 +1350,7 @@ postsRouter.post("/:id/comments", async (c) => {
     userId: comment.user_id,
     content: comment.content,
     createdAt: comment.created_at,
-    user: {
-      id: userId,
-      name: (profile as any)?.full_name ?? "",
-      avatar: resolveAvatarUrl(
-        userId,
-        (profile as any)?.avatar_url,
-        (profile as any)?.gender
-      ),
-    },
+    user: formatCommentUser(userId, profile),
   };
 
   // Mentions (resolve + push) — don't hold the comment response.
@@ -1453,7 +1449,7 @@ postsRouter.patch("/:id/comments/:commentId", async (c) => {
     .from("comments")
     .update({ content })
     .eq("id", commentId)
-    .select("id, post_id, user_id, content, created_at, profiles:user_id(id, full_name, avatar_url, gender)")
+    .select("id, post_id, user_id, content, created_at, profiles:user_id(id, full_name, username, avatar_url, gender)")
     .single();
 
   if (updateError || !updated) {
@@ -1468,11 +1464,7 @@ postsRouter.patch("/:id/comments/:commentId", async (c) => {
     userId: u.user_id,
     content: u.content,
     createdAt: u.created_at,
-    user: {
-      id: u.user_id,
-      name: u.profiles?.full_name ?? "",
-      avatar: resolveAvatarUrl(u.user_id, u.profiles?.avatar_url, u.profiles?.gender),
-    },
+    user: formatCommentUser(u.user_id, u.profiles),
   };
 
   return c.json({ data: formatted });
