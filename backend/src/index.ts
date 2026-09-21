@@ -34,8 +34,28 @@ import {
   shouldPurgeDeletionAccount,
 } from "./lib/account-deletion";
 import type { HonoVariables } from "./types";
+import { existsSync, readFileSync } from "fs";
+import { join, resolve } from "path";
 
 const app = new Hono<{ Variables: HonoVariables }>();
+
+// Shared stylized default avatars (public, long-cache). Used when a user has
+// not uploaded a custom profile photo. Files live in backend/public/default-avatars/.
+const DEFAULT_AVATARS_DIR = resolve(import.meta.dir, "../public/default-avatars");
+app.get("/static/default-avatars/:name", (c) => {
+  const name = c.req.param("name") ?? "";
+  if (!/^\d{2}\.(jpe?g)$/i.test(name)) return c.notFound();
+  const normalized = name.replace(/\.jpeg$/i, ".jpg").toLowerCase();
+  const diskPath = join(DEFAULT_AVATARS_DIR, normalized);
+  if (!existsSync(diskPath)) return c.notFound();
+  const bytes = readFileSync(diskPath);
+  return new Response(bytes, {
+    headers: {
+      "Content-Type": "image/jpeg",
+      "Cache-Control": "public, max-age=31536000, immutable",
+    },
+  });
+});
 
 // Register public HTML pages immediately (before middleware) so they cannot be missed.
 registerMarketingPages(app);
@@ -323,7 +343,8 @@ app.get("/__marketing", (c) =>
   // Path+" moment as the oldest item on their timeline.
   await backfillJoinedPosts();
 
-  // Apply gender-matched default avatars for users who never uploaded a custom photo.
+  // Apply stylized default avatars for users who never uploaded a custom photo.
+  // Safe: skips every custom Supabase/upload URL; only empty + DiceBear + old defaults.
   await backfillGenderAvatars();
 
   // Purge accounts past the deletion grace window + send day-29 reminders, then every 6 hours.
