@@ -5,7 +5,7 @@ import { computeAge, computeZodiac } from "../lib/profileMeta";
 import { decodeImages } from "../lib/images";
 import { getBlockedIds } from "../lib/blocks";
 import { formatDuration } from "../lib/duration";
-import { upsertUserDevice, deactivateUserDevices, getPushTokensForUser, getPushStatusForUser, sendPushNotificationDetailed } from "../lib/push";
+import { upsertUserDevice, deactivateUserDevices, getPushTokensForUser, getPushStatusForUser, sendPushNotificationDetailed, getUnreadNotificationBadgeCount } from "../lib/push";
 import { isCustomAvatar, defaultAvatarForGender, resolveAvatarUrl, normalizeGender } from "../lib/avatar";
 import { isDeletionHiddenProfile } from "../lib/account-deletion";
 import { parseLimit, parseCursor, encodeCursor, isOlderThanCursor } from "../lib/pagination";
@@ -676,16 +676,17 @@ usersRouter.post("/me/push-test", async (c) => {
   console.log(`[push-test] User ${userId.slice(0, 8)}… requesting test push (${tokens.length} device(s))`);
 
   const results = await Promise.all(
-    tokens.map((token) =>
-      sendPushNotificationDetailed(
+    tokens.map(async (token) => {
+      const badge = await getUnreadNotificationBadgeCount(supabaseAdmin, userId);
+      return sendPushNotificationDetailed(
         token,
         "Path+ Test Notification",
         "Push Notifications are working correctly.",
         { type: "test" },
         supabaseAdmin,
-        { waitForReceipt: true }
-      )
-    )
+        { waitForReceipt: true, badge, userId }
+      );
+    })
   );
 
   const ok = results.some((r) => r.ok);

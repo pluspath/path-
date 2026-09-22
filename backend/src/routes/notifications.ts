@@ -5,6 +5,7 @@ import {
   getPushTokensForUser,
   getPushStatusForUser,
   sendPushNotificationDetailed,
+  getUnreadNotificationBadgeCount,
 } from "../lib/push";
 import { resolveAvatarUrl } from "../lib/avatar";
 import { parseLimit, parseCursor, encodeCursor } from "../lib/pagination";
@@ -63,16 +64,17 @@ notificationsRouter.post("/test", async (c) => {
   );
 
   const results = await Promise.all(
-    tokens.map((token) =>
-      sendPushNotificationDetailed(
+    tokens.map(async (token) => {
+      const badge = await getUnreadNotificationBadgeCount(supabaseAdmin, userId);
+      return sendPushNotificationDetailed(
         token,
         "Path+ Test Notification",
         "Push Notifications are working correctly.",
         { type: "test" },
         supabaseAdmin,
-        { waitForReceipt: true }
-      )
-    )
+        { waitForReceipt: true, badge, userId }
+      );
+    })
   );
 
   const ok = results.some((r) => r.ok);

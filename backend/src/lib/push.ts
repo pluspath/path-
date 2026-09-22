@@ -68,6 +68,7 @@ export function stringifyPushData(data?: Record<string, unknown>): Record<string
  * - interruptionLevel: "active" (NOT "passive" — passive = Notification Center only)
  * - Never set contentAvailable for normal alerts (that makes background/silent pushes)
  * - Ping uses a distinct category + custom sound (bundled as nudge.wav in the app)
+ * - badge must be the recipient's real unread total (APNs replaces the icon badge)
  */
 export function buildExpoPushMessage(
   pushToken: string,
@@ -82,7 +83,7 @@ export function buildExpoPushMessage(
   const isPing = type === "ping";
   const badge =
     typeof opts?.badge === "number" && Number.isFinite(opts.badge)
-      ? Math.max(1, Math.min(99, Math.floor(opts.badge)))
+      ? Math.max(0, Math.min(99, Math.floor(opts.badge)))
       : 1;
 
   const stringData = stringifyPushData({
@@ -111,25 +112,94 @@ export function buildExpoPushMessage(
   };
 }
 
-/** Unread in-app notifications — drives the iOS/Android app-icon badge on push. */
-export async function getUnreadNotificationBadgeCount(
-  client: any,
-  userId: string
-): Promise<number> {
+async function countUnreadNotifications(client: any, userId: string): Promise<number> {
   try {
     const { count, error } = await client
       .from("notifications")
       .select("id", { count: "exact", head: true })
       .eq("user_id", userId)
       .eq("read", false);
-    if (error) {
-      console.warn("[push] unread badge count failed:", error.message);
-      return 1;
-    }
-    return Math.max(1, count ?? 1);
-  } catch {
-    return 1;
+    if (!error && typeof count === "number") return count;
+
+    // Fallback when head-count is unavailable (some PostgREST configs).
+    const { data } = await client
+      .from("notifications")
+      .select("id")
+      .eq("user_id", userId)
+      .eq("read", false)
+      .limit(99);
+    return data?.length ?? 0;
+  } catch (e) {
+    console.warn("[push] unread notification count failed:", e);
+    return 0;
   }
+}
+
+/** Unread DMs (messages from others newer than last_read_at). */
+async function countUnreadDirectMessages(client: any, userId: string): Promise<number> {
+  try {
+    const { data: participations } = await client
+      .from("conversation_participants")
+      .select("conversation_id, last_read_at")
+      .eq("user_id", userId);
+    const parts = participations ?? [];
+    if (parts.length === 0) return 0;
+
+    const lastReadByConv: Record<string, string | null> = {};
+    const ids: string[] = [];
+    for (const p of parts) {
+      ids.push(p.conversation_id);
+      lastReadByConv[p.conversation_id] = p.last_read_at ?? null;
+    }
+
+    const lastReads = parts.map((p: any) => p.last_read_at).filter(Boolean) as string[];
+    const allHaveLastRead = lastReads.length === parts.length;
+    const minLastRead = allHaveLastRead
+      ? lastReads.reduce((a, b) => (a < b ? a : b))
+      : null;
+
+    let query = client
+      .from("messages")
+      .select("conversation_id, created_at")
+      .in("conversation_id", ids)
+      .neq("sender_id", userId);
+    if (minLastRead) query = query.gt("created_at", minLastRead);
+
+    const { data: rows } = await query;
+    let total = 0;
+    for (const m of rows ?? []) {
+      const lastRead = lastReadByConv[m.conversation_id as string];
+      if (!lastRead || m.created_at > lastRead) total += 1;
+    }
+    return total;
+  } catch (e) {
+    console.warn("[push] unread DM count failed:", e);
+    return 0;
+  }
+}
+
+/**
+ * App-icon badge = unread in-app notifications + unread DMs.
+ * Matches mobile useAppIconBadgeSync.
+ */
+export async function getUnreadNotificationBadgeCount(
+  client: any,
+  userId: string
+): Promise<number> {
+  const [notifications, messages] = await Promise.all([
+    countUnreadNotifications(client, userId),
+    countUnreadDirectMessages(client, userId),
+  ]);
+  const total = notifications + messages;
+  // A push is being delivered, so the badge should never land on 0.
+  return Math.max(1, Math.min(99, total));
+}
+
+export async function getAppIconBadgeCount(
+  client: any,
+  userId: string
+): Promise<number> {
+  return getUnreadNotificationBadgeCount(client, userId);
 }
 
 async function deactivatePushToken(client: any, pushToken: string): Promise<void> {
@@ -439,7 +509,7 @@ export async function sendPushNotificationDetailed(
   body: string,
   data?: Record<string, unknown>,
   client?: any,
-  opts?: { waitForReceipt?: boolean; badge?: number }
+  opts?: { waitForReceipt?: boolean; badge?: number; userId?: string }
 ): Promise<PushDeliveryResult> {
   const suffix = pushToken ? tokenSuffix(pushToken) : "none";
 
@@ -452,7 +522,17 @@ export async function sendPushNotificationDetailed(
     return { ok: false, tokenSuffix: suffix, message: "Push notifications disabled in Admin settings" };
   }
 
-  const message = buildExpoPushMessage(pushToken, title, body, data, { badge: opts?.badge });
+  let badge = opts?.badge;
+  if (
+    (typeof badge !== "number" || !Number.isFinite(badge)) &&
+    client &&
+    typeof opts?.userId === "string" &&
+    opts.userId.length > 0
+  ) {
+    badge = await getUnreadNotificationBadgeCount(client, opts.userId);
+  }
+
+  const message = buildExpoPushMessage(pushToken, title, body, data, { badge });
   const notifType = typeof data?.type === "string" ? data.type : "default";
   console.log(
     `[push] Sending type=${notifType} sound=${String(message.sound)} category=${String(message.categoryId)} badge=${String(message.badge)} to ${suffix}`
@@ -561,9 +641,12 @@ export async function sendPushNotification(
   body: string,
   data?: Record<string, unknown>,
   client?: any,
-  opts?: { badge?: number }
+  opts?: { badge?: number; userId?: string }
 ): Promise<void> {
-  await sendPushNotificationDetailed(pushToken, title, body, data, client, { badge: opts?.badge });
+  await sendPushNotificationDetailed(pushToken, title, body, data, client, {
+    badge: opts?.badge,
+    userId: opts?.userId,
+  });
 }
 
 /** Send a push to every active device belonging to a user. Never throws. */
@@ -590,7 +673,9 @@ export async function sendPushToUser(
       `[push] Sending "${title}" to user ${userId.slice(0, 8)}… (${tokens.length} device(s), badge=${badge})`
     );
     await Promise.all(
-      tokens.map((token) => sendPushNotification(token, title, body, data, client, { badge }))
+      tokens.map((token) =>
+        sendPushNotification(token, title, body, data, client, { badge, userId })
+      )
     );
   } catch (e) {
     console.error("[push] sendPushToUser error:", e);
