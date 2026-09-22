@@ -114,33 +114,44 @@ export function buildExpoPushMessage(
 
 async function countUnreadNotifications(client: any, userId: string): Promise<number> {
   try {
-    // Exact COUNT — never derive from a row page (that undercounts past the page size).
-    // Match the in-app bell: exclude DM/ping rows.
-    // PostgREST text enums in `not.in` MUST be double-quoted: '("ping","message")'.
-    // Using (ping,message) without quotes silently undercounts.
-    const { count, error } = await client
+    // Exact COUNT — never derive from a paginated list (that undercounts).
+    // Prefer chained .neq over not.in — PostgREST text `not.in` quoting is fragile
+    // across versions and was returning 0 for valid unread rows.
+    const filtered = await client
       .from("notifications")
       .select("id", { count: "exact", head: true })
       .eq("user_id", userId)
       .eq("read", false)
-      .not("type", "in", '("ping","message")');
+      .neq("type", "ping")
+      .neq("type", "message");
 
-    if (!error && typeof count === "number") return Math.max(0, count);
-
-    if (error) {
-      console.warn("[push] unread notification count error:", error.message ?? error);
+    if (!filtered.error && typeof filtered.count === "number") {
+      return Math.max(0, filtered.count);
+    }
+    if (filtered.error) {
+      console.warn("[push] filtered unread count error:", filtered.error.message);
     }
 
-    // Fallback: page through every unread social notification.
+    // Fallback 1: all unread rows (includes legacy ping/message — better than showing 0).
+    const all = await client
+      .from("notifications")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", userId)
+      .eq("read", false);
+
+    if (!all.error && typeof all.count === "number") {
+      return Math.max(0, all.count);
+    }
+
+    // Fallback 2: page through unread ids.
     let total = 0;
     let cursor: string | null = null;
     for (let page = 0; page < 100; page++) {
       let q = client
         .from("notifications")
-        .select("id, created_at")
+        .select("id, created_at, type")
         .eq("user_id", userId)
         .eq("read", false)
-        .not("type", "in", '("ping","message")')
         .order("created_at", { ascending: false })
         .limit(200);
       if (cursor) q = q.lt("created_at", cursor);
@@ -149,10 +160,13 @@ async function countUnreadNotifications(client: any, userId: string): Promise<nu
         console.warn("[push] unread notification page failed:", pageErr.message);
         break;
       }
-      const rows = data ?? [];
-      total += rows.length;
-      if (rows.length < 200) break;
-      cursor = rows[rows.length - 1]?.created_at ?? null;
+      const rows = (data ?? []).filter(
+        (n: { type?: string }) => n.type !== "ping" && n.type !== "message"
+      );
+      // If filter empties the page but raw rows exist, count raw (legacy data).
+      total += rows.length > 0 ? rows.length : (data ?? []).length;
+      if ((data ?? []).length < 200) break;
+      cursor = data![data!.length - 1]?.created_at ?? null;
       if (!cursor) break;
     }
     return total;
