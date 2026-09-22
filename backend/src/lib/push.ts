@@ -114,31 +114,52 @@ export function buildExpoPushMessage(
 
 async function countUnreadNotifications(client: any, userId: string): Promise<number> {
   try {
-    // Match the in-app bell: exclude DM/ping rows (those belong on Messages + unread DMs).
+    // Exact COUNT — never derive from a row page (that undercounts past the page size).
+    // Match the in-app bell list: exclude DM/ping rows; treat null `read` as unread.
     const { count, error } = await client
       .from("notifications")
       .select("id", { count: "exact", head: true })
       .eq("user_id", userId)
-      .eq("read", false)
-      .neq("type", "ping")
-      .neq("type", "message");
-    if (!error && typeof count === "number") return count;
+      .or("read.eq.false,read.is.null")
+      .not("type", "in", "(ping,message)");
 
-    // Fallback when head-count is unavailable (some PostgREST configs).
-    const { data } = await client
-      .from("notifications")
-      .select("id, type")
-      .eq("user_id", userId)
-      .eq("read", false)
-      .limit(99);
-    return (data ?? []).filter(
-      (n: { type?: string }) => n.type !== "ping" && n.type !== "message"
-    ).length;
+    if (!error && typeof count === "number") return Math.max(0, count);
+
+    if (error) {
+      console.warn("[push] unread notification count error:", error.message ?? error);
+    }
+
+    // Fallback: page through unread ids (still better than a single tiny page).
+    let total = 0;
+    let cursor: string | null = null;
+    for (let page = 0; page < 50; page++) {
+      let q = client
+        .from("notifications")
+        .select("id, created_at, type, read")
+        .eq("user_id", userId)
+        .or("read.eq.false,read.is.null")
+        .not("type", "in", "(ping,message)")
+        .order("created_at", { ascending: false })
+        .limit(100);
+      if (cursor) q = q.lt("created_at", cursor);
+      const { data, error: pageErr } = await q;
+      if (pageErr) {
+        console.warn("[push] unread notification page failed:", pageErr.message);
+        break;
+      }
+      const rows = data ?? [];
+      total += rows.length;
+      if (rows.length < 100) break;
+      cursor = rows[rows.length - 1]?.created_at ?? null;
+      if (!cursor) break;
+    }
+    return total;
   } catch (e) {
     console.warn("[push] unread notification count failed:", e);
     return 0;
   }
 }
+
 
 /** Unread DMs — exact COUNT per conversation (avoids PostgREST row caps). */
 async function countUnreadDirectMessages(client: any, userId: string): Promise<number> {
@@ -185,14 +206,24 @@ export type BadgeBreakdown = {
   total: number;
 };
 
-/** Exact unread totals for app-icon + in-app badges. */
+/** Exact unread notification count (bell) — excludes ping/message rows. */
+export async function countUnreadNotificationsForUser(
+  client: any,
+  userId: string
+): Promise<number> {
+  return countUnreadNotifications(client, userId);
+}
+
+/** Exact badge totals for the OS icon + in-app indicators. */
 export async function getBadgeBreakdown(client: any, userId: string): Promise<BadgeBreakdown> {
   const [notifications, messages] = await Promise.all([
     countUnreadNotifications(client, userId),
     countUnreadDirectMessages(client, userId),
   ]);
-  const total = Math.max(0, Math.min(99, notifications + messages));
-  return { notifications, messages, total };
+  const safeNotifications = Math.max(0, notifications);
+  const safeMessages = Math.max(0, messages);
+  const total = Math.max(0, Math.min(99, safeNotifications + safeMessages));
+  return { notifications: safeNotifications, messages: safeMessages, total };
 }
 
 /**

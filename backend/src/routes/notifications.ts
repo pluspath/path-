@@ -7,6 +7,7 @@ import {
   sendPushNotificationDetailed,
   getUnreadNotificationBadgeCount,
   getBadgeBreakdown,
+  countUnreadNotificationsForUser,
 } from "../lib/push";
 import { resolveAvatarUrl } from "../lib/avatar";
 import { parseLimit, parseCursor, encodeCursor } from "../lib/pagination";
@@ -202,6 +203,8 @@ notificationsRouter.get("/", async (c) => {
     nextCursor,
     hasMore,
     limit,
+    // Exact unread total for the bell (never derive from this page alone).
+    unreadTotal: await countUnreadNotificationsForUser(supabaseAdmin, userId),
   });
 });
 
@@ -211,7 +214,16 @@ notificationsRouter.get("/badge", async (c) => {
   if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const breakdown = await getBadgeBreakdown(supabaseAdmin, userId);
-  return c.json({ data: breakdown });
+  return c.json({
+    data: {
+      notifications: breakdown.notifications,
+      messages: breakdown.messages,
+      total: breakdown.total,
+      // Alias used by older clients / clearer naming for the bell badge.
+      unreadNotifications: breakdown.notifications,
+      unreadMessages: breakdown.messages,
+    },
+  });
 });
 
 // Mark every unread notification for the current user as read (called when the
