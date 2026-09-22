@@ -67,10 +67,15 @@ async function deleteCloseFriend(userClient: any, ownerId: string, friendId: str
 }
 
 function formatProfile(p: any) {
+  const username = String(p.username ?? "").trim();
+  // Prefer display name; fall back to @username so list rows never look empty.
+  const name =
+    String(p.full_name ?? p.name ?? "").trim() ||
+    username;
   return {
     id: p.id,
-    name: String(p.full_name ?? p.name ?? "").trim(),
-    username: String(p.username ?? "").trim(),
+    name,
+    username,
     avatar: resolveAvatarUrl(p.id, p.avatar_url, p.gender),
     bio: p.bio ?? "",
     location: String(p.location ?? "").trim(),
@@ -83,6 +88,49 @@ function formatProfile(p: any) {
     postCount: 0,
     momentCount: 0,
   };
+}
+
+/** Load profiles in chunks via service role (avoids RLS gaps + PostgREST .in limits). */
+async function loadProfilesByIds(ids: string[]): Promise<Record<string, any>> {
+  const map: Record<string, any> = {};
+  const unique = Array.from(new Set(ids.filter(Boolean)));
+  for (const chunk of chunkIds(unique, 80)) {
+    const { data, error } = await supabaseAdmin.from("profiles").select("*").in("id", chunk);
+    if (error) {
+      console.warn("[friends] profile chunk failed:", error.message);
+      continue;
+    }
+    for (const p of data ?? []) map[p.id] = p;
+  }
+  return map;
+}
+
+/**
+ * Older / partial profile rows sometimes lack full_name or username even though
+ * auth metadata still has them. Fill blanks so friend lists show a real label.
+ */
+async function enrichMissingIdentity(profileMap: Record<string, any>): Promise<void> {
+  const need = Object.values(profileMap).filter((p: any) => {
+    const name = String(p?.full_name ?? p?.name ?? "").trim();
+    const username = String(p?.username ?? "").trim();
+    return !name || !username;
+  });
+  if (need.length === 0) return;
+
+  await Promise.all(
+    need.map(async (p: any) => {
+      try {
+        const { data: authData } = await supabaseAdmin.auth.admin.getUserById(p.id);
+        const meta = authData?.user?.user_metadata ?? {};
+        const metaName = String(meta.full_name ?? meta.name ?? "").trim();
+        const metaUsername = String(meta.username ?? "").trim();
+        if (!String(p.full_name ?? "").trim() && metaName) p.full_name = metaName;
+        if (!String(p.username ?? "").trim() && metaUsername) p.username = metaUsername;
+      } catch {
+        /* best-effort */
+      }
+    })
+  );
 }
 
 /** Build a PostgREST `not.in.(…)` value; quote UUIDs for safe parsing. */
@@ -319,19 +367,23 @@ friendsRouter.get("/", async (c) => {
   const allIds = [...new Set([...friendIds, ...pendingRequesterIds])];
   const excludeIds = [userId, ...friendIds, ...pendingRequesterIds, ...pendingSentIds, ...blockedSet];
 
-  const [profilesResult, suggestedLoad] = await Promise.all([
-    allIds.length > 0
-      ? supabaseAdmin.from("profiles").select("*").in("id", allIds)
-      : Promise.resolve({ data: [] as any[] }),
+  const [profileMap, suggestedLoad] = await Promise.all([
+    loadProfilesByIds(allIds),
     loadRankedDiscoverProfiles(excludeIds, friendIds, 0, 40),
   ]);
+
+  await enrichMissingIdentity(profileMap);
 
   if (suggestedLoad.error) {
     console.warn("[friends] suggested load failed:", suggestedLoad.error.message);
   }
 
-  let profileMap: Record<string, any> = {};
-  for (const p of profilesResult.data ?? []) profileMap[p.id] = p;
+  // Fill blank identity on discover suggestions too (same root cause).
+  const suggestedProfileMap: Record<string, any> = {};
+  for (const r of suggestedLoad.rows ?? []) {
+    if (r?.profile?.id) suggestedProfileMap[r.profile.id] = r.profile;
+  }
+  await enrichMissingIdentity(suggestedProfileMap);
 
   const friends = friendIds
     .map((id: string) => profileMap[id])
@@ -346,7 +398,9 @@ friendsRouter.get("/", async (c) => {
     .filter((f: any) => !blockedSet.has(f.requester_id))
     .map((f: any) => ({
       id: f.id,
-      user: profileMap[f.requester_id] ? formatProfile(profileMap[f.requester_id]) : { id: f.requester_id, name: "Unknown" },
+      user: profileMap[f.requester_id]
+        ? formatProfile(profileMap[f.requester_id])
+        : { id: f.requester_id, name: "Unknown", username: "", avatar: "" },
       mutualFriends: 0,
       createdAt: f.created_at,
     }))
@@ -355,7 +409,7 @@ friendsRouter.get("/", async (c) => {
   const suggested = (suggestedLoad.rows ?? [])
     .filter((r) => !isDeletionHiddenProfile(r.profile))
     .map((r) => ({
-      ...formatProfile(r.profile),
+      ...formatProfile(suggestedProfileMap[r.profile.id] ?? r.profile),
       friendshipStatus: "none" as const,
       mutualFriends: r.mutualFriends,
     }));
@@ -424,10 +478,16 @@ friendsRouter.get("/discover", async (c) => {
     return c.json({ error: { message: "Failed to load people" } }, 500);
   }
 
+  const discoverMap: Record<string, any> = {};
+  for (const r of rows ?? []) {
+    if (r?.profile?.id) discoverMap[r.profile.id] = r.profile;
+  }
+  await enrichMissingIdentity(discoverMap);
+
   const users = (rows ?? [])
     .filter((r) => !isDeletionHiddenProfile(r.profile))
     .map((r) => ({
-      ...formatProfile(r.profile),
+      ...formatProfile(discoverMap[r.profile.id] ?? r.profile),
       friendshipStatus: "none" as const,
       mutualFriends: r.mutualFriends,
     }));
