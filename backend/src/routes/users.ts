@@ -126,18 +126,51 @@ export function formatPost(p: any, viewerId?: string, blockedIds: string[] = [])
   const friends = p.type === FRIENDSHIP_TYPE ? parseFriendshipFriends(p) : undefined;
   // image_url may hold a single URL (legacy) or a JSON array of URLs (multi-image).
   const images = decodeImages(p.image_url);
+
+  // Never leak friendship JSON blobs or friend UUIDs as caption / place name.
+  // Clients must use `friends` for friendship moments (and SystemMomentTitle).
+  let content: string | undefined = p.content == null ? undefined : String(p.content);
+  let locationName: string | undefined =
+    p.location == null || p.location === "" ? undefined : String(p.location);
+
+  if (p.type === FRIENDSHIP_TYPE) {
+    content = undefined;
+    locationName = undefined;
+  } else if (content) {
+    const trimmed = content.trim();
+    if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        const looksLikeFriendPayload =
+          (Array.isArray(parsed) &&
+            parsed.some((x) => x && typeof x === "object" && "id" in x)) ||
+          (parsed && typeof parsed === "object" && !Array.isArray(parsed) && "id" in parsed);
+        if (looksLikeFriendPayload) content = undefined;
+      } catch {
+        /* keep plain text */
+      }
+    }
+  }
+
+  if (
+    locationName &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(locationName.trim())
+  ) {
+    locationName = undefined;
+  }
+
   return {
     id: p.id,
     userId: p.user_id,
     user: p.profiles ? formatProfile(p.profiles) : null,
     type: p.type,
-    content: p.content ?? undefined,
+    content,
     friends,
     // `image` stays the FIRST url for full backward compatibility; `images` is
     // the complete list (present whenever there's at least one image).
     image: images[0] ?? undefined,
     images: images.length > 0 ? images : undefined,
-    locationName: p.location ?? undefined,
+    locationName,
     // Coordinates for check-in (location) moments so anyone who can see the
     // moment can open it on a map — same as location messages in chat.
     locationLat: p.location_lat ?? undefined,

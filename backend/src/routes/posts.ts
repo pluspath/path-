@@ -671,7 +671,10 @@ postsRouter.post("/", async (c) => {
       console.error("[notifications] repath insert error:", e);
     }
 
-    return c.json({ data: formatPost(post, userId) }, 201);
+    const formatted = formatPost(post, userId);
+    await refreshFriendshipAvatars([formatted]);
+    if (formatted.original) await refreshFriendshipAvatars([formatted.original]);
+    return c.json({ data: formatted }, 201);
   }
 
   const insertData: Record<string, any> = {
