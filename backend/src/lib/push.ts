@@ -115,13 +115,15 @@ export function buildExpoPushMessage(
 async function countUnreadNotifications(client: any, userId: string): Promise<number> {
   try {
     // Exact COUNT — never derive from a row page (that undercounts past the page size).
-    // Match the in-app bell list: exclude DM/ping rows; treat null `read` as unread.
+    // Match the in-app bell: exclude DM/ping rows.
+    // PostgREST text enums in `not.in` MUST be double-quoted: '("ping","message")'.
+    // Using (ping,message) without quotes silently undercounts.
     const { count, error } = await client
       .from("notifications")
       .select("id", { count: "exact", head: true })
       .eq("user_id", userId)
-      .or("read.eq.false,read.is.null")
-      .not("type", "in", "(ping,message)");
+      .eq("read", false)
+      .not("type", "in", '("ping","message")');
 
     if (!error && typeof count === "number") return Math.max(0, count);
 
@@ -129,18 +131,18 @@ async function countUnreadNotifications(client: any, userId: string): Promise<nu
       console.warn("[push] unread notification count error:", error.message ?? error);
     }
 
-    // Fallback: page through unread ids (still better than a single tiny page).
+    // Fallback: page through every unread social notification.
     let total = 0;
     let cursor: string | null = null;
-    for (let page = 0; page < 50; page++) {
+    for (let page = 0; page < 100; page++) {
       let q = client
         .from("notifications")
-        .select("id, created_at, type, read")
+        .select("id, created_at")
         .eq("user_id", userId)
-        .or("read.eq.false,read.is.null")
-        .not("type", "in", "(ping,message)")
+        .eq("read", false)
+        .not("type", "in", '("ping","message")')
         .order("created_at", { ascending: false })
-        .limit(100);
+        .limit(200);
       if (cursor) q = q.lt("created_at", cursor);
       const { data, error: pageErr } = await q;
       if (pageErr) {
@@ -149,7 +151,7 @@ async function countUnreadNotifications(client: any, userId: string): Promise<nu
       }
       const rows = data ?? [];
       total += rows.length;
-      if (rows.length < 100) break;
+      if (rows.length < 200) break;
       cursor = rows[rows.length - 1]?.created_at ?? null;
       if (!cursor) break;
     }
