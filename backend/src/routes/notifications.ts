@@ -208,18 +208,21 @@ notificationsRouter.get("/", async (c) => {
   });
 });
 
-/** Exact badge totals for the OS icon + in-app indicators. */
+/** Exact badge totals for the OS icon + in-app indicators.
+ * `total` / `appIcon` = unread bell notifications + unread message threads.
+ */
 notificationsRouter.get("/badge", async (c) => {
   const userId = c.get("userId");
   if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const breakdown = await getBadgeBreakdown(supabaseAdmin, userId);
+  const appIcon = breakdown.total; // notifications + messages (capped 99 for OS)
   return c.json({
     data: {
       notifications: breakdown.notifications,
       messages: breakdown.messages,
-      total: breakdown.total,
-      // Alias used by older clients / clearer naming for the bell badge.
+      total: appIcon,
+      appIcon,
       unreadNotifications: breakdown.notifications,
       unreadMessages: breakdown.messages,
     },

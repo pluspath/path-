@@ -216,7 +216,9 @@ export async function countUnreadNotificationsForUser(
   return countUnreadNotifications(client, userId);
 }
 
-/** Exact badge totals for the OS icon + in-app indicators. */
+/** Exact badge totals for the OS icon + in-app indicators.
+ * App-icon badge = unread social notifications (bell) + unread DMs (messages).
+ */
 export async function getBadgeBreakdown(client: any, userId: string): Promise<BadgeBreakdown> {
   const [notifications, messages] = await Promise.all([
     countUnreadNotifications(client, userId),
@@ -224,7 +226,9 @@ export async function getBadgeBreakdown(client: any, userId: string): Promise<Ba
   ]);
   const safeNotifications = Math.max(0, notifications);
   const safeMessages = Math.max(0, messages);
-  const total = Math.max(0, Math.min(99, safeNotifications + safeMessages));
+  // Uncapped raw sum for clients; OS APIs still clamp to 99 when applying.
+  const rawTotal = safeNotifications + safeMessages;
+  const total = Math.max(0, Math.min(99, rawTotal));
   return { notifications: safeNotifications, messages: safeMessages, total };
 }
 
