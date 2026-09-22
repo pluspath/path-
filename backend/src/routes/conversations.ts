@@ -370,8 +370,8 @@ conversationsRouter.get("/:id", async (c) => {
   if (!participation) return c.json({ error: { message: "Not found" } }, 404);
   const myLastReadAt: string | null = participation.last_read_at ?? null;
 
-  const rawLimit = Number(c.req.query("limit") ?? 40);
-  const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.floor(rawLimit), 1), 100) : 40;
+  const rawLimit = Number(c.req.query("limit") ?? 24);
+  const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.floor(rawLimit), 1), 100) : 24;
   const before = c.req.query("before"); // older page (exclusive upper bound)
   const after = c.req.query("after"); // newer page (exclusive lower bound)
 
@@ -493,7 +493,9 @@ conversationsRouter.get("/:id", async (c) => {
     };
   };
 
-  // Batch 1: conversation + other participants (+ first-unread or paginated messages).
+  // Batch 1: conversation + other participants (+ paginated messages when scrolling).
+  // Initial open always loads the newest page (end of chat) — never the full history
+  // or an unread-forward window that jumps mid-thread.
   const [convResult, othersResult, batch1] = await Promise.all([
     db.from("conversations").select("*").eq("id", id).single(),
     db
@@ -505,7 +507,7 @@ conversationsRouter.get("/:id", async (c) => {
       ? loadAfterPage()
       : before
         ? loadBeforePage()
-        : findFirstUnread(),
+        : loadNewestPage(),
   ]);
 
   const conv = convResult.data;
@@ -521,7 +523,7 @@ conversationsRouter.get("/:id", async (c) => {
       return min === null ? null : v < min ? v : min;
     }, undefined as any) ?? null;
 
-  // Batch 2: profile + initial message window (when not already paginating).
+  // Batch 2: profile (+ unread metadata for the initial newest-page open).
   const profilePromise = otherUserId
     ? db.from("profiles").select("*").eq("id", otherUserId).single()
     : Promise.resolve({ data: null });
@@ -533,12 +535,25 @@ conversationsRouter.get("/:id", async (c) => {
     const { data: profile } = await profilePromise;
     otherUser = profile ? formatProfile(profile) : null;
   } else {
-    const firstUnread = batch1 as { id: string; created_at: string } | null;
-    const [profileResult, page] = await Promise.all([
+    const newestPage = batch1 as MsgPage;
+    const [profileResult, firstUnread, unreadCountRes] = await Promise.all([
       profilePromise,
-      firstUnread ? loadUnreadForward(firstUnread) : loadNewestPage(),
+      findFirstUnread(),
+      (async () => {
+        let countQuery = db
+          .from("messages")
+          .select("id", { count: "exact", head: true })
+          .eq("conversation_id", id)
+          .neq("sender_id", userId);
+        if (myLastReadAt) countQuery = countQuery.gt("created_at", myLastReadAt);
+        return countQuery;
+      })(),
     ]);
-    msgPage = page;
+    msgPage = {
+      ...newestPage,
+      firstUnreadMessageId: firstUnread?.id ?? null,
+      unreadCount: unreadCountRes.count ?? 0,
+    };
     otherUser = profileResult.data ? formatProfile(profileResult.data) : null;
   }
 
