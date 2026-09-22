@@ -6,6 +6,7 @@ import {
   getPushStatusForUser,
   sendPushNotificationDetailed,
   getUnreadNotificationBadgeCount,
+  getBadgeBreakdown,
 } from "../lib/push";
 import { resolveAvatarUrl } from "../lib/avatar";
 import { parseLimit, parseCursor, encodeCursor } from "../lib/pagination";
@@ -202,6 +203,15 @@ notificationsRouter.get("/", async (c) => {
     hasMore,
     limit,
   });
+});
+
+/** Exact badge totals for the OS icon + in-app indicators. */
+notificationsRouter.get("/badge", async (c) => {
+  const userId = c.get("userId");
+  if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const breakdown = await getBadgeBreakdown(supabaseAdmin, userId);
+  return c.json({ data: breakdown });
 });
 
 // Mark every unread notification for the current user as read (called when the

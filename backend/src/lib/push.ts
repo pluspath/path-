@@ -114,28 +114,33 @@ export function buildExpoPushMessage(
 
 async function countUnreadNotifications(client: any, userId: string): Promise<number> {
   try {
+    // Match the in-app bell: exclude DM/ping rows (those belong on Messages + unread DMs).
     const { count, error } = await client
       .from("notifications")
       .select("id", { count: "exact", head: true })
       .eq("user_id", userId)
-      .eq("read", false);
+      .eq("read", false)
+      .neq("type", "ping")
+      .neq("type", "message");
     if (!error && typeof count === "number") return count;
 
     // Fallback when head-count is unavailable (some PostgREST configs).
     const { data } = await client
       .from("notifications")
-      .select("id")
+      .select("id, type")
       .eq("user_id", userId)
       .eq("read", false)
       .limit(99);
-    return data?.length ?? 0;
+    return (data ?? []).filter(
+      (n: { type?: string }) => n.type !== "ping" && n.type !== "message"
+    ).length;
   } catch (e) {
     console.warn("[push] unread notification count failed:", e);
     return 0;
   }
 }
 
-/** Unread DMs (messages from others newer than last_read_at). */
+/** Unread DMs — exact COUNT per conversation (avoids PostgREST row caps). */
 async function countUnreadDirectMessages(client: any, userId: string): Promise<number> {
   try {
     const { data: participations } = await client
@@ -145,31 +150,27 @@ async function countUnreadDirectMessages(client: any, userId: string): Promise<n
     const parts = participations ?? [];
     if (parts.length === 0) return 0;
 
-    const lastReadByConv: Record<string, string | null> = {};
-    const ids: string[] = [];
-    for (const p of parts) {
-      ids.push(p.conversation_id);
-      lastReadByConv[p.conversation_id] = p.last_read_at ?? null;
-    }
-
-    const lastReads = parts.map((p: any) => p.last_read_at).filter(Boolean) as string[];
-    const allHaveLastRead = lastReads.length === parts.length;
-    const minLastRead = allHaveLastRead
-      ? lastReads.reduce((a, b) => (a < b ? a : b))
-      : null;
-
-    let query = client
-      .from("messages")
-      .select("conversation_id, created_at")
-      .in("conversation_id", ids)
-      .neq("sender_id", userId);
-    if (minLastRead) query = query.gt("created_at", minLastRead);
-
-    const { data: rows } = await query;
     let total = 0;
-    for (const m of rows ?? []) {
-      const lastRead = lastReadByConv[m.conversation_id as string];
-      if (!lastRead || m.created_at > lastRead) total += 1;
+    const chunkSize = 25;
+    for (let i = 0; i < parts.length; i += chunkSize) {
+      const chunk = parts.slice(i, i + chunkSize);
+      const counts = await Promise.all(
+        chunk.map(async (p: any) => {
+          let q = client
+            .from("messages")
+            .select("id", { count: "exact", head: true })
+            .eq("conversation_id", p.conversation_id)
+            .neq("sender_id", userId);
+          if (p.last_read_at) q = q.gt("created_at", p.last_read_at);
+          const { count, error } = await q;
+          if (error) {
+            console.warn("[push] unread DM count failed:", error.message);
+            return 0;
+          }
+          return count ?? 0;
+        })
+      );
+      for (const n of counts) total += n;
     }
     return total;
   } catch (e) {
@@ -178,21 +179,32 @@ async function countUnreadDirectMessages(client: any, userId: string): Promise<n
   }
 }
 
+export type BadgeBreakdown = {
+  notifications: number;
+  messages: number;
+  total: number;
+};
+
+/** Exact unread totals for app-icon + in-app badges. */
+export async function getBadgeBreakdown(client: any, userId: string): Promise<BadgeBreakdown> {
+  const [notifications, messages] = await Promise.all([
+    countUnreadNotifications(client, userId),
+    countUnreadDirectMessages(client, userId),
+  ]);
+  const total = Math.max(0, Math.min(99, notifications + messages));
+  return { notifications, messages, total };
+}
+
 /**
- * App-icon badge = unread in-app notifications + unread DMs.
- * Matches mobile useAppIconBadgeSync.
+ * App-icon badge on outbound push = unread notifications + unread DMs.
+ * At least 1 when a push is being delivered.
  */
 export async function getUnreadNotificationBadgeCount(
   client: any,
   userId: string
 ): Promise<number> {
-  const [notifications, messages] = await Promise.all([
-    countUnreadNotifications(client, userId),
-    countUnreadDirectMessages(client, userId),
-  ]);
-  const total = notifications + messages;
-  // A push is being delivered, so the badge should never land on 0.
-  return Math.max(1, Math.min(99, total));
+  const { total } = await getBadgeBreakdown(client, userId);
+  return Math.max(1, total);
 }
 
 export async function getAppIconBadgeCount(

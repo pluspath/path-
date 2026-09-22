@@ -9,12 +9,7 @@ import type { HonoVariables } from "../types";
 const conversationsRouter = new Hono<{ Variables: HonoVariables }>();
 
 /**
- * Unread counts in one round-trip: fetch messages from others for all
- * conversations, then count in memory against each last_read_at.
- * Replaces per-conversation COUNT queries (N+1).
- *
- * When every participation has a last_read_at, only fetch messages newer than
- * the earliest last_read — dramatically smaller payloads for active users.
+ * Unread DM counts via exact COUNT queries (never undercounts from row caps).
  */
 async function computeUnreadCounts(
   db: any,
@@ -22,38 +17,30 @@ async function computeUnreadCounts(
   participations: { conversation_id: string; last_read_at?: string | null }[]
 ): Promise<Record<string, number>> {
   const result: Record<string, number> = {};
-  const lastReadByConv: Record<string, string | null> = {};
-  const ids: string[] = [];
   for (const p of participations) {
-    ids.push(p.conversation_id);
     result[p.conversation_id] = 0;
-    lastReadByConv[p.conversation_id] = p.last_read_at ?? null;
   }
-  if (ids.length === 0) return result;
+  if (participations.length === 0) return result;
 
-  const lastReads = participations.map((p) => p.last_read_at).filter(Boolean) as string[];
-  const allHaveLastRead = lastReads.length === participations.length;
-  const minLastRead = allHaveLastRead
-    ? lastReads.reduce((a, b) => (a < b ? a : b))
-    : null;
-
-  let query = db
-    .from("messages")
-    .select("conversation_id, created_at")
-    .in("conversation_id", ids)
-    .neq("sender_id", userId);
-  if (minLastRead) {
-    query = query.gt("created_at", minLastRead);
-  }
-
-  const { data: rows } = await query;
-
-  for (const m of rows ?? []) {
-    const convId = m.conversation_id as string;
-    const lastRead = lastReadByConv[convId];
-    if (!lastRead || m.created_at > lastRead) {
-      result[convId] = (result[convId] ?? 0) + 1;
-    }
+  const chunkSize = 25;
+  for (let i = 0; i < participations.length; i += chunkSize) {
+    const chunk = participations.slice(i, i + chunkSize);
+    await Promise.all(
+      chunk.map(async (p) => {
+        let q = db
+          .from("messages")
+          .select("id", { count: "exact", head: true })
+          .eq("conversation_id", p.conversation_id)
+          .neq("sender_id", userId);
+        if (p.last_read_at) q = q.gt("created_at", p.last_read_at);
+        const { count, error } = await q;
+        if (error) {
+          console.warn("[conversations] unread count failed:", error.message);
+          return;
+        }
+        result[p.conversation_id] = count ?? 0;
+      })
+    );
   }
   return result;
 }
