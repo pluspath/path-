@@ -176,6 +176,8 @@ app.get("/__marketing", (c) =>
         "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS show_posts_to_others BOOLEAN DEFAULT TRUE;",
         "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS show_moments_to_friends BOOLEAN DEFAULT TRUE;",
         "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS show_moments_to_others BOOLEAN DEFAULT TRUE;",
+        // Denormalized total likes (reactions+comments+repaths) for public profile stats.
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS like_count INTEGER NOT NULL DEFAULT 0;",
         `CREATE TABLE IF NOT EXISTS public.account_deletion_requests (
           id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
           user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,

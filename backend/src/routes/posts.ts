@@ -970,7 +970,22 @@ postsRouter.post("/:id/reactions", async (c) => {
   // and only when a reaction was actually added. The sheep (🐑) sent from a
   // sleep moment reads as "sent you a sheep"; any other emoji reads as a love.
   try {
-    const { data: postOwner } = await userClient.from("posts").select("user_id").eq("id", id).maybeSingle();
+    const { data: postOwner } = await supabaseAdmin.from("posts").select("user_id").eq("id", id).maybeSingle();
+    if (postOwner && postOwner.user_id !== userId) {
+      // Keep denormalized profile like_count in sync for visitors.
+      let delta = 0;
+      if (!existing && didReact) delta = 1;
+      else if (existing && !didReact) delta = -1;
+      if (delta !== 0) {
+        const { data: row } = await supabaseAdmin
+          .from("profiles")
+          .select("like_count")
+          .eq("id", postOwner.user_id)
+          .maybeSingle();
+        const next = Math.max(0, (Number((row as any)?.like_count) || 0) + delta);
+        await supabaseAdmin.from("profiles").update({ like_count: next }).eq("id", postOwner.user_id);
+      }
+    }
     if (didReact && postOwner && postOwner.user_id !== userId) {
       const isSheep = incoming === "🐑";
       const { data: inserted } = await supabaseAdmin.from("notifications").insert({
