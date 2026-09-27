@@ -287,7 +287,16 @@ export function formatPost(p: any, viewerId?: string, blockedIds: string[] = [])
   return {
     id: p.id,
     userId: p.user_id,
-    user: p.profiles ? formatProfile(p.profiles) : null,
+    // Author card only — never embed zeroed profile stats here. Fake likeCount:0
+    // from formatProfile defaults was poisoning friend-profile caches so viewers
+    // only saw their own (visible) reactions instead of the real total.
+    user: p.profiles
+      ? (() => {
+          const u = formatProfile(p.profiles);
+          const { friendCount: _f, postCount: _p, momentCount: _m, likeCount: _l, ...author } = u;
+          return author;
+        })()
+      : null,
     type: p.type,
     content,
     friends,
