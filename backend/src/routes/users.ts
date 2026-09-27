@@ -20,45 +20,77 @@ const usersRouter = new Hono<{ Variables: HonoVariables }>();
 // sees their own age/zodiac (plus the raw birthday, needed to drive the
 // toggles). Everyone else sees age/zodiac ONLY when the owner has opted in via
 // show_age / show_zodiac, and never sees the raw birthday.
-/** Total reactions received across all of a user's posts/moments (from others). */
-async function countLikesReceived(userId: string): Promise<number> {
-  // Prefer a single joined count — reactions has no standalone `id` column
-  // (PK is typically post_id+user_id), so selecting "id" always failed → 0 likes.
-  try {
-    const { count, error } = await supabaseAdmin
-      .from("reactions")
-      .select("post_id, posts!inner(user_id)", { count: "exact", head: true })
-      .eq("posts.user_id", userId)
-      .neq("user_id", userId);
-    if (!error && typeof count === "number") return Math.max(0, count);
-    if (error) {
-      console.warn("[users] likes join count failed, falling back:", error.message);
-    }
-  } catch (e) {
-    console.warn("[users] likes join count threw:", e);
-  }
-
+/**
+ * Total interactions received on a user's moments from other people:
+ * reactions + comments + repaths. Exposed as `likeCount` for the profile stats.
+ */
+async function countInteractionsReceived(userId: string): Promise<number> {
   const { data: posts, error: postsErr } = await supabaseAdmin
     .from("posts")
     .select("id")
     .eq("user_id", userId);
   if (postsErr || !posts?.length) return 0;
   const ids = posts.map((p: { id: string }) => p.id);
-  let total = 0;
-  for (let i = 0; i < ids.length; i += 80) {
-    const chunk = ids.slice(i, i + 80);
-    const { count, error: cErr } = await supabaseAdmin
-      .from("reactions")
-      .select("post_id", { count: "exact", head: true })
-      .in("post_id", chunk)
-      .neq("user_id", userId);
-    if (cErr) {
-      console.warn("[users] likes count chunk failed:", cErr.message);
-      continue;
+
+  const countOnPosts = async (
+    table: "reactions" | "comments"
+  ): Promise<number> => {
+    // Fast path: inner join filter by post owner.
+    try {
+      const { count, error } = await supabaseAdmin
+        .from(table)
+        .select("post_id, posts!inner(user_id)", { count: "exact", head: true })
+        .eq("posts.user_id", userId)
+        .neq("user_id", userId);
+      if (!error && typeof count === "number") return Math.max(0, count);
+      if (error) {
+        console.warn(`[users] ${table} join count failed, falling back:`, error.message);
+      }
+    } catch (e) {
+      console.warn(`[users] ${table} join count threw:`, e);
     }
-    total += count ?? 0;
-  }
-  return total;
+
+    let total = 0;
+    for (let i = 0; i < ids.length; i += 80) {
+      const chunk = ids.slice(i, i + 80);
+      const { count, error: cErr } = await supabaseAdmin
+        .from(table)
+        .select("post_id", { count: "exact", head: true })
+        .in("post_id", chunk)
+        .neq("user_id", userId);
+      if (cErr) {
+        console.warn(`[users] ${table} count chunk failed:`, cErr.message);
+        continue;
+      }
+      total += count ?? 0;
+    }
+    return total;
+  };
+
+  const countRepaths = async (): Promise<number> => {
+    let total = 0;
+    for (let i = 0; i < ids.length; i += 80) {
+      const chunk = ids.slice(i, i + 80);
+      const { count, error: cErr } = await supabaseAdmin
+        .from("posts")
+        .select("id", { count: "exact", head: true })
+        .in("repath_of", chunk)
+        .neq("user_id", userId);
+      if (cErr) {
+        console.warn("[users] repath count chunk failed:", cErr.message);
+        continue;
+      }
+      total += count ?? 0;
+    }
+    return total;
+  };
+
+  const [reactions, comments, repaths] = await Promise.all([
+    countOnPosts("reactions"),
+    countOnPosts("comments"),
+    countRepaths(),
+  ]);
+  return reactions + comments + repaths;
 }
 
 function formatProfile(
@@ -107,7 +139,7 @@ function formatProfile(
     friendCount,
     postCount,
     momentCount: postCount,
-    likeCount,
+    likeCount, // total interactions received (reactions + comments + repaths)
     // Computed age/zodiac, gated by visibility for non-owners.
     age: isOwner || showAge ? age : null,
     zodiac: isOwner || showZodiac ? zodiac : null,
@@ -461,7 +493,7 @@ usersRouter.get("/me", async (c) => {
   const [postsResult, friendsResult, likeCount] = await Promise.all([
     userClient.from("posts").select("id", { count: "exact", head: true }).eq("user_id", userId),
     supabaseAdmin.from("friendships").select("id", { count: "exact", head: true }).eq("status", "accepted").or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
-    countLikesReceived(userId),
+    countInteractionsReceived(userId),
   ]);
 
   // Always read the profile row so username/avatar stay in sync with the DB.
@@ -948,7 +980,7 @@ usersRouter.get("/:id", async (c) => {
     // count to only the friendships the *viewer* is part of (which made the count
     // differ per viewer). Same number for everyone now.
     supabaseAdmin.from("friendships").select("id", { count: "exact", head: true }).eq("status", "accepted").or(`requester_id.eq.${id},receiver_id.eq.${id}`),
-    countLikesReceived(id),
+    countInteractionsReceived(id),
   ]);
 
   return c.json({
