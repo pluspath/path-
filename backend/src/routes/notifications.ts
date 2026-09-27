@@ -11,6 +11,7 @@ import {
 } from "../lib/push";
 import { resolveAvatarUrl } from "../lib/avatar";
 import { parseLimit, parseCursor, encodeCursor } from "../lib/pagination";
+import { decodeImages } from "../lib/images";
 import type { HonoVariables } from "../types";
 
 const notificationsRouter = new Hono<{ Variables: HonoVariables }>();
@@ -153,6 +154,22 @@ notificationsRouter.get("/", async (c) => {
     for (const p of profiles ?? []) profileMap[p.id] = p;
   }
 
+  // Attach a thumbnail URL for reaction/comment/repath rows (UI expects postImage).
+  const postIds = [
+    ...new Set(page.map((n: any) => n.post_id).filter(Boolean)),
+  ] as string[];
+  const postImageMap: Record<string, string> = {};
+  if (postIds.length > 0) {
+    const { data: posts } = await supabaseAdmin
+      .from("posts")
+      .select("id, image_url")
+      .in("id", postIds);
+    for (const p of posts ?? []) {
+      const imgs = decodeImages((p as any).image_url);
+      if (imgs[0]) postImageMap[p.id] = imgs[0];
+    }
+  }
+
   // For friend_request notifications, fetch friendship IDs in one query.
   const friendRequestNotifs = page.filter((n: any) => n.type === "friend_request");
   let friendshipMap: Record<string, string> = {};
@@ -192,10 +209,14 @@ notificationsRouter.get("/", async (c) => {
               profileMap[n.from_user_id].avatar_url,
               profileMap[n.from_user_id].gender
             ),
+            bio: profileMap[n.from_user_id].bio ?? "",
+            location: profileMap[n.from_user_id].location ?? "",
+            gender: profileMap[n.from_user_id].gender ?? undefined,
           }
         : { id: "system", name: "Path+", username: "", avatar: "" },
       message: n.message,
       postId: n.post_id ?? undefined,
+      postImage: (n.post_id && postImageMap[n.post_id]) || n.post_image || undefined,
       friendshipId: friendshipMap[n.id] ?? undefined,
       read: n.read,
       createdAt: n.created_at,
