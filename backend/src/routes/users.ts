@@ -22,70 +22,110 @@ const usersRouter = new Hono<{ Variables: HonoVariables }>();
 // show_age / show_zodiac, and never sees the raw birthday.
 /**
  * Total likes received on a user's moments from anyone on the app:
- * reactions + comments + repaths. Always computed with the service role
- * (no viewer / RLS filtering) and persisted to profiles.like_count.
+ * reactions + comments + repaths. Service-role only (no viewer filtering).
  */
 async function countInteractionsReceived(userId: string): Promise<number> {
   let stored = 0;
   try {
+    // select('*') so a missing like_count column cannot 400 the whole profile.
     const { data } = await supabaseAdmin
       .from("profiles")
-      .select("like_count")
+      .select("*")
       .eq("id", userId)
       .maybeSingle();
     const n = Number((data as any)?.like_count ?? 0);
     if (Number.isFinite(n) && n > 0) stored = n;
   } catch {
-    /* column may not exist yet */
-  }
-
-  const postIds: string[] = [];
-  try {
-    // Paginate — PostgREST caps rows per request.
-    for (let from = 0; ; from += 1000) {
-      const { data, error } = await supabaseAdmin
-        .from("posts")
-        .select("id")
-        .eq("user_id", userId)
-        .range(from, from + 999);
-      if (error) {
-        console.warn("[users] posts id page failed:", error.message);
-        break;
-      }
-      if (!data?.length) break;
-      for (const row of data) postIds.push(String((row as { id: string }).id));
-      if (data.length < 1000) break;
-    }
-  } catch (e) {
-    console.warn("[users] posts id list threw:", e);
+    /* ignore */
   }
 
   let computed = 0;
-  for (let i = 0; i < postIds.length; i += 80) {
-    const chunk = postIds.slice(i, i + 80);
-    const [reactions, comments, repaths] = await Promise.all([
-      supabaseAdmin
-        .from("reactions")
-        .select("*", { count: "exact", head: true })
-        .in("post_id", chunk),
-      supabaseAdmin
-        .from("comments")
-        .select("*", { count: "exact", head: true })
-        .in("post_id", chunk),
-      supabaseAdmin
+  const allPostIds: string[] = [];
+
+  // Walk every post page so totals cover the full timeline (not just the first
+  // PostgREST page of ~1000 rows).
+  try {
+    for (let from = 0; ; from += 500) {
+      const { data: posts, error } = await supabaseAdmin
+        .from("posts")
+        .select("id, comment_count, reactions(count), comments(count)")
+        .eq("user_id", userId)
+        .range(from, from + 499);
+      if (error) {
+        console.warn("[users] nested like count page failed:", error.message);
+        break;
+      }
+      if (!posts?.length) break;
+      for (const p of posts as any[]) {
+        allPostIds.push(String(p.id));
+        const r = Array.isArray(p.reactions) ? Number(p.reactions[0]?.count ?? 0) : 0;
+        const cNested = Array.isArray(p.comments) ? Number(p.comments[0]?.count ?? 0) : 0;
+        const cCol = Number(p.comment_count ?? 0) || 0;
+        computed +=
+          (Number.isFinite(r) ? r : 0) +
+          Math.max(Number.isFinite(cNested) ? cNested : 0, cCol);
+      }
+      if (posts.length < 500) break;
+    }
+    for (let i = 0; i < allPostIds.length; i += 80) {
+      const chunk = allPostIds.slice(i, i + 80);
+      const { count, error: rErr } = await supabaseAdmin
         .from("posts")
         .select("*", { count: "exact", head: true })
-        .in("repath_of", chunk),
-    ]);
-    if (!reactions.error) computed += reactions.count ?? 0;
-    else console.warn("[users] reactions count failed:", reactions.error.message);
-    if (!comments.error) computed += comments.count ?? 0;
-    else console.warn("[users] comments count failed:", comments.error.message);
-    if (!repaths.error) computed += repaths.count ?? 0;
-    else console.warn("[users] repath count failed:", repaths.error.message);
+        .in("repath_of", chunk);
+      if (!rErr) computed += count ?? 0;
+    }
+  } catch (e) {
+    console.warn("[users] nested like count threw:", e);
   }
 
-  // Notifications are a floor when table counts fail (still from other users).
+  // Fallback: chunked head counts when nested embeds return nothing.
+  if (computed <= 0) {
+    const postIds =
+      allPostIds.length > 0
+        ? allPostIds
+        : await (async () => {
+            const ids: string[] = [];
+            try {
+              for (let from = 0; ; from += 1000) {
+                const { data, error } = await supabaseAdmin
+                  .from("posts")
+                  .select("id")
+                  .eq("user_id", userId)
+                  .range(from, from + 999);
+                if (error || !data?.length) break;
+                for (const row of data) ids.push(String((row as { id: string }).id));
+                if (data.length < 1000) break;
+              }
+            } catch (e) {
+              console.warn("[users] posts id list threw:", e);
+            }
+            return ids;
+          })();
+
+    for (let i = 0; i < postIds.length; i += 80) {
+      const chunk = postIds.slice(i, i + 80);
+      const [reactions, comments, repaths] = await Promise.all([
+        supabaseAdmin
+          .from("reactions")
+          .select("*", { count: "exact", head: true })
+          .in("post_id", chunk),
+        supabaseAdmin
+          .from("comments")
+          .select("*", { count: "exact", head: true })
+          .in("post_id", chunk),
+        supabaseAdmin
+          .from("posts")
+          .select("*", { count: "exact", head: true })
+          .in("repath_of", chunk),
+      ]);
+      if (!reactions.error) computed += reactions.count ?? 0;
+      if (!comments.error) computed += comments.count ?? 0;
+      if (!repaths.error) computed += repaths.count ?? 0;
+    }
+  }
+
+  // Notifications floor (reaction / sheep / comment / repath from anyone).
   try {
     const { count, error } = await supabaseAdmin
       .from("notifications")
@@ -93,20 +133,18 @@ async function countInteractionsReceived(userId: string): Promise<number> {
       .eq("user_id", userId)
       .in("type", ["reaction", "sleep", "comment", "repath"]);
     if (!error && typeof count === "number") computed = Math.max(computed, count);
-    else if (error) console.warn("[users] notification like count failed:", error.message);
-  } catch (e) {
-    console.warn("[users] notification like count threw:", e);
+  } catch {
+    /* ignore */
   }
 
   computed = Math.max(0, computed);
-  // Never wipe a known-good denormalized total with a flaky zero compute.
-  const total = computed > 0 ? computed : stored;
+  const total = Math.max(computed, stored);
 
   if (computed > 0) {
     try {
       await supabaseAdmin.from("profiles").update({ like_count: computed }).eq("id", userId);
-    } catch (e) {
-      console.warn("[users] persist like_count failed:", e);
+    } catch {
+      /* column may not exist yet — boot migration adds it */
     }
   }
 
@@ -183,8 +221,6 @@ function formatProfile(
     postCount,
     momentCount: postCount,
     likeCount, // total likes from anyone — same value for owner and every visitor
-    // Also surface snake_case for older clients / proxies that rewrite keys.
-    like_count: likeCount,
     // Computed age/zodiac, gated by visibility for non-owners.
     age: isOwner || showAge ? age : null,
     zodiac: isOwner || showZodiac ? zodiac : null,
@@ -296,7 +332,7 @@ export function formatPost(p: any, viewerId?: string, blockedIds: string[] = [])
     user: p.profiles
       ? (() => {
           const u = formatProfile(p.profiles);
-          const { friendCount: _f, postCount: _p, momentCount: _m, likeCount: _l, ...author } = u;
+          const { friendCount: _f, postCount: _p, momentCount: _m, likeCount: _l, like_count: _lc, ...author } = u as any;
           return author;
         })()
       : null,
@@ -977,11 +1013,14 @@ usersRouter.get("/profile-stats/:id", async (c) => {
     }
   }
 
-  const { data: targetProfile } = await supabaseAdmin
+  const { data: targetProfile, error: profileErr } = await supabaseAdmin
     .from("profiles")
-    .select("id, status, suspended_reason, like_count")
+    .select("*")
     .eq("id", id)
     .maybeSingle();
+  if (profileErr) {
+    console.warn("[users] profile-stats profile error:", profileErr.message);
+  }
   if (!targetProfile) return c.json({ error: { message: "User not found" } }, 404);
   if (id !== userId && isDeletionHiddenProfile(targetProfile)) {
     return c.json({ error: { message: "User not found" } }, 404);
@@ -1020,11 +1059,14 @@ usersRouter.get("/:id/stats", async (c) => {
     }
   }
 
-  const { data: targetProfile } = await supabaseAdmin
+  const { data: targetProfile, error: profileErr } = await supabaseAdmin
     .from("profiles")
-    .select("id, status, suspended_reason, like_count")
+    .select("*")
     .eq("id", id)
     .maybeSingle();
+  if (profileErr) {
+    console.warn("[users] /:id/stats profile error:", profileErr.message);
+  }
   if (!targetProfile) return c.json({ error: { message: "User not found" } }, 404);
   if (id !== userId && isDeletionHiddenProfile(targetProfile)) {
     return c.json({ error: { message: "User not found" } }, 404);
@@ -1260,21 +1302,23 @@ usersRouter.get("/:id/posts", async (c) => {
 
   const SELECT =
     "*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(avatar_url, gender))";
-  const batchSize = Math.min(Math.max(limit * 3, limit + 15), 80);
+  const batchSize = Math.min(Math.max(limit * 3, limit + 15), 100);
   const collected: any[] = [];
   let dbExhausted = false;
   let guard = 0;
+  let lastScanned: { createdAt: string; id: string } | null = null;
 
   // Over-fetch in batches until we have limit+1 *visible* rows (or the table
   // ends). Filtering audience/section after a single limit+1 fetch previously
   // set hasMore=false too early and froze profile timelines around ~20 items.
-  while (collected.length < limit + 1 && !dbExhausted && guard < 12) {
+  while (collected.length < limit + 1 && !dbExhausted && guard < 25) {
     guard += 1;
     let q = supabaseAdmin
       .from("posts")
       .select(SELECT)
       .eq("user_id", id)
       .order("created_at", { ascending: false })
+      .order("id", { ascending: false })
       .limit(batchSize);
     if (scanCursor?.createdAt) {
       q = q.lte("created_at", scanCursor.createdAt);
@@ -1288,6 +1332,7 @@ usersRouter.get("/:id/posts", async (c) => {
         .select("*, profiles!user_id(*)")
         .eq("user_id", id)
         .order("created_at", { ascending: false })
+        .order("id", { ascending: false })
         .limit(batchSize);
       if (scanCursor?.createdAt) basicQ = basicQ.lte("created_at", scanCursor.createdAt);
       const basic = await basicQ;
@@ -1319,24 +1364,30 @@ usersRouter.get("/:id/posts", async (c) => {
 
     const lastRaw = rows[rows.length - 1];
     if (lastRaw?.created_at && lastRaw?.id) {
-      scanCursor = { createdAt: String(lastRaw.created_at), id: String(lastRaw.id) };
+      lastScanned = { createdAt: String(lastRaw.created_at), id: String(lastRaw.id) };
+      scanCursor = lastScanned;
     } else {
       dbExhausted = true;
       break;
     }
 
-    // Full batch after cursor filter means more rows may exist.
     if (rows.length < batchSize) {
       dbExhausted = true;
     }
   }
 
-  const hasMore = collected.length > limit;
-  const page = hasMore ? collected.slice(0, limit) : collected;
-  const last = page.length > 0 ? page[page.length - 1] : null;
+  // hasMore if we buffered an extra visible row, OR we stopped early while the
+  // table still has older rows (guard / filter), so the client can continue.
+  const hasMore =
+    collected.length > limit || (!dbExhausted && collected.length >= limit);
+  const page = collected.length > limit ? collected.slice(0, limit) : collected;
+  const lastVisible = page.length > 0 ? page[page.length - 1] : null;
+  const cursorSource = lastVisible?.created_at && lastVisible?.id
+    ? { createdAt: String(lastVisible.created_at), id: String(lastVisible.id) }
+    : lastScanned;
   const nextCursor =
-    hasMore && last?.created_at && last?.id
-      ? encodeCursor(String(last.created_at), String(last.id))
+    hasMore && cursorSource
+      ? encodeCursor(cursorSource.createdAt, cursorSource.id)
       : null;
 
   const { attachOriginals } = await import("../lib/load-posts");
