@@ -84,9 +84,8 @@ function formatProfile(p: any) {
     gender: p.gender ?? "",
     coverPhoto: p.cover_url ?? "https://images.unsplash.com/photo-1519638399535-1b036603ac77?w=800",
     joinDate: p.created_at ?? new Date().toISOString(),
-    friendCount: 0,
-    postCount: 0,
-    momentCount: 0,
+    // Omit count fields — zeros here poisoned friend-profile caches so visitors
+    // saw likeCount 0 instead of the real total from GET /api/:id(/stats).
   };
 }
 
