@@ -21,8 +21,8 @@ const usersRouter = new Hono<{ Variables: HonoVariables }>();
 // toggles). Everyone else sees age/zodiac ONLY when the owner has opted in via
 // show_age / show_zodiac, and never sees the raw birthday.
 /**
- * Total interactions received on a user's moments from other people:
- * reactions + comments + repaths. Exposed as `likeCount` for the profile stats.
+ * Total likes received on a user's moments from anyone on the app:
+ * reactions + comments + repaths (no friend-only filter). Exposed as `likeCount`.
  * Uses several PostgREST strategies and takes the highest reliable total so a
  * single flaky embed/join cannot zero-out the profile stat.
  */
@@ -31,7 +31,7 @@ async function countInteractionsReceived(userId: string): Promise<number> {
   let fromChunks = 0;
   let fromNotifs = 0;
 
-  // 1) Nested aggregate counts (no dependency on reactions.id).
+  // 1) Nested aggregate counts (no dependency on reactions.id) — all reactors/commenters.
   try {
     const { data: posts, error } = await supabaseAdmin
       .from("posts")
@@ -51,18 +51,17 @@ async function countInteractionsReceived(userId: string): Promise<number> {
         const { count, error: rErr } = await supabaseAdmin
           .from("posts")
           .select("id", { count: "exact", head: true })
-          .in("repath_of", chunk)
-          .neq("user_id", userId);
+          .in("repath_of", chunk);
         if (!rErr) fromNested += count ?? 0;
       }
     } else if (error) {
-      console.warn("[users] nested interaction count failed:", error.message);
+      console.warn("[users] nested like count failed:", error.message);
     }
   } catch (e) {
-    console.warn("[users] nested interaction count threw:", e);
+    console.warn("[users] nested like count threw:", e);
   }
 
-  // 2) Chunked head counts on reactions/comments/repaths.
+  // 2) Chunked head counts on reactions/comments/repaths from anyone.
   try {
     const { data: posts, error: postsErr } = await supabaseAdmin
       .from("posts")
@@ -76,18 +75,15 @@ async function countInteractionsReceived(userId: string): Promise<number> {
           supabaseAdmin
             .from("reactions")
             .select("user_id", { count: "exact", head: true })
-            .in("post_id", chunk)
-            .neq("user_id", userId),
+            .in("post_id", chunk),
           supabaseAdmin
             .from("comments")
             .select("user_id", { count: "exact", head: true })
-            .in("post_id", chunk)
-            .neq("user_id", userId),
+            .in("post_id", chunk),
           supabaseAdmin
             .from("posts")
             .select("id", { count: "exact", head: true })
-            .in("repath_of", chunk)
-            .neq("user_id", userId),
+            .in("repath_of", chunk),
         ]);
         if (!reactions.error) fromChunks += reactions.count ?? 0;
         else console.warn("[users] reactions count chunk failed:", reactions.error.message);
@@ -98,10 +94,10 @@ async function countInteractionsReceived(userId: string): Promise<number> {
       }
     }
   } catch (e) {
-    console.warn("[users] chunk interaction count threw:", e);
+    console.warn("[users] chunk like count threw:", e);
   }
 
-  // 3) Activity notifications the owner received (always from others).
+  // 3) Activity notifications the owner received (from other users).
   try {
     const { count, error } = await supabaseAdmin
       .from("notifications")
@@ -109,9 +105,9 @@ async function countInteractionsReceived(userId: string): Promise<number> {
       .eq("user_id", userId)
       .in("type", ["reaction", "sleep", "comment", "repath"]);
     if (!error && typeof count === "number") fromNotifs = count;
-    else if (error) console.warn("[users] notification interaction count failed:", error.message);
+    else if (error) console.warn("[users] notification like count failed:", error.message);
   } catch (e) {
-    console.warn("[users] notification interaction count threw:", e);
+    console.warn("[users] notification like count threw:", e);
   }
 
   return Math.max(0, fromNested, fromChunks, fromNotifs);
@@ -185,7 +181,7 @@ function formatProfile(
     friendCount,
     postCount,
     momentCount: postCount,
-    likeCount, // total interactions received (reactions + comments + repaths)
+    likeCount, // total likes received from anyone (reactions + comments + repaths)
     // Computed age/zodiac, gated by visibility for non-owners.
     age: isOwner || showAge ? age : null,
     zodiac: isOwner || showZodiac ? zodiac : null,
