@@ -1240,6 +1240,10 @@ usersRouter.get("/:id/posts", async (c) => {
 
   const { id } = c.req.param();
   const section = (c.req.query("section") ?? "moments").toLowerCase(); // posts | moments
+  const wantAll =
+    c.req.query("all") === "1" ||
+    c.req.query("all") === "true" ||
+    String(c.req.query("limit") ?? "").toLowerCase() === "all";
 
   // If this profile is blocked (either direction), don't expose their moments.
   const blockedIds = userId ? await getBlockedIds(userId) : [];
@@ -1264,8 +1268,8 @@ usersRouter.get("/:id/posts", async (c) => {
     return c.json({ error: { message: "Moments are only visible to friends" } }, 403);
   }
 
-  const limit = parseLimit(c.req.query("limit"), 20, 50);
-  let scanCursor = parseCursor(c.req.query("cursor"));
+  const limit = wantAll ? 500 : parseLimit(c.req.query("limit"), 20, 100);
+  const cursor = parseCursor(c.req.query("cursor"));
 
   let isClose = false;
   if (userId && userId !== id && isFriend) {
@@ -1302,92 +1306,56 @@ usersRouter.get("/:id/posts", async (c) => {
 
   const SELECT =
     "*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(avatar_url, gender))";
-  const batchSize = Math.min(Math.max(limit * 3, limit + 15), 100);
-  const collected: any[] = [];
-  let dbExhausted = false;
-  let guard = 0;
-  let lastScanned: { createdAt: string; id: string } | null = null;
 
-  // Over-fetch in batches until we have limit+1 *visible* rows (or the table
-  // ends). Filtering audience/section after a single limit+1 fetch previously
-  // set hasMore=false too early and froze profile timelines around ~20 items.
-  while (collected.length < limit + 1 && !dbExhausted && guard < 25) {
-    guard += 1;
-    let q = supabaseAdmin
+  // Load the user's full post list (paged from DB), then filter + slice in memory.
+  // Cursor-only over-fetch previously under-reported hasMore and froze UIs at ~20.
+  const allRows: any[] = [];
+  for (let from = 0; ; from += 500) {
+    let { data: batch, error: batchErr } = await supabaseAdmin
       .from("posts")
       .select(SELECT)
       .eq("user_id", id)
       .order("created_at", { ascending: false })
       .order("id", { ascending: false })
-      .limit(batchSize);
-    if (scanCursor?.createdAt) {
-      q = q.lte("created_at", scanCursor.createdAt);
-    }
+      .range(from, from + 499);
 
-    let { data: batch, error: batchErr } = await q;
     if (batchErr) {
       console.warn("[users/posts] nested select failed, retrying basic:", batchErr.message);
-      let basicQ = supabaseAdmin
+      const basic = await supabaseAdmin
         .from("posts")
         .select("*, profiles!user_id(*)")
         .eq("user_id", id)
         .order("created_at", { ascending: false })
         .order("id", { ascending: false })
-        .limit(batchSize);
-      if (scanCursor?.createdAt) basicQ = basicQ.lte("created_at", scanCursor.createdAt);
-      const basic = await basicQ;
+        .range(from, from + 499);
       batch = basic.data ?? [];
-      batchErr = basic.error;
-      if (batchErr) {
-        console.error("[users/posts] query failed:", batchErr.message);
+      if (basic.error) {
+        console.error("[users/posts] query failed:", basic.error.message);
         break;
       }
     }
 
-    let rows = batch ?? [];
-    if (scanCursor) {
-      rows = rows.filter((p: any) =>
-        isOlderThanCursor(String(p.created_at ?? ""), String(p.id ?? ""), scanCursor!)
-      );
-    }
-
-    if (rows.length === 0) {
-      dbExhausted = true;
-      break;
-    }
-
-    for (const p of rows) {
-      if (!passesAudience(p) || !passesSection(p)) continue;
-      collected.push(p);
-      if (collected.length >= limit + 1) break;
-    }
-
-    const lastRaw = rows[rows.length - 1];
-    if (lastRaw?.created_at && lastRaw?.id) {
-      lastScanned = { createdAt: String(lastRaw.created_at), id: String(lastRaw.id) };
-      scanCursor = lastScanned;
-    } else {
-      dbExhausted = true;
-      break;
-    }
-
-    if (rows.length < batchSize) {
-      dbExhausted = true;
-    }
+    const rows = batch ?? [];
+    if (rows.length === 0) break;
+    allRows.push(...rows);
+    if (rows.length < 500) break;
   }
 
-  // hasMore if we buffered an extra visible row, OR we stopped early while the
-  // table still has older rows (guard / filter), so the client can continue.
-  const hasMore =
-    collected.length > limit || (!dbExhausted && collected.length >= limit);
-  const page = collected.length > limit ? collected.slice(0, limit) : collected;
-  const lastVisible = page.length > 0 ? page[page.length - 1] : null;
-  const cursorSource = lastVisible?.created_at && lastVisible?.id
-    ? { createdAt: String(lastVisible.created_at), id: String(lastVisible.id) }
-    : lastScanned;
+  const visibleAll = allRows.filter((p) => passesAudience(p) && passesSection(p));
+  const fullVisibleCount = visibleAll.length;
+  let visible = visibleAll;
+  if (cursor) {
+    visible = visible.filter((p: any) =>
+      isOlderThanCursor(String(p.created_at ?? ""), String(p.id ?? ""), cursor)
+    );
+  }
+
+  const hasMore = !wantAll && visible.length > limit;
+  const page = hasMore ? visible.slice(0, limit) : visible.slice(0, wantAll ? visible.length : limit);
+  const last = page.length > 0 ? page[page.length - 1] : null;
   const nextCursor =
-    hasMore && cursorSource
-      ? encodeCursor(cursorSource.createdAt, cursorSource.id)
+    hasMore && last?.created_at && last?.id
+      ? encodeCursor(String(last.created_at), String(last.id))
       : null;
 
   const { attachOriginals } = await import("../lib/load-posts");
@@ -1395,7 +1363,15 @@ usersRouter.get("/:id/posts", async (c) => {
 
   const formatted = page.map((p) => formatPost(p, userId ?? undefined, blockedIds));
   await refreshFriendshipAvatars(formatted);
-  return c.json({ data: formatted, nextCursor, hasMore, limit });
+
+  return c.json({
+    data: formatted,
+    nextCursor,
+    hasMore,
+    limit: wantAll ? page.length : limit,
+    // Full filtered timeline size (ignores cursor) — client can trust Moments stat.
+    totalVisible: cursor ? undefined : fullVisibleCount,
+  });
 });
 
 export { usersRouter };
