@@ -1223,106 +1223,116 @@ usersRouter.get("/:id/posts", async (c) => {
   }
 
   const limit = parseLimit(c.req.query("limit"), 20, 50);
-  const cursor = parseCursor(c.req.query("cursor"));
-  const offsetRaw = Number.parseInt(String(c.req.query("offset") ?? ""), 10);
-  const offset = Number.isFinite(offsetRaw) && offsetRaw > 0 ? offsetRaw : 0;
+  let scanCursor = parseCursor(c.req.query("cursor"));
 
-  const applyPaging = (q: any) => {
-    if (cursor?.createdAt) {
-      return q.lte("created_at", cursor.createdAt).limit(limit + 1);
+  let isClose = false;
+  if (userId && userId !== id && isFriend) {
+    let { data: star } = await supabaseAdmin
+      .from("close_friends")
+      .select("friend_id")
+      .eq("user_id", id)
+      .eq("friend_id", userId)
+      .maybeSingle();
+    if (!star) {
+      ({ data: star } = await supabaseAdmin
+        .from("close_friends")
+        .select("friend_id")
+        .eq("owner_id", id)
+        .eq("friend_id", userId)
+        .maybeSingle());
     }
-    if (offset > 0) {
-      // Inclusive range — fetch one extra row for hasMore.
-      return q.range(offset, offset + limit);
-    }
-    return q.limit(limit + 1);
+    isClose = !!star;
+  }
+
+  const passesAudience = (p: any): boolean => {
+    if (isOwner) return true;
+    const audience = p.audience ?? "friends";
+    if (audience === "public") return true;
+    if (audience === "private") return false;
+    if (audience === "close") return isClose;
+    return isFriend;
   };
 
-  let postsQuery = applyPaging(
-    supabaseAdmin
+  const passesSection = (p: any): boolean => {
+    if (section !== "posts") return true;
+    return !!(p.content || p.image_url || p.location || p.type === "location");
+  };
+
+  const SELECT =
+    "*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(avatar_url, gender))";
+  const batchSize = Math.min(Math.max(limit * 3, limit + 15), 80);
+  const collected: any[] = [];
+  let dbExhausted = false;
+  let guard = 0;
+
+  // Over-fetch in batches until we have limit+1 *visible* rows (or the table
+  // ends). Filtering audience/section after a single limit+1 fetch previously
+  // set hasMore=false too early and froze profile timelines around ~20 items.
+  while (collected.length < limit + 1 && !dbExhausted && guard < 12) {
+    guard += 1;
+    let q = supabaseAdmin
       .from("posts")
-      .select("*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(avatar_url, gender))")
+      .select(SELECT)
       .eq("user_id", id)
       .order("created_at", { ascending: false })
-  );
+      .limit(batchSize);
+    if (scanCursor?.createdAt) {
+      q = q.lte("created_at", scanCursor.createdAt);
+    }
 
-  const { data: posts, error: postsErr } = await postsQuery;
-
-  let all = posts ?? [];
-  if (postsErr) {
-    console.warn("[users/posts] nested select failed, retrying basic:", postsErr.message);
-    const { data: basic, error: basicErr } = await applyPaging(
-      supabaseAdmin
+    let { data: batch, error: batchErr } = await q;
+    if (batchErr) {
+      console.warn("[users/posts] nested select failed, retrying basic:", batchErr.message);
+      let basicQ = supabaseAdmin
         .from("posts")
         .select("*, profiles!user_id(*)")
         .eq("user_id", id)
         .order("created_at", { ascending: false })
-    );
-    all = basic ?? [];
-    if (basicErr || !basic) {
-      const { data: min, error: minErr } = await applyPaging(
-        supabaseAdmin
-          .from("posts")
-          .select("*")
-          .eq("user_id", id)
-          .order("created_at", { ascending: false })
+        .limit(batchSize);
+      if (scanCursor?.createdAt) basicQ = basicQ.lte("created_at", scanCursor.createdAt);
+      const basic = await basicQ;
+      batch = basic.data ?? [];
+      batchErr = basic.error;
+      if (batchErr) {
+        console.error("[users/posts] query failed:", batchErr.message);
+        break;
+      }
+    }
+
+    let rows = batch ?? [];
+    if (scanCursor) {
+      rows = rows.filter((p: any) =>
+        isOlderThanCursor(String(p.created_at ?? ""), String(p.id ?? ""), scanCursor!)
       );
-      if (minErr) console.error("[users/posts] query failed:", minErr.message);
-      all = min ?? [];
-      if (all.length > 0 && !all[0]?.profiles) {
-        const authorIds = Array.from(new Set(all.map((p: any) => p.user_id).filter(Boolean)));
-        const { data: profiles } = await supabaseAdmin.from("profiles").select("*").in("id", authorIds);
-        const byId = new Map((profiles ?? []).map((p: any) => [p.id, p]));
-        for (const p of all) p.profiles = byId.get(p.user_id) ?? null;
-      }
+    }
+
+    if (rows.length === 0) {
+      dbExhausted = true;
+      break;
+    }
+
+    for (const p of rows) {
+      if (!passesAudience(p) || !passesSection(p)) continue;
+      collected.push(p);
+      if (collected.length >= limit + 1) break;
+    }
+
+    const lastRaw = rows[rows.length - 1];
+    if (lastRaw?.created_at && lastRaw?.id) {
+      scanCursor = { createdAt: String(lastRaw.created_at), id: String(lastRaw.id) };
+    } else {
+      dbExhausted = true;
+      break;
+    }
+
+    // Full batch after cursor filter means more rows may exist.
+    if (rows.length < batchSize) {
+      dbExhausted = true;
     }
   }
 
-  if (cursor) {
-    all = all.filter((p: any) =>
-      isOlderThanCursor(String(p.created_at ?? ""), String(p.id ?? ""), cursor)
-    );
-  }
-
-  let visible = all;
-  if (userId && userId !== id) {
-    let isClose = false;
-    if (isFriend) {
-      let { data: star } = await supabaseAdmin
-        .from("close_friends")
-        .select("friend_id")
-        .eq("user_id", id)
-        .eq("friend_id", userId)
-        .maybeSingle();
-      if (!star) {
-        ({ data: star } = await supabaseAdmin
-          .from("close_friends")
-          .select("friend_id")
-          .eq("owner_id", id)
-          .eq("friend_id", userId)
-          .maybeSingle());
-      }
-      isClose = !!star;
-    }
-
-    visible = all.filter((p: any) => {
-      const audience = p.audience ?? "friends";
-      if (audience === "public") return true;
-      if (audience === "private") return false;
-      if (audience === "close") return isClose;
-      return isFriend;
-    });
-  }
-
-  // "Posts" = moments that include media or written content; "Moments" = full timeline.
-  if (section === "posts") {
-    visible = visible.filter(
-      (p: any) => !!(p.content || p.image_url || p.location || p.type === "location")
-    );
-  }
-
-  const hasMore = visible.length > limit;
-  const page = hasMore ? visible.slice(0, limit) : visible;
+  const hasMore = collected.length > limit;
+  const page = hasMore ? collected.slice(0, limit) : collected;
   const last = page.length > 0 ? page[page.length - 1] : null;
   const nextCursor =
     hasMore && last?.created_at && last?.id
