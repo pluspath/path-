@@ -46,7 +46,11 @@ function firstZodMessage(error: { issues: IssueLike[] }): string {
 const signupSchema = z.object({
   email: z.string().email(),
   password: z.string().min(6),
-  username: z.string().min(3),
+  username: z
+    .string()
+    .trim()
+    .toLowerCase()
+    .regex(/^[a-z0-9_]{3,30}$/, "Username must be 3–30 characters: letters, numbers, underscore."),
   fullName: z.string().min(1),
   gender: z.enum(["Male", "Female"]).optional().nullable(),
   birthday: z

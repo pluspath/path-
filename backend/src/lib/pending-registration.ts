@@ -104,8 +104,16 @@ export async function startRegistration(
   input: StartRegistrationInput
 ): Promise<{ ok: true } | { ok: false; message: string; status?: number }> {
   const email = input.email.toLowerCase().trim();
-  const username = input.username.toLowerCase().trim();
+  const username = input.username.toLowerCase().trim().replace(/^@+/, "");
   const now = Date.now();
+
+  if (!/^[a-z0-9_]{3,30}$/.test(username)) {
+    return {
+      ok: false,
+      message: "Username must be 3–30 characters: letters, numbers, underscore.",
+      status: 400,
+    };
+  }
 
   await purgeExpiredPendingRegistrations();
 

@@ -228,7 +228,7 @@ async function extractUpload(c: any, defaultType: string): Promise<ExtractedFile
   let file: any = null;
   try {
     const body = await c.req.parseBody({ all: true });
-    file = body["file"] ?? body["image"] ?? body["audio"];
+    file = body["file"] ?? body["image"] ?? body["audio"] ?? body["video"];
     if (Array.isArray(file)) file = file[0];
   } catch (e) {
     console.warn("[upload] parseBody failed, trying formData:", e instanceof Error ? e.message : e);
@@ -237,7 +237,7 @@ async function extractUpload(c: any, defaultType: string): Promise<ExtractedFile
   if (!file || typeof file === "string") {
     try {
       const form = await c.req.formData();
-      file = form.get("file") ?? form.get("image") ?? form.get("audio");
+      file = form.get("file") ?? form.get("image") ?? form.get("audio") ?? form.get("video");
     } catch {
       /* ignore */
     }

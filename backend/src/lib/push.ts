@@ -248,14 +248,15 @@ export async function getBadgeBreakdown(client: any, userId: string): Promise<Ba
 
 /**
  * App-icon badge on outbound push = unread notifications + unread DMs.
- * At least 1 when a push is being delivered.
+ * Exact total (0–99). Callers that deliver a user-visible alert may bump to
+ * at least 1 so the icon never stays blank for a brand-new unread event.
  */
 export async function getUnreadNotificationBadgeCount(
   client: any,
   userId: string
 ): Promise<number> {
   const { total } = await getBadgeBreakdown(client, userId);
-  return Math.max(1, total);
+  return Math.max(0, Math.min(99, total));
 }
 
 export async function getAppIconBadgeCount(
@@ -728,10 +729,13 @@ export async function sendPushToUser(
       return;
     }
     // Optional badge override skips the unread COUNT round-trip.
-    const badge =
+    // Alert pushes use at least 1 so APNs always paints the icon when a new
+    // unread event is delivered (exact total after the notification insert).
+    let badge =
       typeof opts?.badge === "number" && Number.isFinite(opts.badge)
-        ? Math.max(1, Math.min(99, Math.floor(opts.badge)))
+        ? Math.max(0, Math.min(99, Math.floor(opts.badge)))
         : await getUnreadNotificationBadgeCount(client, userId);
+    if (badge < 1) badge = 1;
     console.log(
       `[push] Sending "${title}" to user ${userId.slice(0, 8)}… (${tokens.length} device(s), badge=${badge})`
     );

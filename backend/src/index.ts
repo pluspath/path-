@@ -24,6 +24,7 @@ import { apiLimiter, authLimiter } from "./lib/rate-limit";
 import { secureHeadersMiddleware } from "./admin/middlewares/secure-headers";
 import { backfillJoinedPosts } from "./lib/joined";
 import { backfillGenderAvatars } from "./lib/avatar";
+import { backfillMissingUsernames } from "./lib/username-backfill";
 import { env, supabaseProjectRef } from "./env";
 import {
   purgeExpiredDeletionAccounts,
@@ -366,6 +367,11 @@ app.get("/__marketing", (c) =>
   // Apply stylized default avatars for users who never uploaded a custom photo.
   // Safe: skips every custom Supabase/upload URL; only empty + DiceBear + old defaults.
   await backfillGenderAvatars();
+
+  // Legacy accounts (pre-mandatory username / partial upserts) may have NULL
+  // profiles.username even when auth metadata has a handle. Fill uniquely;
+  // never overwrite an existing valid username.
+  await backfillMissingUsernames();
 
   // Purge accounts past the deletion grace window + send day-29 reminders, then every 6 hours.
   const runDeletionJobs = async () => {

@@ -615,7 +615,7 @@ friendsRouter.post("/accept/:id", async (c) => {
     void sendPushToUser(
       supabaseAdmin,
       friendship.requester_id,
-      "Friend Request Accepted",
+      user.full_name || "Path+",
       `${user.full_name} accepted your friend request`,
       {
         type: "friend_accepted",

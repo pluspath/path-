@@ -9,7 +9,10 @@ import { upsertUserDevice, deactivateUserDevices, getPushTokensForUser, getPushS
 import { isCustomAvatar, defaultAvatarForGender, resolveAvatarUrl, normalizeGender } from "../lib/avatar";
 import { isDeletionHiddenProfile } from "../lib/account-deletion";
 import { parseLimit, parseCursor, encodeCursor, isOlderThanCursor } from "../lib/pagination";
+import { ensureUserHasUsername } from "../lib/username-backfill";
 import type { HonoVariables, Profile } from "../types";
+
+const USERNAME_RE = /^[a-z0-9_]{3,30}$/;
 
 const usersRouter = new Hono<{ Variables: HonoVariables }>();
 
@@ -17,7 +20,34 @@ const usersRouter = new Hono<{ Variables: HonoVariables }>();
 // sees their own age/zodiac (plus the raw birthday, needed to drive the
 // toggles). Everyone else sees age/zodiac ONLY when the owner has opted in via
 // show_age / show_zodiac, and never sees the raw birthday.
-function formatProfile(p: any, postCount = 0, friendCount = 0, viewerId?: string) {
+/** Total reactions received across all of a user's posts/moments. */
+async function countLikesReceived(userId: string): Promise<number> {
+  const { data: posts, error } = await supabaseAdmin.from("posts").select("id").eq("user_id", userId);
+  if (error || !posts?.length) return 0;
+  const ids = posts.map((p: { id: string }) => p.id);
+  let total = 0;
+  for (let i = 0; i < ids.length; i += 80) {
+    const chunk = ids.slice(i, i + 80);
+    const { count, error: cErr } = await supabaseAdmin
+      .from("reactions")
+      .select("id", { count: "exact", head: true })
+      .in("post_id", chunk);
+    if (cErr) {
+      console.warn("[users] likes count chunk failed:", cErr.message);
+      continue;
+    }
+    total += count ?? 0;
+  }
+  return total;
+}
+
+function formatProfile(
+  p: any,
+  postCount = 0,
+  friendCount = 0,
+  viewerId?: string,
+  likeCount = 0
+) {
   const isOwner = !!viewerId && viewerId === p.id;
   const showAge = p.show_age ?? false;
   const showZodiac = p.show_zodiac ?? false;
@@ -57,6 +87,7 @@ function formatProfile(p: any, postCount = 0, friendCount = 0, viewerId?: string
     friendCount,
     postCount,
     momentCount: postCount,
+    likeCount,
     // Computed age/zodiac, gated by visibility for non-owners.
     age: isOwner || showAge ? age : null,
     zodiac: isOwner || showZodiac ? zodiac : null,
@@ -407,20 +438,35 @@ usersRouter.get("/me", async (c) => {
 
   const userClient = createUserClient(token);
 
-  const [postsResult, friendsResult] = await Promise.all([
+  const [postsResult, friendsResult, likeCount] = await Promise.all([
     userClient.from("posts").select("id", { count: "exact", head: true }).eq("user_id", userId),
     supabaseAdmin.from("friendships").select("id", { count: "exact", head: true }).eq("status", "accepted").or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
+    countLikesReceived(userId),
   ]);
 
   // Always read the profile row so username/avatar stay in sync with the DB.
-  const { data: profileRow } = await supabaseAdmin
+  let { data: profileRow } = await supabaseAdmin
     .from("profiles")
     .select("*")
     .eq("id", userId)
     .maybeSingle();
 
+  // Heal legacy rows missing username (also runs on boot; this covers mid-session).
+  const haveUsername = USERNAME_RE.test(
+    String(profileRow?.username ?? "")
+      .trim()
+      .toLowerCase()
+  );
+  if (profileRow && !haveUsername) {
+    await ensureUserHasUsername(userId);
+    const refreshed = await supabaseAdmin.from("profiles").select("*").eq("id", userId).maybeSingle();
+    profileRow = refreshed.data ?? profileRow;
+  }
+
   const profile = profileRow ?? user;
-  return c.json({ data: formatProfile(profile, postsResult.count ?? 0, friendsResult.count ?? 0, userId) });
+  return c.json({
+    data: formatProfile(profile, postsResult.count ?? 0, friendsResult.count ?? 0, userId, likeCount),
+  });
 });
 
 // POST /api/set-gender — optional gender selection (Apple 5.1.1(v)).
@@ -472,7 +518,13 @@ usersRouter.put("/me", async (c) => {
   const body = await c.req.json();
 
   if (body.username) {
-    const trimmedUsername = body.username.toLowerCase().trim();
+    const trimmedUsername = body.username.toLowerCase().trim().replace(/^@+/, "");
+    if (!USERNAME_RE.test(trimmedUsername)) {
+      return c.json(
+        { error: { message: "Username must be 3–30 characters: letters, numbers, underscore." } },
+        400
+      );
+    }
     const { data: existing } = await supabase
       .from("profiles")
       .select("id")
@@ -841,42 +893,52 @@ usersRouter.get("/:id", async (c) => {
     return c.json({ error: { message: "User not found" } }, 404);
   }
 
-  // If identity fields are blank on the profile row, fill from auth metadata
-  // (older accounts / partial upserts) without inventing new values.
+  // Persist a username when the profile row is missing one (legacy accounts).
   let enriched = targetProfile;
-  const needsIdentity =
-    !String(targetProfile.full_name ?? "").trim() ||
-    !String(targetProfile.username ?? "").trim();
-  if (needsIdentity) {
+  const needsUsername = !USERNAME_RE.test(
+    String(targetProfile.username ?? "")
+      .trim()
+      .toLowerCase()
+  );
+  if (needsUsername || !String(targetProfile.full_name ?? "").trim()) {
+    if (needsUsername) {
+      await ensureUserHasUsername(id);
+    }
     try {
       const { data: authData } = await supabaseAdmin.auth.admin.getUserById(id);
       const meta = authData?.user?.user_metadata ?? {};
+      const { data: fresh } = await supabaseAdmin.from("profiles").select("*").eq("id", id).maybeSingle();
+      const row = fresh ?? targetProfile;
       enriched = {
-        ...targetProfile,
+        ...row,
         full_name:
-          String(targetProfile.full_name ?? "").trim() ||
+          String(row.full_name ?? "").trim() ||
           String(meta.full_name ?? meta.name ?? "").trim() ||
-          targetProfile.full_name,
-        username:
-          String(targetProfile.username ?? "").trim() ||
-          String(meta.username ?? "").trim() ||
-          targetProfile.username,
+          row.full_name,
+        username: String(row.username ?? "").trim() || String(meta.username ?? "").trim() || row.username,
       };
     } catch (e) {
-      console.warn("[users] GET /:id auth metadata fallback failed:", e);
+      console.warn("[users] GET /:id identity heal failed:", e);
     }
   }
 
-  const [postsResult, friendsResult] = await Promise.all([
+  const [postsResult, friendsResult, likeCount] = await Promise.all([
     supabaseAdmin.from("posts").select("id", { count: "exact", head: true }).eq("user_id", id),
     // True total friend count — uses the admin client so RLS doesn't restrict the
     // count to only the friendships the *viewer* is part of (which made the count
     // differ per viewer). Same number for everyone now.
     supabaseAdmin.from("friendships").select("id", { count: "exact", head: true }).eq("status", "accepted").or(`requester_id.eq.${id},receiver_id.eq.${id}`),
+    countLikesReceived(id),
   ]);
 
   return c.json({
-    data: formatProfile(enriched, postsResult.count ?? 0, friendsResult.count ?? 0, userId ?? undefined),
+    data: formatProfile(
+      enriched,
+      postsResult.count ?? 0,
+      friendsResult.count ?? 0,
+      userId ?? undefined,
+      likeCount
+    ),
   });
 });
 
@@ -906,12 +968,9 @@ usersRouter.get("/:id/friends", async (c) => {
 
   const isOwner = userId === id;
   const isFriend = isOwner ? true : await areFriends(userId, id);
-  const allowed = canViewSection(
-    isOwner,
-    isFriend,
-    profile.show_friends_to_friends ?? true,
-    profile.show_friends_to_others ?? false
-  );
+  // Friends (and owner) can always open the list. Non-friends need
+  // Friends List Visibility (show_friends_to_others) ON.
+  const allowed = isOwner || isFriend || !!(profile.show_friends_to_others ?? false);
   if (!allowed) {
     return c.json({ error: { message: "This friends list is private" } }, 403);
   }
@@ -968,25 +1027,14 @@ usersRouter.get("/:id/posts", async (c) => {
 
   const isFriend = isOwner ? true : userId ? await areFriends(userId, id) : false;
 
-  if (section === "posts") {
-    const allowed = canViewSection(
-      isOwner,
-      isFriend,
-      ownerProfile.show_posts_to_friends ?? true,
-      ownerProfile.show_posts_to_others ?? true
-    );
-    if (!allowed) return c.json({ error: { message: "Posts are private" } }, 403);
-  } else {
-    const allowed = canViewSection(
-      isOwner,
-      isFriend,
-      ownerProfile.show_moments_to_friends ?? true,
-      ownerProfile.show_moments_to_others ?? true
-    );
-    if (!allowed) return c.json({ error: { message: "Moments are private" } }, 403);
+  // Obsolete per-section post/moment visibility switches were removed from the
+  // app. Keep the default Path+ rule: owner + friends see the timeline; do not
+  // let stale DB flags hide content from friends.
+  if (!isOwner && !isFriend) {
+    return c.json({ error: { message: "Moments are only visible to friends" } }, 403);
   }
 
-  const limit = parseLimit(c.req.query("limit"), 50, 100);
+  const limit = parseLimit(c.req.query("limit"), 20, 50);
   const cursor = parseCursor(c.req.query("cursor"));
   const offsetRaw = Number.parseInt(String(c.req.query("offset") ?? ""), 10);
   const offset = Number.isFinite(offsetRaw) && offsetRaw > 0 ? offsetRaw : 0;
