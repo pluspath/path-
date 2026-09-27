@@ -20,18 +20,38 @@ const usersRouter = new Hono<{ Variables: HonoVariables }>();
 // sees their own age/zodiac (plus the raw birthday, needed to drive the
 // toggles). Everyone else sees age/zodiac ONLY when the owner has opted in via
 // show_age / show_zodiac, and never sees the raw birthday.
-/** Total reactions received across all of a user's posts/moments. */
+/** Total reactions received across all of a user's posts/moments (from others). */
 async function countLikesReceived(userId: string): Promise<number> {
-  const { data: posts, error } = await supabaseAdmin.from("posts").select("id").eq("user_id", userId);
-  if (error || !posts?.length) return 0;
+  // Prefer a single joined count — reactions has no standalone `id` column
+  // (PK is typically post_id+user_id), so selecting "id" always failed → 0 likes.
+  try {
+    const { count, error } = await supabaseAdmin
+      .from("reactions")
+      .select("post_id, posts!inner(user_id)", { count: "exact", head: true })
+      .eq("posts.user_id", userId)
+      .neq("user_id", userId);
+    if (!error && typeof count === "number") return Math.max(0, count);
+    if (error) {
+      console.warn("[users] likes join count failed, falling back:", error.message);
+    }
+  } catch (e) {
+    console.warn("[users] likes join count threw:", e);
+  }
+
+  const { data: posts, error: postsErr } = await supabaseAdmin
+    .from("posts")
+    .select("id")
+    .eq("user_id", userId);
+  if (postsErr || !posts?.length) return 0;
   const ids = posts.map((p: { id: string }) => p.id);
   let total = 0;
   for (let i = 0; i < ids.length; i += 80) {
     const chunk = ids.slice(i, i + 80);
     const { count, error: cErr } = await supabaseAdmin
       .from("reactions")
-      .select("id", { count: "exact", head: true })
-      .in("post_id", chunk);
+      .select("post_id", { count: "exact", head: true })
+      .in("post_id", chunk)
+      .neq("user_id", userId);
     if (cErr) {
       console.warn("[users] likes count chunk failed:", cErr.message);
       continue;
