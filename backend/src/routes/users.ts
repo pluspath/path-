@@ -23,74 +23,120 @@ const usersRouter = new Hono<{ Variables: HonoVariables }>();
 /**
  * Total interactions received on a user's moments from other people:
  * reactions + comments + repaths. Exposed as `likeCount` for the profile stats.
+ * Uses several PostgREST strategies and takes the highest reliable total so a
+ * single flaky embed/join cannot zero-out the profile stat.
  */
 async function countInteractionsReceived(userId: string): Promise<number> {
-  const { data: posts, error: postsErr } = await supabaseAdmin
-    .from("posts")
-    .select("id")
-    .eq("user_id", userId);
-  if (postsErr || !posts?.length) return 0;
-  const ids = posts.map((p: { id: string }) => p.id);
+  let fromNested = 0;
+  let fromChunks = 0;
+  let fromNotifs = 0;
 
-  const countOnPosts = async (
-    table: "reactions" | "comments"
-  ): Promise<number> => {
-    // Fast path: inner join filter by post owner.
-    try {
-      const { count, error } = await supabaseAdmin
-        .from(table)
-        .select("post_id, posts!inner(user_id)", { count: "exact", head: true })
-        .eq("posts.user_id", userId)
-        .neq("user_id", userId);
-      if (!error && typeof count === "number") return Math.max(0, count);
-      if (error) {
-        console.warn(`[users] ${table} join count failed, falling back:`, error.message);
+  // 1) Nested aggregate counts (no dependency on reactions.id).
+  try {
+    const { data: posts, error } = await supabaseAdmin
+      .from("posts")
+      .select("id, reactions(count), comments(count)")
+      .eq("user_id", userId);
+    if (!error && Array.isArray(posts)) {
+      const postIds: string[] = [];
+      for (const p of posts as any[]) {
+        postIds.push(String(p.id));
+        const r = Array.isArray(p.reactions) ? Number(p.reactions[0]?.count ?? 0) : 0;
+        const c = Array.isArray(p.comments) ? Number(p.comments[0]?.count ?? 0) : 0;
+        fromNested += (Number.isFinite(r) ? r : 0) + (Number.isFinite(c) ? c : 0);
       }
-    } catch (e) {
-      console.warn(`[users] ${table} join count threw:`, e);
-    }
-
-    let total = 0;
-    for (let i = 0; i < ids.length; i += 80) {
-      const chunk = ids.slice(i, i + 80);
-      const { count, error: cErr } = await supabaseAdmin
-        .from(table)
-        .select("post_id", { count: "exact", head: true })
-        .in("post_id", chunk)
-        .neq("user_id", userId);
-      if (cErr) {
-        console.warn(`[users] ${table} count chunk failed:`, cErr.message);
-        continue;
+      for (let i = 0; i < postIds.length; i += 80) {
+        const chunk = postIds.slice(i, i + 80);
+        if (chunk.length === 0) break;
+        const { count, error: rErr } = await supabaseAdmin
+          .from("posts")
+          .select("id", { count: "exact", head: true })
+          .in("repath_of", chunk)
+          .neq("user_id", userId);
+        if (!rErr) fromNested += count ?? 0;
       }
-      total += count ?? 0;
+    } else if (error) {
+      console.warn("[users] nested interaction count failed:", error.message);
     }
-    return total;
-  };
+  } catch (e) {
+    console.warn("[users] nested interaction count threw:", e);
+  }
 
-  const countRepaths = async (): Promise<number> => {
-    let total = 0;
-    for (let i = 0; i < ids.length; i += 80) {
-      const chunk = ids.slice(i, i + 80);
-      const { count, error: cErr } = await supabaseAdmin
-        .from("posts")
-        .select("id", { count: "exact", head: true })
-        .in("repath_of", chunk)
-        .neq("user_id", userId);
-      if (cErr) {
-        console.warn("[users] repath count chunk failed:", cErr.message);
-        continue;
+  // 2) Chunked head counts on reactions/comments/repaths.
+  try {
+    const { data: posts, error: postsErr } = await supabaseAdmin
+      .from("posts")
+      .select("id")
+      .eq("user_id", userId);
+    if (!postsErr && posts?.length) {
+      const ids = posts.map((p: { id: string }) => p.id);
+      for (let i = 0; i < ids.length; i += 80) {
+        const chunk = ids.slice(i, i + 80);
+        const [reactions, comments, repaths] = await Promise.all([
+          supabaseAdmin
+            .from("reactions")
+            .select("user_id", { count: "exact", head: true })
+            .in("post_id", chunk)
+            .neq("user_id", userId),
+          supabaseAdmin
+            .from("comments")
+            .select("user_id", { count: "exact", head: true })
+            .in("post_id", chunk)
+            .neq("user_id", userId),
+          supabaseAdmin
+            .from("posts")
+            .select("id", { count: "exact", head: true })
+            .in("repath_of", chunk)
+            .neq("user_id", userId),
+        ]);
+        if (!reactions.error) fromChunks += reactions.count ?? 0;
+        else console.warn("[users] reactions count chunk failed:", reactions.error.message);
+        if (!comments.error) fromChunks += comments.count ?? 0;
+        else console.warn("[users] comments count chunk failed:", comments.error.message);
+        if (!repaths.error) fromChunks += repaths.count ?? 0;
+        else console.warn("[users] repath count chunk failed:", repaths.error.message);
       }
-      total += count ?? 0;
     }
-    return total;
-  };
+  } catch (e) {
+    console.warn("[users] chunk interaction count threw:", e);
+  }
 
-  const [reactions, comments, repaths] = await Promise.all([
-    countOnPosts("reactions"),
-    countOnPosts("comments"),
-    countRepaths(),
+  // 3) Activity notifications the owner received (always from others).
+  try {
+    const { count, error } = await supabaseAdmin
+      .from("notifications")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", userId)
+      .in("type", ["reaction", "sleep", "comment", "repath"]);
+    if (!error && typeof count === "number") fromNotifs = count;
+    else if (error) console.warn("[users] notification interaction count failed:", error.message);
+  } catch (e) {
+    console.warn("[users] notification interaction count threw:", e);
+  }
+
+  return Math.max(0, fromNested, fromChunks, fromNotifs);
+}
+
+/** Friend + moment + interaction counts for a profile response. */
+async function loadProfileStatCounts(userId: string): Promise<{
+  postCount: number;
+  friendCount: number;
+  likeCount: number;
+}> {
+  const [postsResult, friendsResult, likeCount] = await Promise.all([
+    supabaseAdmin.from("posts").select("id", { count: "exact", head: true }).eq("user_id", userId),
+    supabaseAdmin
+      .from("friendships")
+      .select("id", { count: "exact", head: true })
+      .eq("status", "accepted")
+      .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
+    countInteractionsReceived(userId),
   ]);
-  return reactions + comments + repaths;
+  return {
+    postCount: postsResult.count ?? 0,
+    friendCount: friendsResult.count ?? 0,
+    likeCount,
+  };
 }
 
 function formatProfile(
@@ -488,14 +534,6 @@ usersRouter.get("/me", async (c) => {
   const token = c.get("accessToken");
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
-  const userClient = createUserClient(token);
-
-  const [postsResult, friendsResult, likeCount] = await Promise.all([
-    userClient.from("posts").select("id", { count: "exact", head: true }).eq("user_id", userId),
-    supabaseAdmin.from("friendships").select("id", { count: "exact", head: true }).eq("status", "accepted").or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
-    countInteractionsReceived(userId),
-  ]);
-
   // Always read the profile row so username/avatar stay in sync with the DB.
   let { data: profileRow } = await supabaseAdmin
     .from("profiles")
@@ -516,8 +554,9 @@ usersRouter.get("/me", async (c) => {
   }
 
   const profile = profileRow ?? user;
+  const counts = await loadProfileStatCounts(userId);
   return c.json({
-    data: formatProfile(profile, postsResult.count ?? 0, friendsResult.count ?? 0, userId, likeCount),
+    data: formatProfile(profile, counts.postCount, counts.friendCount, userId, counts.likeCount),
   });
 });
 
@@ -557,7 +596,10 @@ usersRouter.post("/set-gender", async (c) => {
     console.error("[users] set-gender failed:", error.message);
     return c.json({ error: { message: "Failed to set gender" } }, 500);
   }
-  return c.json({ data: formatProfile(updated, 0, 0, userId) });
+  const counts = await loadProfileStatCounts(userId);
+  return c.json({
+    data: formatProfile(updated, counts.postCount, counts.friendCount, userId, counts.likeCount),
+  });
 });
 
 // PUT /api/me
@@ -587,7 +629,6 @@ usersRouter.put("/me", async (c) => {
     body.username = trimmedUsername;
   }
 
-  const userClient = createUserClient(token);
   const updateData: Record<string, unknown> = {};
   if (body.name !== undefined) updateData.full_name = body.name;
   if (body.username !== undefined) updateData.username = body.username;
@@ -674,12 +715,10 @@ usersRouter.put("/me", async (c) => {
     await ensureCoverChangeMoment(userId, body.coverPhoto);
   }
 
-  const [postsResult, friendsResult] = await Promise.all([
-    userClient.from("posts").select("id", { count: "exact", head: true }).eq("user_id", userId),
-    supabaseAdmin.from("friendships").select("id", { count: "exact", head: true }).eq("status", "accepted").or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
-  ]);
-
-  return c.json({ data: formatProfile(updated, postsResult.count ?? 0, friendsResult.count ?? 0, userId) });
+  const counts = await loadProfileStatCounts(userId);
+  return c.json({
+    data: formatProfile(updated, counts.postCount, counts.friendCount, userId, counts.likeCount),
+  });
 });
 
 // POST /api/me/push-deactivate — deactivate this device's push token (logout).
@@ -974,22 +1013,15 @@ usersRouter.get("/:id", async (c) => {
     }
   }
 
-  const [postsResult, friendsResult, likeCount] = await Promise.all([
-    supabaseAdmin.from("posts").select("id", { count: "exact", head: true }).eq("user_id", id),
-    // True total friend count — uses the admin client so RLS doesn't restrict the
-    // count to only the friendships the *viewer* is part of (which made the count
-    // differ per viewer). Same number for everyone now.
-    supabaseAdmin.from("friendships").select("id", { count: "exact", head: true }).eq("status", "accepted").or(`requester_id.eq.${id},receiver_id.eq.${id}`),
-    countInteractionsReceived(id),
-  ]);
+  const counts = await loadProfileStatCounts(id);
 
   return c.json({
     data: formatProfile(
       enriched,
-      postsResult.count ?? 0,
-      friendsResult.count ?? 0,
+      counts.postCount,
+      counts.friendCount,
       userId ?? undefined,
-      likeCount
+      counts.likeCount
     ),
   });
 });
