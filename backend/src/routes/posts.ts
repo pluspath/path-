@@ -1015,6 +1015,20 @@ postsRouter.post("/:id/reactions", async (c) => {
   }
 
   const { data: ownerRow } = await supabaseAdmin.from("posts").select("user_id").eq("id", id).maybeSingle();
+
+  // A reaction implies the friend saw the moment — persist a read receipt so
+  // removing an open/locked like returns their avatar to the Seen row.
+  if (didReact && ownerRow?.user_id && ownerRow.user_id !== userId) {
+    try {
+      await supabaseAdmin.from("post_views").upsert(
+        { post_id: id, user_id: userId, viewed_at: new Date().toISOString() },
+        { onConflict: "post_id,user_id", ignoreDuplicates: true }
+      );
+    } catch (e) {
+      console.error("[post_views] reaction view upsert error:", e);
+    }
+  }
+
   const { data: reactions } = await supabaseAdmin.from("reactions").select("user_id, type, profiles!user_id(avatar_url, gender)").eq("post_id", id);
   // Viewer here is the reactor — they always see their own reaction.
   return c.json({ data: { reactions: formatReactions(reactions ?? [], userId, ownerRow?.user_id) } });
