@@ -64,13 +64,21 @@ export const notificationsService = {
     }
 
     if (input.sendPush) {
-      for (const t of targets) {
-        await sendPushToUser(supabaseAdmin, t.id, title, message, {
-          type: "admin_broadcast",
-          title,
-          body: message,
-        });
-        pushSent += 1;
+      // Send in parallel batches — sequential awaits for every user blocked the
+      // admin API for large audiences and flooded devices at once.
+      const chunkSize = 25;
+      for (let i = 0; i < targets.length; i += chunkSize) {
+        const chunk = targets.slice(i, i + chunkSize);
+        await Promise.all(
+          chunk.map((t) =>
+            sendPushToUser(supabaseAdmin, t.id, title, message, {
+              type: "admin_broadcast",
+              title,
+              body: message,
+            })
+          )
+        );
+        pushSent += chunk.length;
       }
     }
 
