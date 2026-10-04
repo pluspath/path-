@@ -10,6 +10,7 @@ import { isCustomAvatar, defaultAvatarForGender, resolveAvatarUrl, normalizeGend
 import { isDeletionHiddenProfile } from "../lib/account-deletion";
 import { parseLimit, parseCursor, encodeCursor, isOlderThanCursor } from "../lib/pagination";
 import { ensureUserHasUsername } from "../lib/username-backfill";
+import { refreshAuthProfileCache } from "../lib/auth-profile-cache";
 import type { HonoVariables, Profile } from "../types";
 
 const USERNAME_RE = /^[a-z0-9_]{3,30}$/;
@@ -643,6 +644,7 @@ usersRouter.post("/set-gender", async (c) => {
     console.error("[users] set-gender failed:", error.message);
     return c.json({ error: { message: "Failed to set gender" } }, 500);
   }
+  refreshAuthProfileCache(token, updated);
   const counts = await loadProfileStatCounts(userId);
   return c.json({
     data: formatProfile(updated, counts.postCount, counts.friendCount, userId, counts.likeCount),
@@ -723,6 +725,17 @@ usersRouter.put("/me", async (c) => {
     return c.json({ error: { message: "No fields to update" } }, 400);
   }
 
+  // Read CURRENT avatar/cover from DB — never from the short-lived auth cache.
+  // Stale cache made cover (and sometimes avatar) change-moments skip or fire
+  // incorrectly, so friends never saw the "Changed cover photo" broadcast.
+  const { data: beforeRow } = await supabaseAdmin
+    .from("profiles")
+    .select("avatar_url, cover_url")
+    .eq("id", userId)
+    .maybeSingle();
+  const oldAvatar = beforeRow?.avatar_url ?? (user as any).avatar_url ?? null;
+  const oldCover = beforeRow?.cover_url ?? (user as any).cover_url ?? null;
+
   // Use service role for profile writes so missing/strict UPDATE policies (and
   // newly-added columns like show_age / show_zodiac) cannot silently block the
   // age & zodiac visibility toggles after the caller is already authenticated.
@@ -738,6 +751,9 @@ usersRouter.put("/me", async (c) => {
     return c.json({ error: { message: "Update failed" } }, 500);
   }
 
+  // Keep the auth middleware cache in sync so the next request sees new cover/avatar.
+  refreshAuthProfileCache(token, updated);
+
   // Register push token in user_devices when the client sends token + device id.
   if (
     typeof body.push_token === "string" &&
@@ -752,14 +768,15 @@ usersRouter.put("/me", async (c) => {
   }
 
   // Auto-create system moments when the avatar / cover photo ACTUALLY changes.
-  // We compare against the values the profile had before this update.
-  const oldAvatar = (user as any).avatar_url ?? null;
-  const oldCover = (user as any).cover_url ?? null;
-  if (body.avatar !== undefined && body.avatar && body.avatar !== oldAvatar) {
-    await ensureAvatarChangeMoment(userId, body.avatar);
+  const nextAvatar =
+    body.avatar !== undefined ? body.avatar : (updated as any)?.avatar_url ?? null;
+  const nextCover =
+    body.coverPhoto !== undefined ? body.coverPhoto : (updated as any)?.cover_url ?? null;
+  if (body.avatar !== undefined && nextAvatar && nextAvatar !== oldAvatar) {
+    await ensureAvatarChangeMoment(userId, nextAvatar);
   }
-  if (body.coverPhoto !== undefined && body.coverPhoto && body.coverPhoto !== oldCover) {
-    await ensureCoverChangeMoment(userId, body.coverPhoto);
+  if (body.coverPhoto !== undefined && nextCover && nextCover !== oldCover) {
+    await ensureCoverChangeMoment(userId, nextCover);
   }
 
   const counts = await loadProfileStatCounts(userId);

@@ -38,6 +38,11 @@ import type { HonoVariables } from "./types";
 import { existsSync, readFileSync } from "fs";
 import { join, resolve } from "path";
 import { generateDefaultAvatarPng } from "./lib/default-avatar-gen";
+import {
+  authProfileCache,
+  getAuthProfileCache,
+  setAuthProfileCache,
+} from "./lib/auth-profile-cache";
 
 const app = new Hono<{ Variables: HonoVariables }>();
 
@@ -524,13 +529,6 @@ app.use("/api/admin/*", secureHeadersMiddleware);
 app.use("/api/*", apiLimiter);
 app.use("/api/auth/*", authLimiter);
 
-/** Short-lived auth+profile cache — cuts JWT/profile RTT on bursty mobile traffic. */
-const AUTH_CACHE_TTL_MS = 45_000;
-const authProfileCache = new Map<
-  string,
-  { userId: string; profile: any; expires: number }
->();
-
 app.use("*", async (c, next) => {
   c.set("user", null);
   c.set("userId", null);
@@ -540,8 +538,8 @@ app.use("*", async (c, next) => {
   if (authHeader?.startsWith("Bearer ")) {
     const token = authHeader.slice(7);
     try {
-      const cached = authProfileCache.get(token);
-      if (cached && cached.expires > Date.now()) {
+      const cached = getAuthProfileCache(token);
+      if (cached) {
         c.set("userId", cached.userId);
         c.set("accessToken", token);
         c.set("user", cached.profile);
@@ -601,16 +599,7 @@ app.use("*", async (c, next) => {
         const sessionUser =
           profile ?? { id: authUser.id, full_name: authUser.user_metadata?.full_name ?? "Someone" };
         c.set("user", sessionUser);
-        authProfileCache.set(token, {
-          userId: authUser.id,
-          profile: sessionUser,
-          expires: Date.now() + AUTH_CACHE_TTL_MS,
-        });
-        // Bound cache size for long-running processes.
-        if (authProfileCache.size > 5_000) {
-          const first = authProfileCache.keys().next().value;
-          if (first) authProfileCache.delete(first);
-        }
+        setAuthProfileCache(token, authUser.id, sessionUser);
       } else if (error) {
         console.warn(`[auth] Token rejected: ${error.message}`);
       }
