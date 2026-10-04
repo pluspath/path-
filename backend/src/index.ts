@@ -355,6 +355,8 @@ app.get("/__marketing", (c) =>
       }
       const { ensureRepathColumn } = await import("./lib/schema");
       await ensureRepathColumn();
+      const { ensureInboxColumns } = await import("./lib/inbox-columns");
+      await ensureInboxColumns();
       await ensurePostsBucketForChat();
       console.log("[migration] column + posts RLS + social bootstrap finished");
     }

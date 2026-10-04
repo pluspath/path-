@@ -4,6 +4,7 @@ import { sendPushToUser } from "../lib/push";
 import { encodeImages, decodeImages } from "../lib/images";
 import { getBlockedIds, isBlocked } from "../lib/blocks";
 import { resolveAvatarUrl } from "../lib/avatar";
+import { ensureInboxColumns } from "../lib/inbox-columns";
 import type { HonoVariables } from "../types";
 
 const conversationsRouter = new Hono<{ Variables: HonoVariables }>();
@@ -630,28 +631,30 @@ async function hideConversationsForUser(
   db: typeof supabaseAdmin,
   userId: string,
   ids: string[]
-): Promise<{ ok: boolean; error?: string }> {
+): Promise<{ ok: boolean; error?: string; deleted: number }> {
   const unique = Array.from(new Set(ids.filter((id) => typeof id === "string" && id.length > 0)));
-  if (unique.length === 0) return { ok: true };
+  if (unique.length === 0) return { ok: true, deleted: 0 };
   const now = new Date().toISOString();
   // Prefer unpinning at the same time; fall back if pinned_at isn't migrated yet.
-  let { error } = await db
+  let { data, error } = await db
     .from("conversation_participants")
     .update({ hidden_at: now, pinned_at: null })
     .eq("user_id", userId)
-    .in("conversation_id", unique);
+    .in("conversation_id", unique)
+    .select("conversation_id");
   if (error && /pinned_at|column/i.test(error.message ?? "")) {
-    ({ error } = await db
+    ({ data, error } = await db
       .from("conversation_participants")
       .update({ hidden_at: now })
       .eq("user_id", userId)
-      .in("conversation_id", unique));
+      .in("conversation_id", unique)
+      .select("conversation_id"));
   }
   if (error) {
     console.error("[conversations] hide failed:", error.message);
-    return { ok: false, error: error.message };
+    return { ok: false, error: error.message, deleted: 0 };
   }
-  return { ok: true };
+  return { ok: true, deleted: (data ?? []).length };
 }
 
 /** Unhide a chat for everyone except optionally one user — used when a new message arrives. */
@@ -682,15 +685,35 @@ conversationsRouter.post("/hide", async (c) => {
   const token = c.get("accessToken");
   if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
+  // Best-effort schema ensure — still attempt hide if probe fails.
+  await ensureInboxColumns();
+
   const body = await c.req.json().catch(() => ({}));
   const ids = Array.isArray(body?.ids)
     ? body.ids
     : typeof body?.id === "string"
       ? [body.id]
       : [];
+  if (ids.length === 0) {
+    return c.json({ error: { message: "No conversations selected" } }, 400);
+  }
   const result = await hideConversationsForUser(supabaseAdmin, userId, ids);
-  if (!result.ok) return c.json({ error: { message: "Failed to delete conversations" } }, 500);
-  return c.json({ data: { ok: true, deleted: ids.length } });
+  if (!result.ok) {
+    const msg = result.error ?? "Failed to delete conversations";
+    const status = /column|hidden_at|pinned_at/i.test(msg) ? 503 : 500;
+    return c.json(
+      {
+        error: {
+          message:
+            status === 503
+              ? "Chat delete is not available yet. Please try again."
+              : msg,
+        },
+      },
+      status
+    );
+  }
+  return c.json({ data: { ok: true, deleted: result.deleted } });
 });
 
 // DELETE /api/conversations/:id — delete-for-me (hide from this user's inbox).
@@ -698,6 +721,8 @@ conversationsRouter.delete("/:id", async (c) => {
   const userId = c.get("userId");
   const token = c.get("accessToken");
   if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  await ensureInboxColumns();
 
   const { id } = c.req.param();
   const { data: participation } = await supabaseAdmin
@@ -709,8 +734,22 @@ conversationsRouter.delete("/:id", async (c) => {
   if (!participation) return c.json({ error: { message: "Unauthorized" } }, 403);
 
   const result = await hideConversationsForUser(supabaseAdmin, userId, [id]);
-  if (!result.ok) return c.json({ error: { message: "Failed to delete conversation" } }, 500);
-  return c.body(null, 204);
+  if (!result.ok) {
+    const msg = result.error ?? "Failed to delete conversation";
+    const status = /column|hidden_at|pinned_at/i.test(msg) ? 503 : 500;
+    return c.json(
+      {
+        error: {
+          message:
+            status === 503
+              ? "Chat delete is not available yet. Please try again."
+              : msg,
+        },
+      },
+      status
+    );
+  }
+  return c.json({ data: { ok: true, id } });
 });
 
 // POST /api/conversations/:id/pin — pin or unpin for the current user.
@@ -718,6 +757,8 @@ conversationsRouter.post("/:id/pin", async (c) => {
   const userId = c.get("userId");
   const token = c.get("accessToken");
   if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  await ensureInboxColumns();
 
   const { id } = c.req.param();
   const body = await c.req.json().catch(() => ({}));
@@ -729,8 +770,20 @@ conversationsRouter.post("/:id/pin", async (c) => {
     .eq("user_id", userId)
     .maybeSingle();
 
-  if (partErr && /pinned_at|hidden_at|column/i.test(partErr.message ?? "")) {
-    return c.json({ error: { message: "Pinning is not available yet" } }, 503);
+  if (partErr) {
+    console.error("[conversations] pin select failed:", partErr.message);
+    const status = /column|pinned_at|hidden_at/i.test(partErr.message ?? "") ? 503 : 500;
+    return c.json(
+      {
+        error: {
+          message:
+            status === 503
+              ? "Pinning is not available yet. Please try again."
+              : "Failed to update pin",
+        },
+      },
+      status
+    );
   }
   if (!participation) return c.json({ error: { message: "Unauthorized" } }, 403);
 
@@ -751,7 +804,18 @@ conversationsRouter.post("/:id/pin", async (c) => {
 
   if (error) {
     console.error("[conversations] pin failed:", error.message);
-    return c.json({ error: { message: "Failed to update pin" } }, 500);
+    const status = /column|pinned_at|hidden_at/i.test(error.message ?? "") ? 503 : 500;
+    return c.json(
+      {
+        error: {
+          message:
+            status === 503
+              ? "Pinning is not available yet. Please try again."
+              : error.message || "Failed to update pin",
+        },
+      },
+      status
+    );
   }
 
   return c.json({
