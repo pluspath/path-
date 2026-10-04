@@ -808,18 +808,18 @@ conversationsRouter.post("/:id/pin", async (c) => {
 
   const wantPinned =
     typeof body?.pinned === "boolean" ? body.pinned : !participation.pinned_at;
+  const pinnedAt = wantPinned ? new Date().toISOString() : null;
 
-  const { data: updated, error } = await supabaseAdmin
+  // Update without RETURNING — some PostgREST configs fail .select().single() even when UPDATE works.
+  const { error } = await supabaseAdmin
     .from("conversation_participants")
     .update({
-      pinned_at: wantPinned ? new Date().toISOString() : null,
+      pinned_at: pinnedAt,
       // Pinning a hidden chat brings it back.
       hidden_at: wantPinned ? null : participation.hidden_at ?? null,
     })
     .eq("conversation_id", id)
-    .eq("user_id", userId)
-    .select("pinned_at")
-    .single();
+    .eq("user_id", userId);
 
   if (error) {
     console.error("[conversations] pin failed:", error.message);
@@ -840,8 +840,8 @@ conversationsRouter.post("/:id/pin", async (c) => {
   return c.json({
     data: {
       id,
-      isPinned: !!updated?.pinned_at,
-      pinnedAt: updated?.pinned_at ?? null,
+      isPinned: wantPinned,
+      pinnedAt,
     },
   });
 });
