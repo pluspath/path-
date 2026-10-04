@@ -634,11 +634,19 @@ async function hideConversationsForUser(
   const unique = Array.from(new Set(ids.filter((id) => typeof id === "string" && id.length > 0)));
   if (unique.length === 0) return { ok: true };
   const now = new Date().toISOString();
-  const { error } = await db
+  // Prefer unpinning at the same time; fall back if pinned_at isn't migrated yet.
+  let { error } = await db
     .from("conversation_participants")
     .update({ hidden_at: now, pinned_at: null })
     .eq("user_id", userId)
     .in("conversation_id", unique);
+  if (error && /pinned_at|column/i.test(error.message ?? "")) {
+    ({ error } = await db
+      .from("conversation_participants")
+      .update({ hidden_at: now })
+      .eq("user_id", userId)
+      .in("conversation_id", unique));
+  }
   if (error) {
     console.error("[conversations] hide failed:", error.message);
     return { ok: false, error: error.message };
