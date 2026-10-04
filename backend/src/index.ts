@@ -133,6 +133,10 @@ app.get("/__marketing", (c) =>
         "UPDATE public.messages SET image = image_url WHERE image IS NULL AND image_url IS NOT NULL;",
         // Read receipts / unread counts
         "ALTER TABLE public.conversation_participants ADD COLUMN IF NOT EXISTS last_read_at TIMESTAMPTZ;",
+        // Per-user inbox controls (pin / delete-for-me)
+        "ALTER TABLE public.conversation_participants ADD COLUMN IF NOT EXISTS pinned_at TIMESTAMPTZ;",
+        "ALTER TABLE public.conversation_participants ADD COLUMN IF NOT EXISTS hidden_at TIMESTAMPTZ;",
+        "CREATE INDEX IF NOT EXISTS idx_conversation_participants_user_hidden ON public.conversation_participants (user_id, hidden_at);",
         // Close friends — match mobile schema (user_id). Also add owner_id alias for older code.
         `CREATE TABLE IF NOT EXISTS public.close_friends (
           id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

@@ -241,21 +241,36 @@ conversationsRouter.get("/", async (c) => {
   const db = supabaseAdmin;
 
   try {
-    const { data: participations, error: partErr } = await db
+    // Prefer pin/hide columns; fall back if migration hasn't landed yet.
+    let participations: any[] | null = null;
+    let partErr: any = null;
+    ({ data: participations, error: partErr } = await db
       .from("conversation_participants")
-      .select("conversation_id, last_read_at")
-      .eq("user_id", userId);
+      .select("conversation_id, last_read_at, pinned_at, hidden_at")
+      .eq("user_id", userId));
+    if (partErr && /pinned_at|hidden_at|column/i.test(partErr.message ?? "")) {
+      ({ data: participations, error: partErr } = await db
+        .from("conversation_participants")
+        .select("conversation_id, last_read_at")
+        .eq("user_id", userId));
+    }
 
     if (partErr) {
       console.error("[conversations] list participations error:", partErr.message);
       return c.json({ error: { message: "Failed to load conversations" } }, 500);
     }
 
-    const convIds = (participations ?? []).map((p: any) => p.conversation_id);
+    // Delete-for-me: hide chats the user removed from their inbox.
+    const visibleParts = (participations ?? []).filter((p: any) => !p.hidden_at);
+    const convIds = visibleParts.map((p: any) => p.conversation_id);
     if (convIds.length === 0) return c.json({ data: [] });
 
     const lastReadByConv: Record<string, string | null> = {};
-    for (const p of participations ?? []) lastReadByConv[p.conversation_id] = p.last_read_at ?? null;
+    const pinnedAtByConv: Record<string, string | null> = {};
+    for (const p of visibleParts) {
+      lastReadByConv[p.conversation_id] = p.last_read_at ?? null;
+      pinnedAtByConv[p.conversation_id] = p.pinned_at ?? null;
+    }
 
     const [{ data: conversations }, { data: allParticipants }, blockedIds] = await Promise.all([
       db.from("conversations").select("*").in("id", convIds).order("updated_at", { ascending: false }),
@@ -327,6 +342,7 @@ conversationsRouter.get("/", async (c) => {
       const otherUserId = otherUserIdByConv[conv.id];
       const lastMsg = lastMsgByConv[conv.id];
       const previewText = lastMsg?.content ?? lastMsg?.text ?? "";
+      const pinnedAt = pinnedAtByConv[conv.id] ?? null;
       return {
         id: conv.id,
         user: (otherUserId && profilesById[otherUserId]) || emptyUser(otherUserId),
@@ -334,13 +350,17 @@ conversationsRouter.get("/", async (c) => {
         lastMessageTime: lastMsg?.created_at ?? conv.created_at,
         lastMessageSenderId: lastMsg?.sender_id ?? null,
         unreadCount: unreadByConv[conv.id] ?? 0,
+        isPinned: !!pinnedAt,
+        pinnedAt,
         messages: [],
       };
     });
 
-    result.sort(
-      (a, b) => new Date(b.lastMessageTime).getTime() - new Date(a.lastMessageTime).getTime()
-    );
+    // Pinned chats stay at the top; within each group sort by latest activity.
+    result.sort((a, b) => {
+      if (a.isPinned !== b.isPinned) return a.isPinned ? -1 : 1;
+      return new Date(b.lastMessageTime).getTime() - new Date(a.lastMessageTime).getTime();
+    });
 
     return c.json({ data: result });
   } catch (err) {
@@ -605,6 +625,136 @@ conversationsRouter.post("/unread-counts", async (c) => {
   return c.json({ data: result });
 });
 
+/** Hide conversations for the current user only (delete-for-me). */
+async function hideConversationsForUser(
+  db: typeof supabaseAdmin,
+  userId: string,
+  ids: string[]
+): Promise<{ ok: boolean; error?: string }> {
+  const unique = Array.from(new Set(ids.filter((id) => typeof id === "string" && id.length > 0)));
+  if (unique.length === 0) return { ok: true };
+  const now = new Date().toISOString();
+  const { error } = await db
+    .from("conversation_participants")
+    .update({ hidden_at: now, pinned_at: null })
+    .eq("user_id", userId)
+    .in("conversation_id", unique);
+  if (error) {
+    console.error("[conversations] hide failed:", error.message);
+    return { ok: false, error: error.message };
+  }
+  return { ok: true };
+}
+
+/** Unhide a chat for everyone except optionally one user — used when a new message arrives. */
+async function unhideConversationForOthers(
+  db: typeof supabaseAdmin,
+  conversationId: string,
+  exceptUserId?: string
+): Promise<void> {
+  try {
+    let q = db
+      .from("conversation_participants")
+      .update({ hidden_at: null })
+      .eq("conversation_id", conversationId)
+      .not("hidden_at", "is", null);
+    if (exceptUserId) q = q.neq("user_id", exceptUserId);
+    await q;
+  } catch (e) {
+    console.warn(
+      "[conversations] unhide skipped:",
+      e instanceof Error ? e.message : e
+    );
+  }
+}
+
+// POST /api/conversations/hide — bulk delete-for-me (must be before /:id routes).
+conversationsRouter.post("/hide", async (c) => {
+  const userId = c.get("userId");
+  const token = c.get("accessToken");
+  if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const body = await c.req.json().catch(() => ({}));
+  const ids = Array.isArray(body?.ids)
+    ? body.ids
+    : typeof body?.id === "string"
+      ? [body.id]
+      : [];
+  const result = await hideConversationsForUser(supabaseAdmin, userId, ids);
+  if (!result.ok) return c.json({ error: { message: "Failed to delete conversations" } }, 500);
+  return c.json({ data: { ok: true, deleted: ids.length } });
+});
+
+// DELETE /api/conversations/:id — delete-for-me (hide from this user's inbox).
+conversationsRouter.delete("/:id", async (c) => {
+  const userId = c.get("userId");
+  const token = c.get("accessToken");
+  if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const { id } = c.req.param();
+  const { data: participation } = await supabaseAdmin
+    .from("conversation_participants")
+    .select("user_id")
+    .eq("conversation_id", id)
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (!participation) return c.json({ error: { message: "Unauthorized" } }, 403);
+
+  const result = await hideConversationsForUser(supabaseAdmin, userId, [id]);
+  if (!result.ok) return c.json({ error: { message: "Failed to delete conversation" } }, 500);
+  return c.body(null, 204);
+});
+
+// POST /api/conversations/:id/pin — pin or unpin for the current user.
+conversationsRouter.post("/:id/pin", async (c) => {
+  const userId = c.get("userId");
+  const token = c.get("accessToken");
+  if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const { id } = c.req.param();
+  const body = await c.req.json().catch(() => ({}));
+
+  const { data: participation, error: partErr } = await supabaseAdmin
+    .from("conversation_participants")
+    .select("user_id, pinned_at, hidden_at")
+    .eq("conversation_id", id)
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (partErr && /pinned_at|hidden_at|column/i.test(partErr.message ?? "")) {
+    return c.json({ error: { message: "Pinning is not available yet" } }, 503);
+  }
+  if (!participation) return c.json({ error: { message: "Unauthorized" } }, 403);
+
+  const wantPinned =
+    typeof body?.pinned === "boolean" ? body.pinned : !participation.pinned_at;
+
+  const { data: updated, error } = await supabaseAdmin
+    .from("conversation_participants")
+    .update({
+      pinned_at: wantPinned ? new Date().toISOString() : null,
+      // Pinning a hidden chat brings it back.
+      hidden_at: wantPinned ? null : participation.hidden_at ?? null,
+    })
+    .eq("conversation_id", id)
+    .eq("user_id", userId)
+    .select("pinned_at")
+    .single();
+
+  if (error) {
+    console.error("[conversations] pin failed:", error.message);
+    return c.json({ error: { message: "Failed to update pin" } }, 500);
+  }
+
+  return c.json({
+    data: {
+      id,
+      isPinned: !!updated?.pinned_at,
+      pinnedAt: updated?.pinned_at ?? null,
+    },
+  });
+});
+
 // Mark a conversation as read for the current user: set last_read_at = now().
 // Server-side so the read state is consistent across all the user's devices.
 conversationsRouter.post("/:id/read", async (c) => {
@@ -806,6 +956,8 @@ conversationsRouter.post("/:id/messages", async (c) => {
   }
 
   await db.from("conversations").update({ updated_at: new Date().toISOString() }).eq("id", id);
+  // New activity brings the chat back for recipients who deleted-for-me.
+  void unhideConversationForOthers(db, id, userId);
 
   // Fire-and-forget push: respond to the client immediately, deliver in background.
   const senderName = (user as any).full_name ?? "Someone";
@@ -919,6 +1071,13 @@ conversationsRouter.post("/start/:userId", async (c) => {
       await db.from("conversation_participants").insert({ conversation_id: existingConvId, user_id: targetId });
     }
 
+    // Re-opening a chat from a profile unhides it for the opener.
+    await db
+      .from("conversation_participants")
+      .update({ hidden_at: null })
+      .eq("conversation_id", existingConvId)
+      .eq("user_id", userId);
+
     const { data: conv } = await db.from("conversations").select("*").eq("id", existingConvId).single();
     const { data: targetProfile } = await db.from("profiles").select("*").eq("id", targetId).single();
     const { data: msgs } = await db
@@ -1025,6 +1184,7 @@ conversationsRouter.post("/:id/ping", async (c) => {
   }
 
   await db.from("conversations").update({ updated_at: new Date().toISOString() }).eq("id", id);
+  void unhideConversationForOthers(db, id, userId);
 
   // Push the ping so the other person's phone buzzes + sounds even if the app is closed.
   // Fire-and-forget: respond immediately, deliver in background.
