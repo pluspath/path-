@@ -635,26 +635,36 @@ async function hideConversationsForUser(
   const unique = Array.from(new Set(ids.filter((id) => typeof id === "string" && id.length > 0)));
   if (unique.length === 0) return { ok: true, deleted: 0 };
   const now = new Date().toISOString();
-  // Prefer unpinning at the same time; fall back if pinned_at isn't migrated yet.
-  let { data, error } = await db
+
+  // Update without .select() first — some PostgREST configs fail RETURNING even when UPDATE works.
+  let { error } = await db
     .from("conversation_participants")
     .update({ hidden_at: now, pinned_at: null })
     .eq("user_id", userId)
-    .in("conversation_id", unique)
-    .select("conversation_id");
+    .in("conversation_id", unique);
+
   if (error && /pinned_at|column/i.test(error.message ?? "")) {
-    ({ data, error } = await db
+    ({ error } = await db
       .from("conversation_participants")
       .update({ hidden_at: now })
       .eq("user_id", userId)
-      .in("conversation_id", unique)
-      .select("conversation_id"));
+      .in("conversation_id", unique));
   }
+
   if (error) {
     console.error("[conversations] hide failed:", error.message);
     return { ok: false, error: error.message, deleted: 0 };
   }
-  return { ok: true, deleted: (data ?? []).length };
+
+  // Best-effort count (do not fail the request if this probe errors).
+  const { data: hiddenRows } = await db
+    .from("conversation_participants")
+    .select("conversation_id")
+    .eq("user_id", userId)
+    .in("conversation_id", unique)
+    .not("hidden_at", "is", null);
+
+  return { ok: true, deleted: (hiddenRows ?? []).length || unique.length };
 }
 
 /** Unhide a chat for everyone except optionally one user — used when a new message arrives. */
@@ -679,6 +689,21 @@ async function unhideConversationForOthers(
   }
 }
 
+function hideErrorResponse(c: any, msg: string) {
+  const status = /column|hidden_at|pinned_at/i.test(msg) ? 503 : 500;
+  return c.json(
+    {
+      error: {
+        message:
+          status === 503
+            ? "Chat delete is not available yet. Please try again."
+            : msg || "Failed to delete conversation",
+      },
+    },
+    status
+  );
+}
+
 // POST /api/conversations/hide — bulk delete-for-me (must be before /:id routes).
 conversationsRouter.post("/hide", async (c) => {
   const userId = c.get("userId");
@@ -698,22 +723,30 @@ conversationsRouter.post("/hide", async (c) => {
     return c.json({ error: { message: "No conversations selected" } }, 400);
   }
   const result = await hideConversationsForUser(supabaseAdmin, userId, ids);
-  if (!result.ok) {
-    const msg = result.error ?? "Failed to delete conversations";
-    const status = /column|hidden_at|pinned_at/i.test(msg) ? 503 : 500;
-    return c.json(
-      {
-        error: {
-          message:
-            status === 503
-              ? "Chat delete is not available yet. Please try again."
-              : msg,
-        },
-      },
-      status
-    );
-  }
+  if (!result.ok) return hideErrorResponse(c, result.error ?? "Failed to delete conversations");
   return c.json({ data: { ok: true, deleted: result.deleted } });
+});
+
+// POST /api/conversations/:id/hide — single-chat delete-for-me alias.
+conversationsRouter.post("/:id/hide", async (c) => {
+  const userId = c.get("userId");
+  const token = c.get("accessToken");
+  if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  await ensureInboxColumns();
+
+  const { id } = c.req.param();
+  const { data: participation } = await supabaseAdmin
+    .from("conversation_participants")
+    .select("user_id")
+    .eq("conversation_id", id)
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (!participation) return c.json({ error: { message: "Unauthorized" } }, 403);
+
+  const result = await hideConversationsForUser(supabaseAdmin, userId, [id]);
+  if (!result.ok) return hideErrorResponse(c, result.error ?? "Failed to delete conversation");
+  return c.json({ data: { ok: true, id, deleted: result.deleted } });
 });
 
 // DELETE /api/conversations/:id — delete-for-me (hide from this user's inbox).
@@ -734,21 +767,7 @@ conversationsRouter.delete("/:id", async (c) => {
   if (!participation) return c.json({ error: { message: "Unauthorized" } }, 403);
 
   const result = await hideConversationsForUser(supabaseAdmin, userId, [id]);
-  if (!result.ok) {
-    const msg = result.error ?? "Failed to delete conversation";
-    const status = /column|hidden_at|pinned_at/i.test(msg) ? 503 : 500;
-    return c.json(
-      {
-        error: {
-          message:
-            status === 503
-              ? "Chat delete is not available yet. Please try again."
-              : msg,
-        },
-      },
-      status
-    );
-  }
+  if (!result.ok) return hideErrorResponse(c, result.error ?? "Failed to delete conversation");
   return c.json({ data: { ok: true, id } });
 });
 
