@@ -1,5 +1,81 @@
 import { supabaseAdmin } from "../supabase";
-import { resolveAvatarUrl } from "./avatar";
+import { isCustomAvatar, isKnownDefaultAvatarUrl, resolveAvatarUrl } from "./avatar";
+
+// Covers the app shows when a profile has no uploaded cover. Clients often send
+// these back on an unrelated save (for example a profile-picture change).
+const PLACEHOLDER_COVER_MARKERS = [
+  "photo-1519638399535-1b036603ac77",
+  "photo-1506905925346-21bda4d32df4",
+];
+
+export function isPlaceholderCoverUrl(url: string | null | undefined): boolean {
+  if (!url || typeof url !== "string") return true;
+  const trimmed = url.trim();
+  if (!trimmed) return true;
+  return PLACEHOLDER_COVER_MARKERS.some((marker) => trimmed.includes(marker));
+}
+
+/** Strip display-only transforms so a rendered URL compares equal to the stored one. */
+export function canonicalMediaUrl(url: string | null | undefined): string | null {
+  if (!url || typeof url !== "string") return null;
+  const trimmed = url.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    parsed.pathname = parsed.pathname.replace(
+      "/storage/v1/render/image/public/",
+      "/storage/v1/object/public/"
+    );
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString().replace(/\/$/, "");
+  } catch {
+    return trimmed;
+  }
+}
+
+/** Null means "no photo the user chose" (empty, default avatar, or placeholder cover). */
+export function canonicalProfileImage(
+  url: string | null | undefined,
+  kind: "avatar" | "cover"
+): string | null {
+  if (kind === "cover") {
+    if (isPlaceholderCoverUrl(url)) return null;
+    return canonicalMediaUrl(url);
+  }
+  if (!url || isKnownDefaultAvatarUrl(url)) return null;
+  return canonicalMediaUrl(url);
+}
+
+export function profileImageActuallyChanged(
+  oldUrl: string | null | undefined,
+  nextUrl: string | null | undefined,
+  kind: "avatar" | "cover"
+): boolean {
+  return canonicalProfileImage(oldUrl, kind) !== canonicalProfileImage(nextUrl, kind);
+}
+
+/**
+ * URL to persist for an avatar/cover field, or null when the request did not
+ * really change that image. Ignores echoed defaults so a profile-picture save
+ * cannot also create a cover-photo moment (and the reverse).
+ */
+export function acceptedProfileImageUpdate(
+  oldUrl: string | null | undefined,
+  incoming: unknown,
+  kind: "avatar" | "cover"
+): string | null {
+  if (typeof incoming !== "string") return null;
+  const next = incoming.trim();
+  if (!next) return null;
+  if (kind === "avatar") {
+    if (!isCustomAvatar(next)) return null;
+  } else if (isPlaceholderCoverUrl(next)) {
+    return null;
+  }
+  if (!profileImageActuallyChanged(oldUrl, next, kind)) return null;
+  return canonicalMediaUrl(next) ?? next;
+}
 
 // System moments are special posts created automatically by the app. Like the
 // "Joined Path+" moment, they cannot be edited or deleted, are scoped to

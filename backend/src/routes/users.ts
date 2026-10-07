@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { supabase, supabaseAdmin, createUserClient } from "../supabase";
-import { ensureAvatarChangeMoment, ensureCoverChangeMoment, FRIENDSHIP_TYPE, parseFriendshipFriends, refreshFriendshipAvatars } from "../lib/systemMoments";
+import { acceptedProfileImageUpdate, ensureAvatarChangeMoment, ensureCoverChangeMoment, FRIENDSHIP_TYPE, parseFriendshipFriends, refreshFriendshipAvatars } from "../lib/systemMoments";
 import { computeAge, computeZodiac } from "../lib/profileMeta";
 import { decodeImages } from "../lib/images";
 import { getBlockedIds } from "../lib/blocks";
@@ -687,8 +687,6 @@ usersRouter.put("/me", async (c) => {
   // changed here. Age/zodiac visibility toggles can still be updated.
   if (body.showAge !== undefined) updateData.show_age = !!body.showAge;
   if (body.showZodiac !== undefined) updateData.show_zodiac = !!body.showZodiac;
-  if (body.coverPhoto !== undefined) updateData.cover_url = body.coverPhoto;
-  if (body.avatar !== undefined) updateData.avatar_url = body.avatar;
   const deviceId =
     typeof body.device_id === "string" && body.device_id.trim()
       ? body.device_id.trim()
@@ -721,13 +719,10 @@ usersRouter.put("/me", async (c) => {
   if (body.showMomentsToFriends !== undefined) updateData.show_moments_to_friends = !!body.showMomentsToFriends;
   if (body.showMomentsToOthers !== undefined) updateData.show_moments_to_others = !!body.showMomentsToOthers;
 
-  if (Object.keys(updateData).length === 0) {
-    return c.json({ error: { message: "No fields to update" } }, 400);
-  }
-
   // Read CURRENT avatar/cover from DB — never from the short-lived auth cache.
-  // Stale cache made cover (and sometimes avatar) change-moments skip or fire
-  // incorrectly, so friends never saw the "Changed cover photo" broadcast.
+  // Clients often resend both images on every save. The displayed cover is a
+  // placeholder when cover_url is null, so comparing that echo to the database
+  // used to create a cover moment whenever the profile picture changed.
   const { data: beforeRow } = await supabaseAdmin
     .from("profiles")
     .select("avatar_url, cover_url")
@@ -735,6 +730,14 @@ usersRouter.put("/me", async (c) => {
     .maybeSingle();
   const oldAvatar = beforeRow?.avatar_url ?? (user as any).avatar_url ?? null;
   const oldCover = beforeRow?.cover_url ?? (user as any).cover_url ?? null;
+  const nextAvatar = acceptedProfileImageUpdate(oldAvatar, body.avatar, "avatar");
+  const nextCover = acceptedProfileImageUpdate(oldCover, body.coverPhoto, "cover");
+  if (nextAvatar) updateData.avatar_url = nextAvatar;
+  if (nextCover) updateData.cover_url = nextCover;
+
+  if (Object.keys(updateData).length === 0) {
+    return c.json({ error: { message: "No fields to update" } }, 400);
+  }
 
   // Use service role for profile writes so missing/strict UPDATE policies (and
   // newly-added columns like show_age / show_zodiac) cannot silently block the
@@ -767,17 +770,9 @@ usersRouter.put("/me", async (c) => {
     });
   }
 
-  // Auto-create system moments when the avatar / cover photo ACTUALLY changes.
-  const nextAvatar =
-    body.avatar !== undefined ? body.avatar : (updated as any)?.avatar_url ?? null;
-  const nextCover =
-    body.coverPhoto !== undefined ? body.coverPhoto : (updated as any)?.cover_url ?? null;
-  if (body.avatar !== undefined && nextAvatar && nextAvatar !== oldAvatar) {
-    await ensureAvatarChangeMoment(userId, nextAvatar);
-  }
-  if (body.coverPhoto !== undefined && nextCover && nextCover !== oldCover) {
-    await ensureCoverChangeMoment(userId, nextCover);
-  }
+  // One moment per image that actually changed — never both for a single photo.
+  if (nextAvatar) await ensureAvatarChangeMoment(userId, nextAvatar);
+  if (nextCover) await ensureCoverChangeMoment(userId, nextCover);
 
   const counts = await loadProfileStatCounts(userId);
   return c.json({
