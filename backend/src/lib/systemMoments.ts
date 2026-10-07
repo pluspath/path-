@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import { supabaseAdmin } from "../supabase";
 import { isCustomAvatar, isKnownDefaultAvatarUrl, resolveAvatarUrl } from "./avatar";
 
@@ -294,13 +295,75 @@ export async function ensureCoverChangeMoment(userId: string, newCoverUrl: strin
   await insertImageMoment(userId, COVER_CHANGE_TYPE, newCoverUrl);
 }
 
+// One in-flight insert per user + moment type + image, so a double save cannot
+// publish the same cover (or profile picture) moment twice.
+const imageMomentInflight = new Map<string, Promise<void>>();
+
+function imageMomentKey(userId: string, type: string, imageUrl: string): string {
+  const canon = canonicalMediaUrl(imageUrl) ?? imageUrl.trim();
+  return `${userId}:${type}:${canon}`;
+}
+
+/** Stable id for the same change inside a short window. A repeat insert conflicts and is ignored. */
+function imageMomentId(userId: string, type: string, imageUrl: string): string {
+  const canon = canonicalMediaUrl(imageUrl) ?? imageUrl.trim();
+  const bucket = Math.floor(Date.now() / (2 * 60 * 1000));
+  const hex = createHash("sha256").update(`${userId}:${type}:${canon}:${bucket}`).digest("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
+async function recentImageMomentExists(
+  userId: string,
+  type: string,
+  imageUrl: string
+): Promise<boolean> {
+  const canon = canonicalMediaUrl(imageUrl) ?? imageUrl.trim();
+  const since = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+  const { data } = await supabaseAdmin
+    .from("posts")
+    .select("image_url")
+    .eq("user_id", userId)
+    .eq("type", type)
+    .gte("created_at", since)
+    .order("created_at", { ascending: false })
+    .limit(5);
+  return (data ?? []).some((row) => (canonicalMediaUrl(row.image_url) ?? row.image_url) === canon);
+}
+
+async function writeImageMoment(userId: string, type: string, imageUrl: string): Promise<void> {
+  if (await recentImageMomentExists(userId, type, imageUrl)) return;
+  const { error } = await supabaseAdmin.from("posts").insert({
+    id: imageMomentId(userId, type, imageUrl),
+    user_id: userId,
+    type,
+    image_url: imageUrl,
+  });
+  // 23505 = unique violation: the same change was inserted a moment ago.
+  if (error && error.code !== "23505") {
+    console.error(`[systemMoments] ${type} insert failed:`, error.message);
+  }
+}
+
 async function insertImageMoment(userId: string, type: string, imageUrl: string): Promise<void> {
   try {
     if (!userId || !imageUrl) return;
-    const { error } = await supabaseAdmin
-      .from("posts")
-      .insert({ user_id: userId, type, image_url: imageUrl });
-    if (error) console.error(`[systemMoments] ${type} insert failed:`, error.message);
+    const key = imageMomentKey(userId, type, imageUrl);
+    const pending = imageMomentInflight.get(key);
+    if (pending) {
+      await pending;
+      return;
+    }
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    imageMomentInflight.set(key, gate);
+    try {
+      await writeImageMoment(userId, type, imageUrl);
+    } finally {
+      imageMomentInflight.delete(key);
+      release();
+    }
   } catch (e) {
     console.error(`[systemMoments] insert ${type} error:`, e);
   }
