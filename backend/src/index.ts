@@ -289,6 +289,9 @@ app.get("/__marketing", (c) =>
         `CREATE POLICY "Users can create posts" ON public.posts FOR INSERT TO authenticated WITH CHECK (auth.uid() = user_id);`,
         `CREATE POLICY "Users can update own posts" ON public.posts FOR UPDATE TO authenticated USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);`,
         `CREATE POLICY "Users can delete own posts" ON public.posts FOR DELETE TO authenticated USING (auth.uid() = user_id);`,
+        // Dashboard post moderation columns (list/hide/publish)
+        "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS is_hidden BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS is_published BOOLEAN NOT NULL DEFAULT TRUE",
         // Hot-path indexes for feed / likes / close friends
         "CREATE INDEX IF NOT EXISTS idx_posts_user_created ON public.posts (user_id, created_at DESC);",
         "CREATE INDEX IF NOT EXISTS idx_posts_audience_created ON public.posts (audience, created_at DESC);",
