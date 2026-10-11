@@ -17,13 +17,12 @@ if [[ ! -f .next/BUILD_ID ]]; then
   exit 1
 fi
 
-if [[ -x /usr/bin/node ]]; then
-  exec /usr/bin/node ./node_modules/next/dist/bin/next start -p 3001 -H 0.0.0.0
-fi
-if [[ -x /usr/local/bin/node ]]; then
-  exec /usr/local/bin/node ./node_modules/next/dist/bin/next start -p 3001 -H 0.0.0.0
-fi
-if command -v node >/dev/null 2>&1; then
+# Next.js 15 needs Node 18+. An older system Node must not be used.
+node_is_new() {
+  "$1" -e 'const major = Number(String(process.versions.node).split(".")[0]); process.exit(major >= 18 ? 0 : 1)' >/dev/null 2>&1
+}
+
+if command -v node >/dev/null 2>&1 && node_is_new "$(command -v node)"; then
   exec node ./node_modules/next/dist/bin/next start -p 3001 -H 0.0.0.0
 fi
 
