@@ -47,6 +47,19 @@ type ListPayload = {
   services: ServiceStatus[];
 };
 
+function emailTemplateSubject(
+  cfg: Record<string, unknown>,
+  key: "signupOtp" | "passwordResetOtp",
+  fallback: string
+): string {
+  const templates = cfg.templates;
+  if (!templates || typeof templates !== "object") return fallback;
+  const entry = (templates as Record<string, unknown>)[key];
+  if (!entry || typeof entry !== "object") return fallback;
+  const subject = (entry as Record<string, unknown>).subject;
+  return typeof subject === "string" && subject.trim() ? subject : fallback;
+}
+
 const ICONS: Record<ServiceId, typeof Mail> = {
   email: Mail,
   supabase: Database,
@@ -271,10 +284,10 @@ function ServiceEditor({
   const [publicAppUrl, setPublicAppUrl] = useState(String(cfg.publicAppUrl ?? ""));
   const [apiKey, setApiKey] = useState("");
   const [signupSubject, setSignupSubject] = useState(
-    String((cfg.templates as any)?.signupOtp?.subject ?? "Your verification code")
+    emailTemplateSubject(cfg, "signupOtp", "Your verification code")
   );
   const [resetSubject, setResetSubject] = useState(
-    String((cfg.templates as any)?.passwordResetOtp?.subject ?? "Your Path+ password reset code")
+    emailTemplateSubject(cfg, "passwordResetOtp", "Your Path+ password reset code")
   );
   const [testTo, setTestTo] = useState("");
   const [notes, setNotes] = useState(String(cfg.notes ?? ""));
