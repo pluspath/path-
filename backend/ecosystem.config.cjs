@@ -35,10 +35,9 @@ module.exports = {
     },
     {
       name: "pathplus-admin",
-      cwd: `${__dirname}/admin`,
-      script: "node_modules/next/dist/bin/next",
-      args: "start -p 3001 -H 0.0.0.0",
-      interpreter: "bun",
+      cwd: __dirname,
+      script: `${__dirname}/deploy/start-admin.sh`,
+      interpreter: "bash",
       instances: 1,
       exec_mode: "fork",
       autorestart: true,
