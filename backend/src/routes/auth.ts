@@ -63,6 +63,7 @@ const signupSchema = z.object({
 });
 
 authRouter.post("/signup", async (c) => {
+  try {
   const raw = await c.req.json().catch(() => null);
   const parsed = signupSchema.safeParse(raw);
   if (!parsed.success) {
@@ -98,9 +99,17 @@ authRouter.post("/signup", async (c) => {
   }
 
   return c.json({ data: { success: true, message: "Verification code sent to your email." } });
+  } catch (err) {
+    console.error("[auth/signup]", err instanceof Error ? err.message : err);
+    return c.json(
+      { error: { message: "Unable to start registration. Please try again." } },
+      500
+    );
+  }
 });
 
 authRouter.post("/verify-otp", async (c) => {
+  try {
   const raw = await c.req.json().catch(() => null);
   const parsed = z
     .object({
@@ -134,20 +143,40 @@ authRouter.post("/verify-otp", async (c) => {
     user_metadata: { full_name: pending.full_name, username: pending.username },
   });
 
-  if (createError || !userData.user) {
-    console.error("[auth/verify-otp] createUser error:", createError?.message);
+  let createdUserId: string | null = null;
+  if (createError || !userData?.user) {
     const msg = createError?.message?.toLowerCase() ?? "";
-    if (msg.includes("already registered") || msg.includes("already exists")) {
-      await consumePendingRegistration(email);
+    const alreadyExists =
+      msg.includes("already registered") || msg.includes("already exists");
+    if (!alreadyExists) {
+      console.error("[auth/verify-otp] createUser error:", createError?.message);
+      return c.json({ error: { message: "Unable to create account. Please try again." } }, 500);
+    }
+    // A previous attempt created the user but the phone never received the
+    // session. Sign in with the same password instead of failing the retry.
+    console.warn("[auth/verify-otp] user already exists, completing sign-in");
+  } else {
+    createdUserId = userData.user.id;
+  }
+
+  // Sign in with the password we stored at signup. This also recovers a retry
+  // when the first attempt created the user but the phone never got the response.
+  const { data: sessionData, error: sessionError } = await supabase.auth.signInWithPassword({
+    email: pending.email,
+    password: plainPassword,
+  });
+  if (sessionError || !sessionData.session || !sessionData.user) {
+    console.error("[auth/verify-otp] signIn error:", sessionError?.message);
+    if (!createdUserId) {
       return c.json(
         { error: { message: "An account with this email already exists. Please sign in instead." } },
         400
       );
     }
-    return c.json({ error: { message: "Unable to create account. Please try again." } }, 500);
+    return c.json({ error: { message: "Account created but sign-in failed. Please sign in manually." } }, 500);
   }
 
-  const userId = userData.user.id;
+  const userId = sessionData.user.id;
   const profileRow: Record<string, unknown> = {
     id: userId,
     username: pending.username,
@@ -166,30 +195,14 @@ authRouter.post("/verify-otp", async (c) => {
     .upsert(profileRow, { onConflict: "id" });
   if (profileError) {
     console.error("[auth/verify-otp] profile upsert failed:", profileError.message);
-    await supabaseAdmin.auth.admin.deleteUser(userId);
+    if (createdUserId) {
+      await supabaseAdmin.auth.admin.deleteUser(userId);
+    }
     return c.json({ error: { message: "Unable to create profile. Please try again." } }, 500);
   }
 
   await ensureJoinedPost(userId, new Date().toISOString());
   await consumePendingRegistration(email);
-
-  const { data: linkData, error: linkError } = await supabaseAdmin.auth.admin.generateLink({
-    type: "magiclink",
-    email: pending.email,
-  });
-  if (linkError || !linkData?.properties?.hashed_token) {
-    console.error("[auth/verify-otp] generateLink error:", linkError?.message);
-    return c.json({ error: { message: "Account created but sign-in failed. Please sign in manually." } }, 500);
-  }
-
-  const { data: sessionData, error: sessionError } = await supabase.auth.verifyOtp({
-    token_hash: linkData.properties.hashed_token,
-    type: "magiclink",
-  });
-  if (sessionError || !sessionData.session) {
-    console.error("[auth/verify-otp] verifyOtp error:", sessionError?.message);
-    return c.json({ error: { message: "Account created but sign-in failed. Please sign in manually." } }, 500);
-  }
 
   return c.json({
     data: {
@@ -200,6 +213,13 @@ authRouter.post("/verify-otp", async (c) => {
       },
     },
   });
+  } catch (err) {
+    console.error("[auth/verify-otp]", err instanceof Error ? err.message : err);
+    return c.json(
+      { error: { message: "Unable to verify the code. Please try again." } },
+      500
+    );
+  }
 });
 
 authRouter.post("/resend-otp", async (c) => {

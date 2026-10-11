@@ -46,6 +46,14 @@ import {
 
 const app = new Hono<{ Variables: HonoVariables }>();
 
+app.onError((err, c) => {
+  console.error("[api] unhandled:", err instanceof Error ? err.message : err);
+  return c.json(
+    { error: { message: "Something went wrong. Please try again." } },
+    500
+  );
+});
+
 // Seed-generated stylized defaults (creative / varied — same idea as DiceBear).
 // GET /static/default-avatars/gen/:seed.png
 app.get("/static/default-avatars/gen/:seed", (c) => {
@@ -346,6 +354,16 @@ app.get("/__marketing", (c) =>
         );`,
         "CREATE INDEX IF NOT EXISTS idx_password_reset_otps_expires ON public.password_reset_otps (otp_expires_at);",
         "ALTER TABLE public.password_reset_otps ENABLE ROW LEVEL SECURITY;",
+        `CREATE OR REPLACE FUNCTION public.auth_user_id_by_email(target_email text)
+RETURNS uuid
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = auth, public
+AS $$ SELECT id FROM auth.users WHERE lower(email) = lower(target_email) LIMIT 1 $$`,
+        "REVOKE ALL ON FUNCTION public.auth_user_id_by_email(text) FROM PUBLIC",
+        "REVOKE ALL ON FUNCTION public.auth_user_id_by_email(text) FROM anon",
+        "REVOKE ALL ON FUNCTION public.auth_user_id_by_email(text) FROM authenticated",
       ];
       for (const sql of statements) {
         const { error } = await supabaseAdmin.rpc("exec_sql", { sql });
