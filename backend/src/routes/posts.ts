@@ -10,6 +10,7 @@ import { getBlockedIds } from "../lib/blocks";
 import { parseDurationToMinutes } from "../lib/duration";
 import { POST_SELECT, loadPosts, attachOriginals } from "../lib/load-posts";
 import { resolveAvatarUrl } from "../lib/avatar";
+import { halfLineSnippet } from "../lib/moment-preview";
 import {
   filterDeletionHiddenPosts,
   getDeletionHiddenUserIds,
@@ -970,7 +971,7 @@ postsRouter.post("/:id/reactions", async (c) => {
   // and only when a reaction was actually added. The sheep (🐑) sent from a
   // sleep moment reads as "sent you a sheep"; any other emoji reads as a love.
   try {
-    const { data: postOwner } = await supabaseAdmin.from("posts").select("user_id").eq("id", id).maybeSingle();
+    const { data: postOwner } = await supabaseAdmin.from("posts").select("user_id, content").eq("id", id).maybeSingle();
     if (postOwner && postOwner.user_id !== userId) {
       // Keep denormalized profile like_count in sync for visitors.
       let delta = 0;
@@ -988,11 +989,12 @@ postsRouter.post("/:id/reactions", async (c) => {
     }
     if (didReact && postOwner && postOwner.user_id !== userId) {
       const isSheep = incoming === "🐑";
+      const snippet = halfLineSnippet((postOwner as { content?: string | null }).content);
       const { data: inserted } = await supabaseAdmin.from("notifications").insert({
         user_id: postOwner.user_id,
         from_user_id: userId,
         type: isSheep ? "sleep" : "reaction",
-        message: isSheep ? "sent you a sheep" : "loved your moment",
+        message: isSheep ? "sent you a sheep" : "liked your Moment",
         post_id: id,
         read: false,
       }).select("id").single();
@@ -1001,7 +1003,11 @@ postsRouter.post("/:id/reactions", async (c) => {
         supabaseAdmin,
         postOwner.user_id,
         isSheep ? "New Sheep" : "New Reaction",
-        isSheep ? `${user.full_name} sent you a sheep` : `${user.full_name} reacted to your moment`,
+        isSheep
+          ? `${user.full_name} sent you a sheep`
+          : snippet
+            ? `${user.full_name} liked your Moment ${snippet}`
+            : `${user.full_name} liked your Moment`,
         {
           postId: id,
           type: isSheep ? "sleep" : "reaction",
@@ -1348,8 +1354,9 @@ postsRouter.post("/:id/comments", async (c) => {
 
   // Notify the post owner (activity feed + push), never about their own comment.
   try {
-    const { data: postOwner } = await userClient.from("posts").select("user_id").eq("id", id).maybeSingle();
+    const { data: postOwner } = await userClient.from("posts").select("user_id, content").eq("id", id).maybeSingle();
     if (postOwner && postOwner.user_id !== userId) {
+      const snippet = halfLineSnippet((postOwner as { content?: string | null }).content);
       const { data: inserted } = await supabaseAdmin.from("notifications").insert({
         user_id: postOwner.user_id,
         from_user_id: userId,
@@ -1363,7 +1370,9 @@ postsRouter.post("/:id/comments", async (c) => {
         supabaseAdmin,
         postOwner.user_id,
         "New Comment",
-        `${user.full_name} commented on your moment`,
+        snippet
+          ? `${user.full_name} commented on your Moment ${snippet}`
+          : `${user.full_name} commented on your Moment`,
         {
           postId: id,
           type: "comment",

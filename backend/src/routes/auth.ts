@@ -183,11 +183,9 @@ authRouter.post("/verify-otp", async (c) => {
     full_name: pending.full_name,
   };
   const gender = normalizeGender(pending.gender);
-  if (gender) {
-    profileRow.gender = gender;
-    // Gender-matched default avatar until the user uploads their own photo.
-    profileRow.avatar_url = defaultAvatarForGender(userId, gender);
-  }
+  if (gender) profileRow.gender = gender;
+  // Distinct scenic default until the user uploads their own photo.
+  profileRow.avatar_url = defaultAvatarForGender(userId, gender);
   if (pending.birthday) profileRow.birthday = pending.birthday;
 
   const { error: profileError } = await supabaseAdmin

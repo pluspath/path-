@@ -12,6 +12,7 @@ import {
 import { resolveAvatarUrl } from "../lib/avatar";
 import { parseLimit, parseCursor, encodeCursor } from "../lib/pagination";
 import { decodeImages } from "../lib/images";
+import { halfLineSnippet } from "../lib/moment-preview";
 import type { HonoVariables } from "../types";
 
 const notificationsRouter = new Hono<{ Variables: HonoVariables }>();
@@ -159,14 +160,17 @@ notificationsRouter.get("/", async (c) => {
     ...new Set(page.map((n: any) => n.post_id).filter(Boolean)),
   ] as string[];
   const postImageMap: Record<string, string> = {};
+  const postSnippetMap: Record<string, string> = {};
   if (postIds.length > 0) {
     const { data: posts } = await supabaseAdmin
       .from("posts")
-      .select("id, image_url")
+      .select("id, image_url, content")
       .in("id", postIds);
     for (const p of posts ?? []) {
       const imgs = decodeImages((p as any).image_url);
       if (imgs[0]) postImageMap[p.id] = imgs[0];
+      const snippet = halfLineSnippet((p as any).content);
+      if (snippet) postSnippetMap[p.id] = snippet;
     }
   }
 
@@ -217,6 +221,7 @@ notificationsRouter.get("/", async (c) => {
       message: n.message,
       postId: n.post_id ?? undefined,
       postImage: (n.post_id && postImageMap[n.post_id]) || n.post_image || undefined,
+      postSnippet: (n.post_id && postSnippetMap[n.post_id]) || undefined,
       friendshipId: friendshipMap[n.id] ?? undefined,
       read: n.read,
       createdAt: n.created_at,

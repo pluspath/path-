@@ -64,7 +64,8 @@ export function defaultAvatarForGender(
   _gender?: string | null
 ): string {
   const id = encodeURIComponent(String(userId || "user"));
-  return `${backendPublicBase()}/static/default-avatars/gen/${id}.png`;
+  // v=3 busts the year-long image cache from earlier face-style defaults.
+  return `${backendPublicBase()}/static/default-avatars/gen/${id}.png?v=3`;
 }
 
 export function resolveAvatarUrl(

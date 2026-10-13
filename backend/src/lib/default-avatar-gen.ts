@@ -1,9 +1,9 @@
 /**
  * Seeded Path+ default-avatar generator.
  *
- * Same idea as DiceBear: a stable user id → always the same creative
- * geometric / landscape illustration. Colors and layouts match the Path+
- * stylized avatar look (navy, cream, salmon, soft blue, yellow, green).
+ * A stable user id always paints the same illustration. These are scenic and
+ * geometric pictures (sunsets, cities, mosaics, plants) — never cartoon faces,
+ * so nobody gets a one-eyed or bald portrait.
  */
 
 const SIZE = 256;
@@ -187,11 +187,11 @@ type TemplateId =
   | "mountainSun"
   | "waves"
   | "stripesSun"
-  | "overlapCircles"
+  | "mosaic"
   | "diamondFrame"
   | "plantGreen"
-  | "twinOrbs"
-  | "crescent"
+  | "cityDusk"
+  | "forest"
   | "arcs";
 
 const TEMPLATES: TemplateId[] = [
@@ -201,11 +201,11 @@ const TEMPLATES: TemplateId[] = [
   "mountainSun",
   "waves",
   "stripesSun",
-  "overlapCircles",
+  "mosaic",
   "diamondFrame",
   "plantGreen",
-  "twinOrbs",
-  "crescent",
+  "cityDusk",
+  "forest",
   "arcs",
 ];
 
@@ -290,11 +290,25 @@ function renderTemplate(
       fillCircle(buf, 170 + rng() * 30, cy, 45 + rng() * 15, PALETTE.yellow);
       break;
     }
-    case "overlapCircles": {
+    case "mosaic": {
+      const tiles: RGB[] = [PALETTE.navy, PALETTE.salmon, PALETTE.yellow, PALETTE.green, PALETTE.lightBlue, PALETTE.peach];
       fillRect(buf, 0, 0, SIZE, SIZE, PALETTE.cream, inside);
-      fillCircle(buf, 90, 110, 70, PALETTE.navy);
-      fillCircle(buf, 160, 150, 65, PALETTE.salmon);
-      if (rng() > 0.5) fillCircle(buf, 140, 90, 40, PALETTE.yellow);
+      const cols = 4;
+      const tile = SIZE / cols;
+      for (let row = 0; row < cols; row++) {
+        for (let col = 0; col < cols; col++) {
+          const color = tiles[Math.floor(rng() * tiles.length)] ?? PALETTE.navy;
+          fillRect(
+            buf,
+            col * tile + 4,
+            row * tile + 4,
+            (col + 1) * tile - 4,
+            (row + 1) * tile - 4,
+            color,
+            inside
+          );
+        }
+      }
       break;
     }
     case "diamondFrame": {
@@ -308,16 +322,28 @@ function renderTemplate(
       fillLeaf(buf, cx, cy - 5, 0.95, PALETTE.navy, inside);
       break;
     }
-    case "twinOrbs": {
-      fillRect(buf, 0, 0, SIZE, SIZE, PALETTE.cream, inside);
-      fillCircle(buf, 100, 130, 70, PALETTE.navy);
-      fillCircle(buf, 165, 130, 55, PALETTE.yellow);
+    case "cityDusk": {
+      fillRect(buf, 0, 0, SIZE, SIZE, PALETTE.navy, inside);
+      fillCircle(buf, 190 + rng() * 20, 70, 22, PALETTE.yellow);
+      const buildings = 5 + Math.floor(rng() * 3);
+      for (let i = 0; i < buildings; i++) {
+        const bw = 28 + rng() * 16;
+        const bh = 70 + rng() * 90;
+        const bx = 16 + i * 36;
+        fillRect(buf, bx, SIZE - bh, bx + bw, SIZE, i % 2 === 0 ? PALETTE.lightBlue : PALETTE.salmon, inside);
+        fillRect(buf, bx + 6, SIZE - bh + 12, bx + 12, SIZE - bh + 22, PALETTE.yellow, inside);
+      }
       break;
     }
-    case "crescent": {
-      fillRect(buf, 0, 0, SIZE, SIZE, PALETTE.navy, inside);
-      fillCircle(buf, cx, cy, 70, PALETTE.yellow);
-      fillCircle(buf, cx + 25, cy - 10, 55, PALETTE.navy);
+    case "forest": {
+      fillRect(buf, 0, 0, SIZE, SIZE, PALETTE.sky, inside);
+      fillRect(buf, 0, 168, SIZE, SIZE, PALETTE.mutedGreen, inside);
+      for (let i = 0; i < 4; i++) {
+        const tx = 36 + i * 56 + rng() * 10;
+        fillRect(buf, tx - 4, 150, tx + 4, 210, PALETTE.navy, inside);
+        fillTriangle(buf, tx - 28, 160, tx, 70 + rng() * 20, tx + 28, 160, PALETTE.green, inside);
+        fillTriangle(buf, tx - 22, 130, tx, 55, tx + 22, 130, PALETTE.mutedGreen, inside);
+      }
       break;
     }
     case "arcs": {
@@ -413,7 +439,7 @@ export function generateDefaultAvatarPng(seed: string): Uint8Array {
   const hit = memoryCache.get(key);
   if (hit) return hit;
 
-  const rng = makeRng(key);
+  const rng = makeRng(`scene-v3:${key}`);
   const template = pickTemplate(rng);
 
   const rgba = new Uint8ClampedArray(SIZE * SIZE * 4);
