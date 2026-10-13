@@ -9,13 +9,24 @@ import {
   getBadgeBreakdown,
   countUnreadNotificationsForUser,
 } from "../lib/push";
-import { resolveAvatarUrl } from "../lib/avatar";
+import { defaultAvatarForGender, resolveAvatarUrl } from "../lib/avatar";
 import { parseLimit, parseCursor, encodeCursor } from "../lib/pagination";
 import { decodeImages } from "../lib/images";
 import { halfLineSnippet } from "../lib/moment-preview";
 import type { HonoVariables } from "../types";
 
 const notificationsRouter = new Hono<{ Variables: HonoVariables }>();
+
+/** Older rows sometimes stored the actor or moment id under a second column name. */
+function actorIdOf(n: Record<string, unknown>): string | null {
+  const id = n.from_user_id || n.actor_id || n.sender_id;
+  return id ? String(id) : null;
+}
+
+function postIdOf(n: Record<string, unknown>): string | null {
+  const id = n.post_id || n.postId;
+  return id ? String(id) : null;
+}
 
 /**
  * POST /api/notifications/test — authenticated self-test push (same as /api/me/push-test).
@@ -124,7 +135,7 @@ notificationsRouter.get("/", async (c) => {
   const blockedSet = new Set(await getBlockedIds(userId));
   let notifications = (rawNotifications ?? []).filter(
     (n: any) =>
-      (!n.from_user_id || !blockedSet.has(n.from_user_id)) &&
+      (!actorIdOf(n) || !blockedSet.has(actorIdOf(n) as string)) &&
       n.type !== "ping" &&
       n.type !== "message"
   );
@@ -148,7 +159,7 @@ notificationsRouter.get("/", async (c) => {
       ? encodeCursor(String(last.created_at), String(last.id ?? ""))
       : null;
 
-  const fromUserIds = [...new Set(page.map((n: any) => n.from_user_id).filter(Boolean))];
+  const fromUserIds = [...new Set(page.map((n: any) => actorIdOf(n)).filter(Boolean))];
   let profileMap: Record<string, any> = {};
   if (fromUserIds.length > 0) {
     const { data: profiles } = await supabaseAdmin.from("profiles").select("*").in("id", fromUserIds as string[]);
@@ -157,7 +168,7 @@ notificationsRouter.get("/", async (c) => {
 
   // Attach a thumbnail URL for reaction/comment/repath rows (UI expects postImage).
   const postIds = [
-    ...new Set(page.map((n: any) => n.post_id).filter(Boolean)),
+    ...new Set(page.map((n: any) => postIdOf(n)).filter(Boolean)),
   ] as string[];
   const postImageMap: Record<string, string> = {};
   const postSnippetMap: Record<string, string> = {};
@@ -179,7 +190,7 @@ notificationsRouter.get("/", async (c) => {
   let friendshipMap: Record<string, string> = {};
   if (friendRequestNotifs.length > 0) {
     const requesterIds = [
-      ...new Set(friendRequestNotifs.map((n: any) => n.from_user_id).filter(Boolean)),
+      ...new Set(friendRequestNotifs.map((n: any) => actorIdOf(n)).filter(Boolean)),
     ] as string[];
     if (requesterIds.length > 0) {
       const { data: friendships } = await supabaseAdmin
@@ -193,39 +204,50 @@ notificationsRouter.get("/", async (c) => {
         byRequester[fs.requester_id] = fs.id;
       }
       for (const n of friendRequestNotifs) {
-        const fid = n.from_user_id ? byRequester[n.from_user_id] : undefined;
+        const requesterId = actorIdOf(n);
+        const fid = requesterId ? byRequester[requesterId] : undefined;
         if (fid) friendshipMap[n.id] = fid;
       }
     }
   }
 
   return c.json({
-    data: page.map((n: any) => ({
+    data: page.map((n: any) => {
+      const actorId = actorIdOf(n);
+      const profile = actorId ? profileMap[actorId] : undefined;
+      const momentId = postIdOf(n);
+      return {
       id: n.id,
       type: n.type,
-      user: n.from_user_id && profileMap[n.from_user_id]
+      user: profile
         ? {
-            id: profileMap[n.from_user_id].id,
-            name: profileMap[n.from_user_id].full_name ?? "",
-            username: profileMap[n.from_user_id].username ?? "",
-            avatar: resolveAvatarUrl(
-              profileMap[n.from_user_id].id,
-              profileMap[n.from_user_id].avatar_url,
-              profileMap[n.from_user_id].gender
-            ),
-            bio: profileMap[n.from_user_id].bio ?? "",
-            location: profileMap[n.from_user_id].location ?? "",
-            gender: profileMap[n.from_user_id].gender ?? undefined,
+            id: profile.id,
+            name: profile.full_name ?? "",
+            username: profile.username ?? "",
+            avatar: resolveAvatarUrl(profile.id, profile.avatar_url, profile.gender),
+            bio: profile.bio ?? "",
+            location: profile.location ?? "",
+            gender: profile.gender ?? undefined,
           }
-        : { id: "system", name: "Path+", username: "", avatar: "" },
+        : actorId
+          ? {
+              id: actorId,
+              name: "",
+              username: "",
+              avatar: defaultAvatarForGender(actorId),
+              bio: "",
+              location: "",
+            }
+          : { id: "system", name: "Path+", username: "", avatar: "" },
       message: n.message,
-      postId: n.post_id ?? undefined,
-      postImage: (n.post_id && postImageMap[n.post_id]) || n.post_image || undefined,
-      postSnippet: (n.post_id && postSnippetMap[n.post_id]) || undefined,
+      postId: momentId ?? undefined,
+      postImage: (momentId && postImageMap[momentId]) || n.post_image || undefined,
+      postSnippet: (momentId && postSnippetMap[momentId]) || undefined,
       friendshipId: friendshipMap[n.id] ?? undefined,
       read: n.read,
       createdAt: n.created_at,
-    })),
+      };
+    }),
     nextCursor,
     hasMore,
     limit,
