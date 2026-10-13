@@ -1,3 +1,5 @@
+import { deflateSync } from "node:zlib";
+
 /**
  * Seeded Path+ default-avatar generator.
  *
@@ -382,7 +384,7 @@ function pngChunk(type: string, data: Uint8Array): Uint8Array {
   return out;
 }
 
-/** Encode RGBA buffer as PNG (uses Bun.deflateSync). */
+/** Encode RGBA buffer as a real PNG (zlib-compressed IDAT). */
 function encodePng(rgba: Uint8ClampedArray): Uint8Array {
   const stride = SIZE * 4;
   const raw = new Uint8Array((SIZE + 1) * stride / 4 * 4 + SIZE); // filter byte per row
@@ -395,10 +397,8 @@ function encodePng(rgba: Uint8ClampedArray): Uint8Array {
     filtered.set(rgba.subarray(y * stride, y * stride + stride), dest + 1);
   }
 
-  const compressed =
-    typeof Bun !== "undefined" && typeof Bun.deflateSync === "function"
-      ? Bun.deflateSync(filtered)
-      : filtered; // extremely unlikely fallback (invalid png) — Bun is required
+  // PNG IDAT must be zlib-wrapped deflate. Raw bytes are not a valid image.
+  const compressed = deflateSync(filtered);
 
   const signature = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
   const ihdr = new Uint8Array(13);

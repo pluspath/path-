@@ -100,38 +100,49 @@ export async function ensureGenderDefaultAvatar(
   return next;
 }
 
+const PROFILE_PAGE = 500;
+
+/** Every profile row, past PostgREST's default 1,000-row cap. */
+async function listAllProfiles(): Promise<
+  Array<{ id: string; gender: string | null; avatar_url: string | null }>
+> {
+  const all: Array<{ id: string; gender: string | null; avatar_url: string | null }> = [];
+  for (let from = 0; ; from += PROFILE_PAGE) {
+    const { data, error } = await supabaseAdmin
+      .from("profiles")
+      .select("id, gender, avatar_url")
+      .order("id", { ascending: true })
+      .range(from, from + PROFILE_PAGE - 1);
+    if (error) throw new Error(error.message);
+    const rows = data ?? [];
+    all.push(...rows);
+    if (rows.length < PROFILE_PAGE) break;
+  }
+  return all;
+}
+
 /**
- * Replace empty / DiceBear / old fixed defaults with seed-generated stylized
- * avatars. NEVER touches custom uploads.
+ * Give every existing account that has no uploaded photo a stable default
+ * avatar. NEVER touches custom uploads. Pages through the whole profiles table.
  */
 export async function backfillGenderAvatars(): Promise<{
   updated: number;
   skippedCustom: number;
 }> {
   try {
-    const { data: profiles, error } = await supabaseAdmin
-      .from("profiles")
-      .select("id, gender, avatar_url");
-
-    if (error || !profiles) {
-      console.error("[avatar] backfill: failed to load profiles:", error?.message);
-      return { updated: 0, skippedCustom: 0 };
-    }
+    const profiles = await listAllProfiles();
 
     let updated = 0;
     let skippedCustom = 0;
 
     for (const p of profiles) {
+      if (!p?.id) continue;
       if (isCustomAvatar(p.avatar_url)) {
         skippedCustom += 1;
         continue;
       }
 
       const next = defaultAvatarForGender(p.id, p.gender);
-      // Already on the generative endpoint — leave alone.
-      if (typeof p.avatar_url === "string" && p.avatar_url.includes("/static/default-avatars/gen/")) {
-        if (p.avatar_url === next) continue;
-      }
       if (p.avatar_url === next) continue;
 
       const { error: updErr } = await supabaseAdmin
@@ -147,7 +158,7 @@ export async function backfillGenderAvatars(): Promise<{
     }
 
     console.log(
-      `[avatar] backfill: updated ${updated} default avatar(s); skipped ${skippedCustom} custom upload(s)`
+      `[avatar] backfill: updated ${updated} default avatar(s); skipped ${skippedCustom} custom upload(s); scanned ${profiles.length}`
     );
     return { updated, skippedCustom };
   } catch (e) {
