@@ -391,8 +391,8 @@ conversationsRouter.get("/:id", async (c) => {
   if (!participation) return c.json({ error: { message: "Not found" } }, 404);
   const myLastReadAt: string | null = participation.last_read_at ?? null;
 
-  const rawLimit = Number(c.req.query("limit") ?? 24);
-  const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.floor(rawLimit), 1), 100) : 24;
+  const rawLimit = Number(c.req.query("limit") ?? 12);
+  const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.floor(rawLimit), 1), 40) : 12;
   const before = c.req.query("before"); // older page (exclusive upper bound)
   const after = c.req.query("after"); // newer page (exclusive lower bound)
 
