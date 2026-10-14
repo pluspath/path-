@@ -6,7 +6,7 @@ import { decodeImages } from "../lib/images";
 import { getBlockedIds } from "../lib/blocks";
 import { formatDuration } from "../lib/duration";
 import { upsertUserDevice, deactivateUserDevices, getPushTokensForUser, getPushStatusForUser, sendPushNotificationDetailed, getUnreadNotificationBadgeCount } from "../lib/push";
-import { isCustomAvatar, defaultAvatarForGender, resolveAvatarUrl, normalizeGender } from "../lib/avatar";
+import { isCustomAvatar, defaultAvatarForGender, ensureGenderDefaultAvatar, resolveAvatarUrl, normalizeGender } from "../lib/avatar";
 import { isDeletionHiddenProfile } from "../lib/account-deletion";
 import { parseLimit, parseCursor, encodeCursor, isOlderThanCursor } from "../lib/pagination";
 import { ensureUserHasUsername } from "../lib/username-backfill";
@@ -572,6 +572,11 @@ usersRouter.post("/setup-profile", async (c) => {
     return c.json({ error: { message: "Failed to create profile", supabaseError: error.message } }, 500);
   }
 
+  if (!isCustomAvatar(profile.avatar_url)) {
+    const assigned = await ensureGenderDefaultAvatar(userId, profile.gender, profile.avatar_url);
+    if (assigned) profile.avatar_url = assigned;
+  }
+
   return c.json({ data: formatProfile(profile) }, 201);
 });
 
@@ -599,6 +604,12 @@ usersRouter.get("/me", async (c) => {
     await ensureUserHasUsername(userId);
     const refreshed = await supabaseAdmin.from("profiles").select("*").eq("id", userId).maybeSingle();
     profileRow = refreshed.data ?? profileRow;
+  }
+
+  // Persist a default avatar for accounts that never uploaded a photo.
+  if (profileRow && !isCustomAvatar(profileRow.avatar_url)) {
+    const assigned = await ensureGenderDefaultAvatar(userId, profileRow.gender, profileRow.avatar_url);
+    if (assigned) profileRow.avatar_url = assigned;
   }
 
   const profile = profileRow ?? user;
