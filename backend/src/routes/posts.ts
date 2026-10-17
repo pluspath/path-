@@ -841,7 +841,7 @@ postsRouter.patch("/:id", async (c) => {
   // Disable Comments: persist the boolean when the client sends it.
   if ("commentsDisabled" in body) updateData.comments_disabled = !!body.commentsDisabled;
 
-  const SELECT = "*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(avatar_url, gender))";
+  const SELECT = "*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(full_name, username, avatar_url, gender))";
   let { data: updated, error } = await userClient
     .from("posts")
     .update(updateData)
@@ -1035,7 +1035,7 @@ postsRouter.post("/:id/reactions", async (c) => {
     }
   }
 
-  const { data: reactions } = await supabaseAdmin.from("reactions").select("user_id, type, profiles!user_id(avatar_url, gender)").eq("post_id", id);
+  const { data: reactions } = await supabaseAdmin.from("reactions").select("user_id, type, profiles!user_id(full_name, username, avatar_url, gender)").eq("post_id", id);
   // Viewer here is the reactor — they always see their own reaction.
   return c.json({ data: { reactions: formatReactions(reactions ?? [], userId, ownerRow?.user_id) } });
 });
@@ -1067,7 +1067,7 @@ postsRouter.post("/:id/reactions/lock", async (c) => {
   await supabaseAdmin.from("reactions").update({ type: newType }).eq("post_id", id).eq("user_id", userId);
 
   const { data: ownerRow } = await supabaseAdmin.from("posts").select("user_id").eq("id", id).maybeSingle();
-  const { data: reactions } = await supabaseAdmin.from("reactions").select("user_id, type, profiles!user_id(avatar_url, gender)").eq("post_id", id);
+  const { data: reactions } = await supabaseAdmin.from("reactions").select("user_id, type, profiles!user_id(full_name, username, avatar_url, gender)").eq("post_id", id);
   return c.json({ data: { locked: nextLocked, reactions: formatReactions(reactions ?? [], userId, ownerRow?.user_id) } });
 });
 

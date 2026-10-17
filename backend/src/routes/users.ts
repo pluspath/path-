@@ -272,17 +272,23 @@ export function formatReactions(rawReactions: any[], viewerId?: string, ownerId?
     // Locked reactions: visible to the moment owner and the reactor (for lock UI).
     // Everyone else never receives locked reactions from the API.
     .filter((r: any) => !isReactionLocked(r.type) || ownerId === viewerId || r.user_id === viewerId)
-    .map((r: any) => ({
-      userId: r.user_id,
-      type: baseReactionType(r.type),
-      locked: isReactionLocked(r.type),
-      // Always resolve to a raster URL — raw SVG defaults render blank in expo-image.
-      userAvatar: resolveAvatarUrl(
-        r.user_id,
-        r.profiles?.avatar_url,
-        r.profiles?.gender
-      ),
-    }));
+    .map((r: any) => {
+      const username = String(r.profiles?.username ?? "").trim();
+      const fullName = String(r.profiles?.full_name ?? r.profiles?.name ?? "").trim();
+      return {
+        userId: r.user_id,
+        type: baseReactionType(r.type),
+        locked: isReactionLocked(r.type),
+        // Prefer display name; fall back to @username so sheets never look empty.
+        userName: fullName || username || undefined,
+        // Always resolve to a raster URL — raw SVG defaults render blank in expo-image.
+        userAvatar: resolveAvatarUrl(
+          r.user_id,
+          r.profiles?.avatar_url,
+          r.profiles?.gender
+        ),
+      };
+    });
 }
 
 export function formatPost(p: any, viewerId?: string, blockedIds: string[] = []): any {
@@ -1249,8 +1255,37 @@ usersRouter.get("/:id/friends", async (c) => {
     .select("*")
     .in("id", visibleIds);
 
+  // Hide accounts in the deletion grace window, and never return blank names.
+  const visible = (profiles ?? []).filter((p: any) => !isDeletionHiddenProfile(p));
+  const needIdentity = visible.filter((p: any) => {
+    const name = String(p?.full_name ?? p?.name ?? "").trim();
+    const username = String(p?.username ?? "").trim();
+    return !name || !username;
+  });
+  await Promise.all(
+    needIdentity.map(async (p: any) => {
+      try {
+        const { data: authData } = await supabaseAdmin.auth.admin.getUserById(p.id);
+        const meta = authData?.user?.user_metadata ?? {};
+        const metaName = String(meta.full_name ?? meta.name ?? "").trim();
+        const metaUsername = String(meta.username ?? "").trim();
+        if (!String(p.full_name ?? "").trim() && metaName) p.full_name = metaName;
+        if (!String(p.username ?? "").trim() && metaUsername) p.username = metaUsername;
+      } catch {
+        /* best-effort */
+      }
+    })
+  );
+
   return c.json({
-    data: (profiles ?? []).map((p: any) => formatProfile(p, 0, 0, userId)),
+    data: visible.map((p: any) => {
+      const formatted = formatProfile(p, 0, 0, userId);
+      // Mirror friends-list formatting: never ship an empty name label.
+      if (!String(formatted.name ?? "").trim() && formatted.username) {
+        formatted.name = formatted.username;
+      }
+      return formatted;
+    }),
   });
 });
 
@@ -1328,7 +1363,7 @@ usersRouter.get("/:id/posts", async (c) => {
   };
 
   const SELECT =
-    "*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(avatar_url, gender))";
+    "*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(full_name, username, avatar_url, gender))";
 
   // Load the user's full post list (paged from DB), then filter + slice in memory.
   // Cursor-only over-fetch previously under-reported hasMore and froze UIs at ~20.

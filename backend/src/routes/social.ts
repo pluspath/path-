@@ -11,7 +11,7 @@ import type { HonoVariables } from "../types";
 const socialRouter = new Hono<{ Variables: HonoVariables }>();
 
 const POST_SELECT =
-  "*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(avatar_url))";
+  "*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(full_name, username, avatar_url))";
 
 /** GET /api/social/trending — posts ranked by recent engagement */
 socialRouter.get("/trending", async (c) => {
@@ -26,7 +26,7 @@ socialRouter.get("/trending", async (c) => {
   const [{ data: posts }, { data: friendships }, blockedIds] = await Promise.all([
     userClient
       .from("posts")
-      .select("*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(avatar_url))")
+      .select("*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(full_name, username, avatar_url))")
       .gte("created_at", since)
       .order("created_at", { ascending: false })
       .limit(100),
@@ -95,7 +95,7 @@ socialRouter.get("/saved", async (c) => {
 
   const { data: posts } = await userClient
     .from("posts")
-    .select("*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(avatar_url))")
+    .select("*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(full_name, username, avatar_url))")
     .in("id", postIds);
 
   const postMap: Record<string, any> = {};
@@ -351,7 +351,7 @@ socialRouter.get("/hashtags/:tag", async (c) => {
 
   const { data: posts } = await userClient
     .from("posts")
-    .select("*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(avatar_url))")
+    .select("*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(full_name, username, avatar_url))")
     .in("id", postIds)
     .order("created_at", { ascending: false });
 
@@ -443,7 +443,7 @@ socialRouter.get("/search", async (c) => {
   if (type === "all" || type === "posts") {
     const { data: found } = await userClient
       .from("posts")
-      .select("*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(avatar_url))")
+      .select("*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(full_name, username, avatar_url))")
       .ilike("content", `%${q}%`)
       .order("created_at", { ascending: false })
       .limit(15);
