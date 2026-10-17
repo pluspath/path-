@@ -140,6 +140,52 @@ notificationsRouter.get("/", async (c) => {
       n.type !== "message"
   );
 
+  // Drop stale LIKE notices whose reaction was removed (and delete them).
+  // Do NOT apply this to "sleep" status alerts ("X is sleeping") — only to
+  // sheep-reaction notices, which share type "sleep" but say "sent you a sheep".
+  const reactionLikeNotifs = notifications.filter((n: any) => {
+    if (!postIdOf(n) || !actorIdOf(n)) return false;
+    if (n.type === "reaction") return true;
+    if (n.type === "sleep") {
+      const msg = String(n.message ?? "").toLowerCase();
+      return msg.includes("sheep") || msg.includes("liked");
+    }
+    return false;
+  });
+  if (reactionLikeNotifs.length > 0) {
+    const postIds = [...new Set(reactionLikeNotifs.map((n: any) => postIdOf(n)!))];
+    const actorIds = [...new Set(reactionLikeNotifs.map((n: any) => actorIdOf(n)!))];
+    const { data: liveReactions } = await supabaseAdmin
+      .from("reactions")
+      .select("post_id, user_id")
+      .in("post_id", postIds)
+      .in("user_id", actorIds);
+    const liveKeys = new Set(
+      (liveReactions ?? []).map((r: any) => `${r.post_id}:${r.user_id}`)
+    );
+    const orphanIds: string[] = [];
+    const isReactionNotice = (n: any) => {
+      if (n.type === "reaction") return true;
+      if (n.type === "sleep") {
+        const msg = String(n.message ?? "").toLowerCase();
+        return msg.includes("sheep") || msg.includes("liked");
+      }
+      return false;
+    };
+    notifications = notifications.filter((n: any) => {
+      if (!isReactionNotice(n)) return true;
+      const pid = postIdOf(n);
+      const aid = actorIdOf(n);
+      if (!pid || !aid) return true;
+      const alive = liveKeys.has(`${pid}:${aid}`);
+      if (!alive) orphanIds.push(String(n.id));
+      return alive;
+    });
+    if (orphanIds.length > 0) {
+      void supabaseAdmin.from("notifications").delete().in("id", orphanIds);
+    }
+  }
+
   // Id tiebreak when cursor includes `|id`.
   if (cursor?.id) {
     notifications = notifications.filter((n: any) => {
@@ -180,10 +226,14 @@ notificationsRouter.get("/", async (c) => {
     for (const p of posts ?? []) {
       const imgs = decodeImages((p as any).image_url);
       if (imgs[0]) postImageMap[p.id] = imgs[0];
+      // Caption snippets only for comments / mentions / repaths — not bare likes,
+      // so unliked Moments never leave text residue in the feed.
       const snippet = halfLineSnippet((p as any).content);
       if (snippet) postSnippetMap[p.id] = snippet;
     }
   }
+
+  const typesThatShowSnippet = new Set(["comment", "mention", "repath"]);
 
   // For friend_request notifications, fetch friendship IDs in one query.
   const friendRequestNotifs = page.filter((n: any) => n.type === "friend_request");
@@ -242,7 +292,10 @@ notificationsRouter.get("/", async (c) => {
       message: n.message,
       postId: momentId ?? undefined,
       postImage: (momentId && postImageMap[momentId]) || n.post_image || undefined,
-      postSnippet: (momentId && postSnippetMap[momentId]) || undefined,
+      postSnippet:
+        typesThatShowSnippet.has(String(n.type)) && momentId
+          ? postSnippetMap[momentId]
+          : undefined,
       friendshipId: friendshipMap[n.id] ?? undefined,
       read: n.read,
       createdAt: n.created_at,

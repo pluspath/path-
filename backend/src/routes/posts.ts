@@ -968,8 +968,9 @@ postsRouter.post("/:id/reactions", async (c) => {
   }
 
   // Notify the post owner (activity feed + push), never about their own action,
-  // and only when a reaction was actually added. The sheep (🐑) sent from a
-  // sleep moment reads as "sent you a sheep"; any other emoji reads as a love.
+  // and only when a reaction was actually added. Removing a like deletes the
+  // prior reaction notification so Moment text never lingers as stale "sensitive"
+  // preview data. The sheep (🐑) from a sleep moment reads as "sent you a sheep".
   try {
     const { data: postOwner } = await supabaseAdmin.from("posts").select("user_id, content").eq("id", id).maybeSingle();
     if (postOwner && postOwner.user_id !== userId) {
@@ -986,10 +987,28 @@ postsRouter.post("/:id/reactions", async (c) => {
         const next = Math.max(0, (Number((row as any)?.like_count) || 0) + delta);
         await supabaseAdmin.from("profiles").update({ like_count: next }).eq("id", postOwner.user_id);
       }
+
+      // Clear prior like notices for this actor+moment (unlike OR emoji switch).
+      // Keep "X is sleeping" alerts (also type=sleep) — only remove sheep likes.
+      await supabaseAdmin
+        .from("notifications")
+        .delete()
+        .eq("user_id", postOwner.user_id)
+        .eq("from_user_id", userId)
+        .eq("post_id", id)
+        .eq("type", "reaction");
+      await supabaseAdmin
+        .from("notifications")
+        .delete()
+        .eq("user_id", postOwner.user_id)
+        .eq("from_user_id", userId)
+        .eq("post_id", id)
+        .eq("type", "sleep")
+        .ilike("message", "%sheep%");
     }
     if (didReact && postOwner && postOwner.user_id !== userId) {
       const isSheep = incoming === "🐑";
-      const snippet = halfLineSnippet((postOwner as { content?: string | null }).content);
+      // Do not embed Moment text in push/body — avoids leaking caption content via notices.
       const { data: inserted } = await supabaseAdmin.from("notifications").insert({
         user_id: postOwner.user_id,
         from_user_id: userId,
@@ -1005,9 +1024,7 @@ postsRouter.post("/:id/reactions", async (c) => {
         isSheep ? "New Sheep" : "New Reaction",
         isSheep
           ? `${user.full_name} sent you a sheep`
-          : snippet
-            ? `${user.full_name} liked your Moment ${snippet}`
-            : `${user.full_name} liked your Moment`,
+          : `${user.full_name} liked your Moment`,
         {
           postId: id,
           type: isSheep ? "sleep" : "reaction",
