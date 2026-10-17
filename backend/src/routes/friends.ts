@@ -415,7 +415,8 @@ friendsRouter.get("/", async (c) => {
       isCloseFriend: false,
     }));
 
-  const friends = [...acceptedFriends, ...pendingSentFriends];
+  // Pending outgoing requests first so they stay visible at the top of Your Friends.
+  const friends = [...pendingSentFriends, ...acceptedFriends];
   const requests = (pendingFriendships ?? [])
     .filter((f: any) => !blockedSet.has(f.requester_id))
     .map((f: any) => ({

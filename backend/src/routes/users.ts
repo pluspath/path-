@@ -265,6 +265,14 @@ export function lockedReactionType(type: string | null | undefined): string {
 // Map + visibility-filter a raw reactions array for a specific viewer.
 // `ownerId` is the moment owner; locked reactions survive only for the reactor
 // themselves or the owner.
+/** Nested `profiles` from PostgREST may be an object or a one-row array. */
+function nestedReactionProfile(r: any): any | null {
+  const raw = r?.profiles ?? r?.profile ?? null;
+  if (!raw) return null;
+  if (Array.isArray(raw)) return raw[0] ?? null;
+  return raw;
+}
+
 export function formatReactions(rawReactions: any[], viewerId?: string, ownerId?: string, blockedIds: string[] = []) {
   const blockedSet = blockedIds.length > 0 ? new Set(blockedIds) : null;
   return (rawReactions ?? [])
@@ -273,8 +281,9 @@ export function formatReactions(rawReactions: any[], viewerId?: string, ownerId?
     // Everyone else never receives locked reactions from the API.
     .filter((r: any) => !isReactionLocked(r.type) || ownerId === viewerId || r.user_id === viewerId)
     .map((r: any) => {
-      const username = String(r.profiles?.username ?? "").trim();
-      const fullName = String(r.profiles?.full_name ?? r.profiles?.name ?? "").trim();
+      const profile = nestedReactionProfile(r);
+      const username = String(profile?.username ?? "").trim();
+      const fullName = String(profile?.full_name ?? profile?.name ?? "").trim();
       return {
         userId: r.user_id,
         type: baseReactionType(r.type),
@@ -284,11 +293,67 @@ export function formatReactions(rawReactions: any[], viewerId?: string, ownerId?
         // Always resolve to a raster URL — raw SVG defaults render blank in expo-image.
         userAvatar: resolveAvatarUrl(
           r.user_id,
-          r.profiles?.avatar_url,
-          r.profiles?.gender
+          profile?.avatar_url,
+          profile?.gender
         ),
       };
     });
+}
+
+/**
+ * Fill missing reactor names and always refresh avatars from live profiles so
+ * interaction sheets never show "a friend" and never keep a stale photo.
+ */
+export async function refreshReactionActors(posts: any[]): Promise<void> {
+  try {
+    const ids = new Set<string>();
+    for (const p of posts ?? []) {
+      for (const r of p?.reactions ?? []) {
+        if (r?.userId) ids.add(String(r.userId));
+      }
+      if (p?.original?.reactions) {
+        for (const r of p.original.reactions) {
+          if (r?.userId) ids.add(String(r.userId));
+        }
+      }
+    }
+    if (ids.size === 0) return;
+
+    const { data: profiles } = await supabaseAdmin
+      .from("profiles")
+      .select("id, full_name, name, username, avatar_url, gender")
+      .in("id", Array.from(ids));
+
+    const byId: Record<
+      string,
+      { userName: string; userAvatar: string }
+    > = {};
+    for (const pr of profiles ?? []) {
+      const username = String(pr.username ?? "").trim();
+      const fullName = String(pr.full_name ?? pr.name ?? "").trim();
+      byId[pr.id] = {
+        userName: fullName || username || "Member",
+        userAvatar: resolveAvatarUrl(pr.id, pr.avatar_url, pr.gender),
+      };
+    }
+
+    const patch = (reactions: any[] | undefined) => {
+      if (!Array.isArray(reactions)) return;
+      for (const r of reactions) {
+        const live = r?.userId ? byId[r.userId] : undefined;
+        if (!live) continue;
+        r.userName = live.userName;
+        r.userAvatar = live.userAvatar;
+      }
+    };
+
+    for (const p of posts ?? []) {
+      patch(p?.reactions);
+      if (p?.original) patch(p.original.reactions);
+    }
+  } catch (e) {
+    console.error("[reactions] refreshReactionActors error:", e);
+  }
 }
 
 export function formatPost(p: any, viewerId?: string, blockedIds: string[] = []): any {
@@ -749,7 +814,11 @@ usersRouter.put("/me", async (c) => {
   const oldCover = beforeRow?.cover_url ?? (user as any).cover_url ?? null;
   const nextAvatar = acceptedProfileImageUpdate(oldAvatar, body.avatar, "avatar");
   const nextCover = acceptedProfileImageUpdate(oldCover, body.coverPhoto, "cover");
-  if (nextAvatar) updateData.avatar_url = nextAvatar;
+  if (nextAvatar) {
+    // Cache-bust so notifications / feed / chat never keep a stale photo.
+    const base = String(nextAvatar).replace(/([?&])v=\d+/g, "").replace(/[?&]$/, "");
+    updateData.avatar_url = `${base}${base.includes("?") ? "&" : "?"}v=${Date.now()}`;
+  }
   if (nextCover) updateData.cover_url = nextCover;
 
   if (Object.keys(updateData).length === 0) {
@@ -1421,6 +1490,7 @@ usersRouter.get("/:id/posts", async (c) => {
 
   const formatted = page.map((p) => formatPost(p, userId ?? undefined, blockedIds));
   await refreshFriendshipAvatars(formatted);
+  await refreshReactionActors(formatted);
 
   return c.json({
     data: formatted,

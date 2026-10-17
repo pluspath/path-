@@ -256,26 +256,34 @@ export async function refreshFriendshipAvatars(posts: any[]): Promise<void> {
 
     const { data: profiles } = await supabaseAdmin
       .from("profiles")
-      .select("id, avatar_url, gender")
+      .select("id, full_name, name, username, avatar_url, gender")
       .in("id", Array.from(friendIds));
 
-    const avatarById: Record<string, string> = {};
+    const liveById: Record<string, { avatar: string; name: string }> = {};
     for (const pr of profiles ?? []) {
-      avatarById[pr.id] = resolveAvatarUrl(pr.id, pr.avatar_url, pr.gender);
+      const username = String(pr.username ?? "").trim();
+      const fullName = String(pr.full_name ?? pr.name ?? "").trim();
+      liveById[pr.id] = {
+        avatar: resolveAvatarUrl(pr.id, pr.avatar_url, pr.gender),
+        name: fullName || username || "Member",
+      };
     }
 
     for (const p of posts ?? []) {
       if (p?.type !== FRIENDSHIP_TYPE || !Array.isArray(p.friends)) continue;
-      // Refresh each grouped friend's avatar.
+      // Refresh each grouped friend's avatar + display name.
       for (const f of p.friends) {
-        if (f?.id && f.id in avatarById) f.avatar = avatarById[f.id];
+        if (f?.id && f.id in liveById) {
+          f.avatar = liveById[f.id].avatar;
+          f.name = liveById[f.id].name;
+        }
       }
       // `image` is the type-icon avatar shown in the timeline. It maps to the
       // moment's `locationName` (most-recent friend), falling back to the first.
       const primary =
         p.friends.find((f: any) => f.id === p.locationName) ?? p.friends[0];
-      if (primary && primary.id in avatarById) {
-        p.image = avatarById[primary.id] ?? undefined;
+      if (primary && primary.id in liveById) {
+        p.image = liveById[primary.id].avatar ?? undefined;
       }
     }
   } catch (e) {

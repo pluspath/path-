@@ -1,6 +1,13 @@
 import { Hono } from "hono";
 import { createUserClient, supabaseAdmin } from "../supabase";
-import { formatPost, formatReactions, isReactionLocked, baseReactionType, lockedReactionType } from "./users";
+import {
+  formatPost,
+  formatReactions,
+  refreshReactionActors,
+  isReactionLocked,
+  baseReactionType,
+  lockedReactionType,
+} from "./users";
 import { sendPushToUser } from "../lib/push";
 import { SYSTEM_MOMENT_TYPES, refreshFriendshipAvatars } from "../lib/systemMoments";
 import { ensureBirthdayMoments } from "../lib/birthday";
@@ -199,6 +206,7 @@ postsRouter.get("/", async (c) => {
 
   const formatted = page.map((p) => formatPost(p, userId ?? undefined, blockedIds));
   await refreshFriendshipAvatars(formatted); // always show friends' CURRENT avatars
+  await refreshReactionActors(formatted); // live names + avatars on likes
   return c.json({ data: formatted, nextCursor, hasMore, limit });
 });
 
@@ -487,6 +495,7 @@ async function handleInteractedMoments(c: any) {
   await attachOriginals(userClient, orderedPosts);
 
   const formatted = orderedPosts.map((p: any) => formatPost(p, userId, blockedIds));
+  await refreshReactionActors(formatted);
   if (paged) {
     return c.json({
       data: {
@@ -674,7 +683,11 @@ postsRouter.post("/", async (c) => {
 
     const formatted = formatPost(post, userId);
     await refreshFriendshipAvatars([formatted]);
-    if (formatted.original) await refreshFriendshipAvatars([formatted.original]);
+    await refreshReactionActors([formatted]);
+    if (formatted.original) {
+      await refreshFriendshipAvatars([formatted.original]);
+      await refreshReactionActors([formatted.original]);
+    }
     return c.json({ data: formatted }, 201);
   }
 
@@ -1054,7 +1067,11 @@ postsRouter.post("/:id/reactions", async (c) => {
 
   const { data: reactions } = await supabaseAdmin.from("reactions").select("user_id, type, profiles!user_id(full_name, username, avatar_url, gender)").eq("post_id", id);
   // Viewer here is the reactor — they always see their own reaction.
-  return c.json({ data: { reactions: formatReactions(reactions ?? [], userId, ownerRow?.user_id) } });
+  const formatted = {
+    reactions: formatReactions(reactions ?? [], userId, ownerRow?.user_id),
+  };
+  await refreshReactionActors([formatted]);
+  return c.json({ data: { reactions: formatted.reactions } });
 });
 
 // Toggle the privacy lock on the current user's reaction for a post.
@@ -1085,7 +1102,11 @@ postsRouter.post("/:id/reactions/lock", async (c) => {
 
   const { data: ownerRow } = await supabaseAdmin.from("posts").select("user_id").eq("id", id).maybeSingle();
   const { data: reactions } = await supabaseAdmin.from("reactions").select("user_id, type, profiles!user_id(full_name, username, avatar_url, gender)").eq("post_id", id);
-  return c.json({ data: { locked: nextLocked, reactions: formatReactions(reactions ?? [], userId, ownerRow?.user_id) } });
+  const formatted = {
+    reactions: formatReactions(reactions ?? [], userId, ownerRow?.user_id),
+  };
+  await refreshReactionActors([formatted]);
+  return c.json({ data: { locked: nextLocked, reactions: formatted.reactions } });
 });
 
 // Record that the current viewer has SEEN this moment (read receipt).

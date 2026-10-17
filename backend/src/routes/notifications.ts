@@ -12,7 +12,7 @@ import {
 import { defaultAvatarForGender, resolveAvatarUrl } from "../lib/avatar";
 import { parseLimit, parseCursor, encodeCursor } from "../lib/pagination";
 import { decodeImages } from "../lib/images";
-import { halfLineSnippet } from "../lib/moment-preview";
+import { momentTextPreview } from "../lib/moment-preview";
 import type { HonoVariables } from "../types";
 
 const notificationsRouter = new Hono<{ Variables: HonoVariables }>();
@@ -212,28 +212,37 @@ notificationsRouter.get("/", async (c) => {
     for (const p of profiles ?? []) profileMap[p.id] = p;
   }
 
-  // Attach a thumbnail URL for reaction/comment/repath rows (UI expects postImage).
+  // Attach Moment preview: media thumb when the Moment has image/video,
+  // otherwise the Moment's text caption (never junk JSON / UUIDs).
   const postIds = [
     ...new Set(page.map((n: any) => postIdOf(n)).filter(Boolean)),
   ] as string[];
   const postImageMap: Record<string, string> = {};
   const postSnippetMap: Record<string, string> = {};
+  const postHasMedia = new Set<string>();
   if (postIds.length > 0) {
     const { data: posts } = await supabaseAdmin
       .from("posts")
-      .select("id, image_url, content")
+      .select("id, image_url, content, type")
       .in("id", postIds);
     for (const p of posts ?? []) {
       const imgs = decodeImages((p as any).image_url);
-      if (imgs[0]) postImageMap[p.id] = imgs[0];
-      // Caption snippets only for comments / mentions / repaths — not bare likes,
-      // so unliked Moments never leave text residue in the feed.
-      const snippet = halfLineSnippet((p as any).content);
+      if (imgs[0]) {
+        postImageMap[p.id] = imgs[0];
+        postHasMedia.add(p.id);
+      }
+      const snippet = momentTextPreview((p as any).content, { maxLen: 100 });
       if (snippet) postSnippetMap[p.id] = snippet;
     }
   }
 
-  const typesThatShowSnippet = new Set(["comment", "mention", "repath"]);
+  const interactionTypes = new Set([
+    "reaction",
+    "comment",
+    "mention",
+    "repath",
+    "sleep",
+  ]);
 
   // For friend_request notifications, fetch friendship IDs in one query.
   const friendRequestNotifs = page.filter((n: any) => n.type === "friend_request");
@@ -291,9 +300,12 @@ notificationsRouter.get("/", async (c) => {
           : { id: "system", name: "Path+", username: "", avatar: "" },
       message: n.message,
       postId: momentId ?? undefined,
+      // Media Moments → thumbnail. Text Moments → caption. Never both when media exists.
       postImage: (momentId && postImageMap[momentId]) || n.post_image || undefined,
       postSnippet:
-        typesThatShowSnippet.has(String(n.type)) && momentId
+        momentId &&
+        interactionTypes.has(String(n.type)) &&
+        !postHasMedia.has(momentId)
           ? postSnippetMap[momentId]
           : undefined,
       friendshipId: friendshipMap[n.id] ?? undefined,
