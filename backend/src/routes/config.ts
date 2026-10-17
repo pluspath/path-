@@ -40,7 +40,7 @@ configRouter.get("/", (c) => {
         "meal",
         "sleep",
       ],
-      maxFriends: 500,
+      maxFriends: 150,
       maxUploadBytes: 50 * 1024 * 1024,
     },
   });

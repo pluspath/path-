@@ -9,6 +9,9 @@ import type { HonoVariables } from "../types";
 
 const friendsRouter = new Hono<{ Variables: HonoVariables }>();
 
+/** Accepted friends + outgoing pending requests count toward this cap. */
+const MAX_FRIENDS = 150;
+
 // Close friends ("starred" friends) are PRIVATE to the owner.
 // Schema drift: some DBs use `user_id`, others use `owner_id`. Support both.
 async function getCloseFriendIds(userClient: any, ownerId: string): Promise<Set<string>> {
@@ -361,9 +364,16 @@ friendsRouter.get("/", async (c) => {
     .map((f: any) => f.requester_id)
     .filter((id: string) => !blockedSet.has(id));
 
-  const pendingSentIds = (pendingSentFriendships ?? []).map((f: any) => f.receiver_id);
+  const pendingSentIds = (pendingSentFriendships ?? [])
+    .map((f: any) => f.receiver_id)
+    .filter((id: string) => !blockedSet.has(id));
 
-  const allIds = [...new Set([...friendIds, ...pendingRequesterIds])];
+  const friendshipIdByPendingSent: Record<string, string> = {};
+  for (const f of pendingSentFriendships ?? []) {
+    friendshipIdByPendingSent[f.receiver_id] = f.id;
+  }
+
+  const allIds = [...new Set([...friendIds, ...pendingRequesterIds, ...pendingSentIds])];
   const excludeIds = [userId, ...friendIds, ...pendingRequesterIds, ...pendingSentIds, ...blockedSet];
 
   const [profileMap, suggestedLoad] = await Promise.all([
@@ -384,7 +394,7 @@ friendsRouter.get("/", async (c) => {
   }
   await enrichMissingIdentity(suggestedProfileMap);
 
-  const friends = friendIds
+  const acceptedFriends = friendIds
     .map((id: string) => profileMap[id])
     .filter((p: any) => p && !isDeletionHiddenProfile(p))
     .map((p: any) => ({
@@ -393,6 +403,19 @@ friendsRouter.get("/", async (c) => {
       friendshipId: friendshipIdByFriend[p.id],
       isCloseFriend: closeFriendSet.has(p.id),
     }));
+
+  // Outgoing pending requests stay visible on the friends page until accepted/cancelled.
+  const pendingSentFriends = pendingSentIds
+    .map((id: string) => profileMap[id])
+    .filter((p: any) => p && !isDeletionHiddenProfile(p))
+    .map((p: any) => ({
+      ...formatProfile(p),
+      friendshipStatus: "pending_sent" as const,
+      friendshipId: friendshipIdByPendingSent[p.id],
+      isCloseFriend: false,
+    }));
+
+  const friends = [...acceptedFriends, ...pendingSentFriends];
   const requests = (pendingFriendships ?? [])
     .filter((f: any) => !blockedSet.has(f.requester_id))
     .map((f: any) => ({
@@ -419,6 +442,8 @@ friendsRouter.get("/", async (c) => {
       requests,
       suggested,
       suggestedHasMore: suggested.length >= 40,
+      friendLimit: MAX_FRIENDS,
+      friendSlotsUsed: acceptedFriends.length + pendingSentFriends.length,
     },
   });
 });
@@ -527,23 +552,69 @@ friendsRouter.post("/request/:userId", async (c) => {
     return c.json({ error: { message: "User not found" } }, 404);
   }
 
-  const userClient = createUserClient(token);
+  // Count accepted friends + outgoing pending toward the circle cap.
+  // Multiple outgoing requests are allowed until this limit is reached.
+  const [{ count: acceptedCount }, { count: pendingSentCount }] = await Promise.all([
+    supabaseAdmin
+      .from("friendships")
+      .select("id", { count: "exact", head: true })
+      .eq("status", "accepted")
+      .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
+    supabaseAdmin
+      .from("friendships")
+      .select("id", { count: "exact", head: true })
+      .eq("requester_id", userId)
+      .eq("status", "pending"),
+  ]);
+  const slotsUsed = (acceptedCount ?? 0) + (pendingSentCount ?? 0);
+  if (slotsUsed >= MAX_FRIENDS) {
+    return c.json(
+      {
+        error: {
+          message: `Friend limit reached (${MAX_FRIENDS}). Remove a friend or cancel a pending request first.`,
+        },
+      },
+      400
+    );
+  }
 
-  const { data: existing } = await userClient
+  const { data: existing } = await supabaseAdmin
     .from("friendships")
-    .select("id")
-    .or(`and(requester_id.eq.${userId},receiver_id.eq.${targetId}),and(requester_id.eq.${targetId},receiver_id.eq.${userId})`)
+    .select("id, status, requester_id, receiver_id")
+    .or(
+      `and(requester_id.eq.${userId},receiver_id.eq.${targetId}),and(requester_id.eq.${targetId},receiver_id.eq.${userId})`
+    )
     .maybeSingle();
 
-  if (existing) return c.json({ error: { message: "Friend request already exists" } }, 409);
+  if (existing) {
+    if (existing.status === "accepted") {
+      return c.json({ error: { message: "Already friends" } }, 409);
+    }
+    // Idempotent: re-sending an existing pending request returns the same row.
+    return c.json(
+      {
+        data: {
+          ...existing,
+          id: existing.id,
+          friendshipId: existing.id,
+        },
+      },
+      200
+    );
+  }
 
-  const { data: friendship, error } = await userClient
+  // Service role insert avoids intermittent RLS / JWT edge cases that looked like
+  // "only one request at a time" failures after a burst of sends.
+  const { data: friendship, error } = await supabaseAdmin
     .from("friendships")
     .insert({ requester_id: userId, receiver_id: targetId, status: "pending" })
     .select()
     .single();
 
-  if (error) return c.json({ error: { message: "Failed to send request" } }, 500);
+  if (error) {
+    console.error("[friends] request insert failed:", error.message);
+    return c.json({ error: { message: "Failed to send request" } }, 500);
+  }
 
   // Insert the in-app notification with the admin client: the sender is
   // writing a row owned by the recipient, which RLS on userClient blocks.
@@ -571,7 +642,15 @@ friendsRouter.post("/request/:userId", async (c) => {
     console.error("[notifications] friend_request insert/push error:", e);
   }
 
-  return c.json({ data: friendship }, 201);
+  return c.json(
+    {
+      data: {
+        ...friendship,
+        friendshipId: friendship.id,
+      },
+    },
+    201
+  );
 });
 
 friendsRouter.post("/accept/:id", async (c) => {

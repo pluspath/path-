@@ -9,12 +9,15 @@ function clientKey(c: { req: { header: (name: string) => string | undefined } })
   );
 }
 
-/** General API limit — applied to all /api/* routes. */
+/** General API limit — applied to all /api/* routes.
+ * Mobile fans out many parallel calls (friends, status, discover, profiles).
+ * Keep this high enough that normal friend-request bursts never trip 429s. */
 export const apiLimiter = rateLimiter({
   windowMs: 60 * 1000,
-  limit: 120,
+  limit: 400,
   standardHeaders: "draft-6",
-  keyGenerator: clientKey,
+  keyGenerator: (c) =>
+    c.req.header("authorization")?.slice(0, 48) || clientKey(c),
 });
 
 /** Stricter limit for auth endpoints (signup, OTP, resend). */
