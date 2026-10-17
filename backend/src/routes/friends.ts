@@ -339,19 +339,23 @@ friendsRouter.get("/", async (c) => {
       .eq("status", "pending"),
     supabaseAdmin
       .from("friendships")
-      .select("id, receiver_id")
+      .select("id, receiver_id, status")
       .eq("requester_id", userId)
-      .eq("status", "pending"),
+      .neq("status", "accepted"),
     getCloseFriendIds(supabaseAdmin, userId),
   ]);
 
   const blockedSet = new Set(blockedIds);
   const { data: acceptedFriendships } = acceptedFriendshipsResult;
   const { data: pendingFriendships } = pendingFriendshipsResult;
-  const { data: pendingSentFriendships, error: pendingSentError } = pendingSentResult;
+  const { data: pendingSentRaw, error: pendingSentError } = pendingSentResult;
   if (pendingSentError) {
     console.warn("[friends] pending-sent query failed:", pendingSentError.message);
   }
+  const pendingSentFriendships = (pendingSentRaw ?? []).filter((f: any) => {
+    const status = String(f.status ?? "").toLowerCase();
+    return status === "pending" || status === "requested" || status === "pending_sent";
+  });
 
   const friendIds = (acceptedFriendships ?? [])
     .map((f: any) => (f.requester_id === userId ? f.receiver_id : f.requester_id))
@@ -409,15 +413,24 @@ friendsRouter.get("/", async (c) => {
     }));
 
   // Outgoing pending requests stay visible on the friends page until accepted/cancelled.
+  // Never drop a pending row just because the profile row is thin/missing.
   const pendingSentFriends = pendingSentIds
-    .map((id: string) => profileMap[id])
-    .filter((p: any) => p && !isDeletionHiddenProfile(p))
-    .map((p: any) => ({
-      ...formatProfile(p),
-      friendshipStatus: "pending_sent" as const,
-      friendshipId: friendshipIdByPendingSent[p.id],
-      isCloseFriend: false,
-    }));
+    .filter((id: string) => {
+      const p = profileMap[id];
+      return !p || !isDeletionHiddenProfile(p);
+    })
+    .map((id: string) => {
+      const p = profileMap[id];
+      const base = p
+        ? formatProfile(p)
+        : { id, name: "Unknown", username: "", avatar: resolveAvatarUrl(id, null, null) };
+      return {
+        ...base,
+        friendshipStatus: "pending_sent" as const,
+        friendshipId: friendshipIdByPendingSent[id],
+        isCloseFriend: false,
+      };
+    });
 
   // Pending outgoing requests first so they stay visible at the top of Your Friends.
   const friends = [...pendingSentFriends, ...acceptedFriends];
@@ -444,6 +457,9 @@ friendsRouter.get("/", async (c) => {
   return c.json({
     data: {
       friends,
+      // Explicit copy so older / partial clients can merge pending even if they
+      // only render accepted friends from `friends`.
+      pendingSent: pendingSentFriends,
       requests,
       suggested,
       suggestedHasMore: suggested.length >= 40,
@@ -451,6 +467,64 @@ friendsRouter.get("/", async (c) => {
       friendSlotsUsed: acceptedFriends.length + pendingSentFriends.length,
     },
   });
+});
+
+/** Outgoing friend requests that have not been accepted yet. */
+friendsRouter.get("/outgoing", async (c) => {
+  const user = c.get("user");
+  const userId = c.get("userId");
+  if (!user || !userId) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const blockedIds = await getBlockedIds(userId);
+  const blockedSet = new Set(blockedIds);
+
+  const { data: rows, error } = await supabaseAdmin
+    .from("friendships")
+    .select("id, receiver_id, status")
+    .eq("requester_id", userId)
+    .neq("status", "accepted");
+
+  if (error) {
+    console.error("[friends/outgoing] query failed:", error.message);
+    return c.json({ error: { message: "Failed to load pending requests" } }, 500);
+  }
+
+  const pendingRows = (rows ?? []).filter((f: any) => {
+    const status = String(f.status ?? "").toLowerCase();
+    return status === "pending" || status === "requested" || status === "pending_sent";
+  });
+
+  const ids = pendingRows
+    .map((f: any) => f.receiver_id as string)
+    .filter((id: string) => id && !blockedSet.has(id));
+
+  const profileMap = await loadProfilesByIds(ids);
+  await enrichMissingIdentity(profileMap);
+
+  const friendshipIdByPendingSent: Record<string, string> = {};
+  for (const f of pendingRows) {
+    friendshipIdByPendingSent[f.receiver_id] = f.id;
+  }
+
+  const pendingSent = ids
+    .filter((id) => {
+      const p = profileMap[id];
+      return !p || !isDeletionHiddenProfile(p);
+    })
+    .map((id) => {
+      const p = profileMap[id];
+      const base = p
+        ? formatProfile(p)
+        : { id, name: "Unknown", username: "", avatar: resolveAvatarUrl(id, null, null) };
+      return {
+        ...base,
+        friendshipStatus: "pending_sent" as const,
+        friendshipId: friendshipIdByPendingSent[id],
+        isCloseFriend: false,
+      };
+    });
+
+  return c.json({ data: { pendingSent } });
 });
 
 /** Paginated directory of other members (excludes self, friends, pending, blocked). */
