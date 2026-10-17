@@ -318,6 +318,7 @@ friendsRouter.get("/", async (c) => {
   const userClient = createUserClient(token);
 
   // Parallelize friendships + blocks + close-friends (was a long waterfall).
+  // Outgoing pending uses admin so RLS never hides people you already requested.
   const [
     blockedIds,
     acceptedFriendshipsResult,
@@ -336,7 +337,7 @@ friendsRouter.get("/", async (c) => {
       .select("id, requester_id, created_at")
       .eq("receiver_id", userId)
       .eq("status", "pending"),
-    userClient
+    supabaseAdmin
       .from("friendships")
       .select("id, receiver_id")
       .eq("requester_id", userId)
@@ -347,7 +348,10 @@ friendsRouter.get("/", async (c) => {
   const blockedSet = new Set(blockedIds);
   const { data: acceptedFriendships } = acceptedFriendshipsResult;
   const { data: pendingFriendships } = pendingFriendshipsResult;
-  const { data: pendingSentFriendships } = pendingSentResult;
+  const { data: pendingSentFriendships, error: pendingSentError } = pendingSentResult;
+  if (pendingSentError) {
+    console.warn("[friends] pending-sent query failed:", pendingSentError.message);
+  }
 
   const friendIds = (acceptedFriendships ?? [])
     .map((f: any) => (f.requester_id === userId ? f.receiver_id : f.requester_id))
