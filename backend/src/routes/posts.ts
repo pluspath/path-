@@ -344,8 +344,10 @@ postsRouter.get("/hashtag/:tag", async (c) => {
       ? encodeCursor(String(last.created_at), String(last.id))
       : null;
 
+  const formatted = page.map((p) => formatPost(p, userId ?? undefined, blockedIds));
+  await refreshReactionActors(formatted);
   return c.json({
-    data: page.map((p) => formatPost(p, userId ?? undefined, blockedIds)),
+    data: formatted,
     nextCursor,
     hasMore,
     limit,
@@ -548,7 +550,9 @@ postsRouter.get("/:id", async (c) => {
     }
   }
 
-  return c.json({ data: formatPost(post, userId ?? undefined, blockedIds) });
+  const formatted = formatPost(post, userId ?? undefined, blockedIds);
+  await refreshReactionActors([formatted]);
+  return c.json({ data: formatted });
 });
 
 postsRouter.post("/", async (c) => {
@@ -854,7 +858,7 @@ postsRouter.patch("/:id", async (c) => {
   // Disable Comments: persist the boolean when the client sends it.
   if ("commentsDisabled" in body) updateData.comments_disabled = !!body.commentsDisabled;
 
-  const SELECT = "*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(full_name, username, avatar_url, gender))";
+  const SELECT = "*, profiles!user_id(*), reactions(user_id, type)";
   let { data: updated, error } = await userClient
     .from("posts")
     .update(updateData)
@@ -1065,10 +1069,16 @@ postsRouter.post("/:id/reactions", async (c) => {
     }
   }
 
-  const { data: reactions } = await supabaseAdmin.from("reactions").select("user_id, type, profiles!user_id(full_name, username, avatar_url, gender)").eq("post_id", id);
-  // Viewer here is the reactor — they always see their own reaction.
+  const { data: reactions } = await supabaseAdmin
+    .from("reactions")
+    .select("user_id, type")
+    .eq("post_id", id);
+  // Attach live profiles (nested embeds are unreliable for reactor names).
+  const { hydrateReactionProfiles } = await import("../lib/load-posts");
+  const shell = [{ reactions: reactions ?? [] }];
+  await hydrateReactionProfiles(shell);
   const formatted = {
-    reactions: formatReactions(reactions ?? [], userId, ownerRow?.user_id),
+    reactions: formatReactions(shell[0].reactions ?? [], userId, ownerRow?.user_id),
   };
   await refreshReactionActors([formatted]);
   return c.json({ data: { reactions: formatted.reactions } });
@@ -1101,9 +1111,15 @@ postsRouter.post("/:id/reactions/lock", async (c) => {
   await supabaseAdmin.from("reactions").update({ type: newType }).eq("post_id", id).eq("user_id", userId);
 
   const { data: ownerRow } = await supabaseAdmin.from("posts").select("user_id").eq("id", id).maybeSingle();
-  const { data: reactions } = await supabaseAdmin.from("reactions").select("user_id, type, profiles!user_id(full_name, username, avatar_url, gender)").eq("post_id", id);
+  const { data: reactions } = await supabaseAdmin
+    .from("reactions")
+    .select("user_id, type")
+    .eq("post_id", id);
+  const { hydrateReactionProfiles } = await import("../lib/load-posts");
+  const shell = [{ reactions: reactions ?? [] }];
+  await hydrateReactionProfiles(shell);
   const formatted = {
-    reactions: formatReactions(reactions ?? [], userId, ownerRow?.user_id),
+    reactions: formatReactions(shell[0].reactions ?? [], userId, ownerRow?.user_id),
   };
   await refreshReactionActors([formatted]);
   return c.json({ data: { locked: nextLocked, reactions: formatted.reactions } });

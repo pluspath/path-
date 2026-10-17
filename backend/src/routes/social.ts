@@ -1,9 +1,9 @@
 import { Hono } from "hono";
 import { createUserClient, supabaseAdmin } from "../supabase";
-import { formatPost } from "./users";
+import { formatPost, refreshReactionActors } from "./users";
 import { sanitizeSearchQuery } from "../lib/auth-helpers";
 import { getBlockedIds } from "../lib/blocks";
-import { attachOriginals } from "../lib/load-posts";
+import { attachOriginals, hydrateReactionProfiles } from "../lib/load-posts";
 import { resolveAvatarUrl } from "../lib/avatar";
 import { env } from "../env";
 import type { HonoVariables } from "../types";
@@ -11,7 +11,7 @@ import type { HonoVariables } from "../types";
 const socialRouter = new Hono<{ Variables: HonoVariables }>();
 
 const POST_SELECT =
-  "*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(full_name, username, avatar_url))";
+  "*, profiles!user_id(*), reactions(user_id, type)";
 
 /** GET /api/social/trending — posts ranked by recent engagement */
 socialRouter.get("/trending", async (c) => {
@@ -26,7 +26,7 @@ socialRouter.get("/trending", async (c) => {
   const [{ data: posts }, { data: friendships }, blockedIds] = await Promise.all([
     userClient
       .from("posts")
-      .select("*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(full_name, username, avatar_url))")
+      .select("*, profiles!user_id(*), reactions(user_id, type)")
       .gte("created_at", since)
       .order("created_at", { ascending: false })
       .limit(100),
@@ -64,8 +64,10 @@ socialRouter.get("/trending", async (c) => {
     .map(({ post }) => post);
 
   await attachOriginals(null, scored);
-
-  return c.json({ data: scored.map((post) => formatPost(post)) });
+  await hydrateReactionProfiles(scored);
+  const formatted = scored.map((post) => formatPost(post));
+  await refreshReactionActors(formatted);
+  return c.json({ data: formatted });
 });
 
 /** GET /api/social/saved — bookmarked posts */
@@ -95,16 +97,16 @@ socialRouter.get("/saved", async (c) => {
 
   const { data: posts } = await userClient
     .from("posts")
-    .select("*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(full_name, username, avatar_url))")
+    .select("*, profiles!user_id(*), reactions(user_id, type)")
     .in("id", postIds);
 
   const postMap: Record<string, any> = {};
   for (const p of posts ?? []) postMap[p.id] = p;
 
-  const ordered = postIds
-    .map((id: string) => postMap[id])
-    .filter(Boolean)
-    .map((p: any) => ({ ...formatPost(p), isSaved: true }));
+  const rawOrdered = postIds.map((id: string) => postMap[id]).filter(Boolean);
+  await hydrateReactionProfiles(rawOrdered);
+  const ordered = rawOrdered.map((p: any) => ({ ...formatPost(p), isSaved: true }));
+  await refreshReactionActors(ordered);
 
   return c.json({ data: ordered });
 });
@@ -195,9 +197,12 @@ socialRouter.get("/liked-moments", async (c) => {
   );
 
   await attachOriginals(null, visible);
+  await hydrateReactionProfiles(visible);
+  const formatted = visible.map((p: any) => formatPost(p, userId, blockedIds));
+  await refreshReactionActors(formatted);
 
   return c.json({
-    data: visible.map((p: any) => formatPost(p, userId, blockedIds)),
+    data: formatted,
   });
 });
 
@@ -351,15 +356,20 @@ socialRouter.get("/hashtags/:tag", async (c) => {
 
   const { data: posts } = await userClient
     .from("posts")
-    .select("*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(full_name, username, avatar_url))")
+    .select("*, profiles!user_id(*), reactions(user_id, type)")
     .in("id", postIds)
     .order("created_at", { ascending: false });
+
+  const raw = posts ?? [];
+  await hydrateReactionProfiles(raw);
+  const formatted = raw.map(formatPost);
+  await refreshReactionActors(formatted);
 
   return c.json({
     data: {
       tag: hashtag.tag,
       postCount: hashtag.post_count,
-      posts: (posts ?? []).map(formatPost),
+      posts: formatted,
     },
   });
 });
@@ -443,11 +453,14 @@ socialRouter.get("/search", async (c) => {
   if (type === "all" || type === "posts") {
     const { data: found } = await userClient
       .from("posts")
-      .select("*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(full_name, username, avatar_url))")
+      .select("*, profiles!user_id(*), reactions(user_id, type)")
       .ilike("content", `%${q}%`)
       .order("created_at", { ascending: false })
       .limit(15);
-    posts = (found ?? []).map(formatPost);
+    const raw = found ?? [];
+    await hydrateReactionProfiles(raw);
+    posts = raw.map(formatPost);
+    await refreshReactionActors(posts);
   }
 
   return c.json({ data: { users, hashtags, posts, query: q } });

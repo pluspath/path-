@@ -284,12 +284,15 @@ export function formatReactions(rawReactions: any[], viewerId?: string, ownerId?
       const profile = nestedReactionProfile(r);
       const username = String(profile?.username ?? "").trim();
       const fullName = String(profile?.full_name ?? profile?.name ?? "").trim();
+      const userName = fullName || username || undefined;
       return {
         userId: r.user_id,
         type: baseReactionType(r.type),
         locked: isReactionLocked(r.type),
         // Prefer display name; fall back to @username so sheets never look empty.
-        userName: fullName || username || undefined,
+        userName,
+        // Alias some clients read as `name`.
+        name: userName,
         // Always resolve to a raster URL — raw SVG defaults render blank in expo-image.
         userAvatar: resolveAvatarUrl(
           r.user_id,
@@ -319,30 +322,40 @@ export async function refreshReactionActors(posts: any[]): Promise<void> {
     }
     if (ids.size === 0) return;
 
-    const { data: profiles } = await supabaseAdmin
-      .from("profiles")
-      .select("id, full_name, name, username, avatar_url, gender")
-      .in("id", Array.from(ids));
-
-    const byId: Record<
-      string,
-      { userName: string; userAvatar: string }
-    > = {};
-    for (const pr of profiles ?? []) {
-      const username = String(pr.username ?? "").trim();
-      const fullName = String(pr.full_name ?? pr.name ?? "").trim();
-      byId[pr.id] = {
-        userName: fullName || username || "Member",
-        userAvatar: resolveAvatarUrl(pr.id, pr.avatar_url, pr.gender),
-      };
+    const allIds = Array.from(ids);
+    const byId: Record<string, { userName: string; userAvatar: string }> = {};
+    for (let i = 0; i < allIds.length; i += 80) {
+      const chunk = allIds.slice(i, i + 80);
+      // Avoid selecting non-existent `name` — that aborts the whole enrich.
+      const { data: profiles, error } = await supabaseAdmin
+        .from("profiles")
+        .select("id, full_name, username, avatar_url, gender")
+        .in("id", chunk);
+      if (error) {
+        console.warn("[reactions] refreshReactionActors query failed:", error.message);
+        continue;
+      }
+      for (const pr of profiles ?? []) {
+        const username = String(pr.username ?? "").trim();
+        const fullName = String(pr.full_name ?? "").trim();
+        byId[pr.id] = {
+          userName: fullName || username || "Member",
+          userAvatar: resolveAvatarUrl(pr.id, pr.avatar_url, pr.gender),
+        };
+      }
     }
 
     const patch = (reactions: any[] | undefined) => {
       if (!Array.isArray(reactions)) return;
       for (const r of reactions) {
-        const live = r?.userId ? byId[r.userId] : undefined;
-        if (!live) continue;
+        const live = r?.userId ? byId[String(r.userId)] : undefined;
+        if (!live) {
+          // Never leave blank — client falls back to "a friend" when missing.
+          if (!r.userName) r.userName = "Member";
+          continue;
+        }
         r.userName = live.userName;
+        r.name = live.userName;
         r.userAvatar = live.userAvatar;
       }
     };
@@ -1432,7 +1445,7 @@ usersRouter.get("/:id/posts", async (c) => {
   };
 
   const SELECT =
-    "*, profiles!user_id(*), reactions(user_id, type, profiles!user_id(full_name, username, avatar_url, gender))";
+    "*, profiles!user_id(*), reactions(user_id, type)";
 
   // Load the user's full post list (paged from DB), then filter + slice in memory.
   // Cursor-only over-fetch previously under-reported hasMore and froze UIs at ~20.
@@ -1485,8 +1498,9 @@ usersRouter.get("/:id/posts", async (c) => {
       ? encodeCursor(String(last.created_at), String(last.id))
       : null;
 
-  const { attachOriginals } = await import("../lib/load-posts");
+  const { attachOriginals, hydrateReactionProfiles } = await import("../lib/load-posts");
   await attachOriginals(null, page);
+  await hydrateReactionProfiles(page);
 
   const formatted = page.map((p) => formatPost(p, userId ?? undefined, blockedIds));
   await refreshFriendshipAvatars(formatted);

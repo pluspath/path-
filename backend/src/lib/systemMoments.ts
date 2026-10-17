@@ -256,13 +256,13 @@ export async function refreshFriendshipAvatars(posts: any[]): Promise<void> {
 
     const { data: profiles } = await supabaseAdmin
       .from("profiles")
-      .select("id, full_name, name, username, avatar_url, gender")
+      .select("id, full_name, username, avatar_url, gender")
       .in("id", Array.from(friendIds));
 
     const liveById: Record<string, { avatar: string; name: string }> = {};
     for (const pr of profiles ?? []) {
       const username = String(pr.username ?? "").trim();
-      const fullName = String(pr.full_name ?? pr.name ?? "").trim();
+      const fullName = String(pr.full_name ?? "").trim();
       liveById[pr.id] = {
         avatar: resolveAvatarUrl(pr.id, pr.avatar_url, pr.gender),
         name: fullName || username || "Member",
