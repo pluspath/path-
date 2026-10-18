@@ -384,9 +384,10 @@ friendsRouter.get("/", async (c) => {
   const allIds = [...new Set([...friendIds, ...pendingRequesterIds, ...pendingSentIds])];
   const excludeIds = [userId, ...friendIds, ...pendingRequesterIds, ...pendingSentIds, ...blockedSet];
 
+  // Keep the first suggested page small so Friends opens quickly; /discover pages the rest.
   const [profileMap, suggestedLoad] = await Promise.all([
     loadProfilesByIds(allIds),
-    loadRankedDiscoverProfiles(excludeIds, friendIds, 0, 40),
+    loadRankedDiscoverProfiles(excludeIds, friendIds, 0, 12),
   ]);
 
   await enrichMissingIdentity(profileMap);
@@ -462,7 +463,7 @@ friendsRouter.get("/", async (c) => {
       pendingSent: pendingSentFriends,
       requests,
       suggested,
-      suggestedHasMore: suggested.length >= 40,
+      suggestedHasMore: suggested.length >= 12,
       friendLimit: MAX_FRIENDS,
       friendSlotsUsed: acceptedFriends.length + pendingSentFriends.length,
     },

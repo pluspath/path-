@@ -1262,23 +1262,40 @@ usersRouter.get("/:id", async (c) => {
     }
   }
 
-  const counts = await loadProfileStatCounts(id);
+  // Fast path for profile chrome: head counts only. Do NOT await
+  // countInteractionsReceived here — that walks every post and made GET /:id
+  // feel like a 2–3s blank screen. Accurate likes come from /profile-stats.
+  const [postsResult, friendsResult] = await Promise.all([
+    supabaseAdmin.from("posts").select("*", { count: "exact", head: true }).eq("user_id", id),
+    supabaseAdmin
+      .from("friendships")
+      .select("*", { count: "exact", head: true })
+      .eq("status", "accepted")
+      .or(`requester_id.eq.${id},receiver_id.eq.${id}`),
+  ]);
+  const postCount = postsResult.count ?? 0;
+  const friendCount = friendsResult.count ?? 0;
+  const likeCount =
+    typeof enriched.like_count === "number" && Number.isFinite(enriched.like_count)
+      ? enriched.like_count
+      : 0;
+
   const profile = formatProfile(
     enriched,
-    counts.postCount,
-    counts.friendCount,
+    postCount,
+    friendCount,
     userId ?? undefined,
-    counts.likeCount
+    likeCount
   );
 
   // Always expose the global like total to every visitor (friend or not).
   return c.json({
     data: {
       ...profile,
-      likeCount: counts.likeCount,
-      momentCount: counts.postCount,
-      postCount: counts.postCount,
-      friendCount: counts.friendCount,
+      likeCount,
+      momentCount: postCount,
+      postCount,
+      friendCount,
     },
   });
 });
@@ -1316,11 +1333,15 @@ usersRouter.get("/:id/friends", async (c) => {
     return c.json({ error: { message: "This friends list is private" } }, 403);
   }
 
-  const { data: friendships } = await supabaseAdmin
-    .from("friendships")
-    .select("requester_id, receiver_id")
-    .eq("status", "accepted")
-    .or(`requester_id.eq.${id},receiver_id.eq.${id}`);
+  // Friendships + block list in parallel; lean profile columns for a fast sheet.
+  const [{ data: friendships }, blockedIds] = await Promise.all([
+    supabaseAdmin
+      .from("friendships")
+      .select("requester_id, receiver_id")
+      .eq("status", "accepted")
+      .or(`requester_id.eq.${id},receiver_id.eq.${id}`),
+    getBlockedIds(userId),
+  ]);
 
   const friendIds = (friendships ?? []).map((f: any) =>
     f.requester_id === id ? f.receiver_id : f.requester_id
@@ -1328,13 +1349,15 @@ usersRouter.get("/:id/friends", async (c) => {
 
   if (friendIds.length === 0) return c.json({ data: [] });
 
-  const blocked = new Set(await getBlockedIds(userId));
+  const blocked = new Set(blockedIds);
   const visibleIds = friendIds.filter((fid: string) => !blocked.has(fid));
   if (visibleIds.length === 0) return c.json({ data: [] });
 
   const { data: profiles } = await supabaseAdmin
     .from("profiles")
-    .select("*")
+    .select(
+      "id, full_name, username, avatar_url, gender, bio, location, cover_url, created_at, status, suspended_reason"
+    )
     .in("id", visibleIds);
 
   // Hide accounts in the deletion grace window, and never return blank names.

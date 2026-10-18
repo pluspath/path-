@@ -339,23 +339,28 @@ conversationsRouter.get("/", async (c) => {
       }
     }
 
-    const result = visibleConversations.map((conv: any) => {
-      const otherUserId = otherUserIdByConv[conv.id];
-      const lastMsg = lastMsgByConv[conv.id];
-      const previewText = lastMsg?.content ?? lastMsg?.text ?? "";
-      const pinnedAt = pinnedAtByConv[conv.id] ?? null;
-      return {
-        id: conv.id,
-        user: (otherUserId && profilesById[otherUserId]) || emptyUser(otherUserId),
-        lastMessage: lastMsg ? messagePreview(lastMsg.type, previewText) : "",
-        lastMessageTime: lastMsg?.created_at ?? conv.created_at,
-        lastMessageSenderId: lastMsg?.sender_id ?? null,
-        unreadCount: unreadByConv[conv.id] ?? 0,
-        isPinned: !!pinnedAt,
-        pinnedAt,
-        messages: [],
-      };
-    });
+    // Only conversations with at least one message belong in the Chats list.
+    // Opening Message without sending must not create a visible empty row.
+    const result = visibleConversations
+      .map((conv: any) => {
+        const otherUserId = otherUserIdByConv[conv.id];
+        const lastMsg = lastMsgByConv[conv.id];
+        if (!lastMsg) return null;
+        const previewText = lastMsg?.content ?? lastMsg?.text ?? "";
+        const pinnedAt = pinnedAtByConv[conv.id] ?? null;
+        return {
+          id: conv.id,
+          user: (otherUserId && profilesById[otherUserId]) || emptyUser(otherUserId),
+          lastMessage: messagePreview(lastMsg.type, previewText),
+          lastMessageTime: lastMsg.created_at ?? conv.created_at,
+          lastMessageSenderId: lastMsg.sender_id ?? null,
+          unreadCount: unreadByConv[conv.id] ?? 0,
+          isPinned: !!pinnedAt,
+          pinnedAt,
+          messages: [],
+        };
+      })
+      .filter(Boolean) as any[];
 
     // Pinned chats stay at the top; within each group sort by latest activity.
     result.sort((a, b) => {
@@ -368,6 +373,59 @@ conversationsRouter.get("/", async (c) => {
     console.error("[conversations] list unexpected:", err);
     return c.json({ error: { message: "Failed to load conversations" } }, 500);
   }
+});
+
+/** Lookup an existing 1:1 conversation without creating one. Must be before /:id. */
+conversationsRouter.get("/with/:userId", async (c) => {
+  const userId = c.get("userId");
+  if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const db = supabaseAdmin;
+  const targetId = c.req.param("userId");
+  if (!targetId || targetId === userId) {
+    return c.json({ error: { message: "Invalid user" } }, 400);
+  }
+  if (await isBlocked(userId, targetId, db)) {
+    return c.json({ error: { message: "Unable to message this user" } }, 403);
+  }
+
+  const { data: myParticipations } = await db
+    .from("conversation_participants")
+    .select("conversation_id")
+    .eq("user_id", userId);
+  const myConvIds = (myParticipations ?? []).map((p: any) => p.conversation_id);
+  if (myConvIds.length === 0) return c.json({ data: null });
+
+  const { data: sharedConv } = await db
+    .from("conversation_participants")
+    .select("conversation_id")
+    .eq("user_id", targetId)
+    .in("conversation_id", myConvIds)
+    .limit(1)
+    .maybeSingle();
+
+  if (!sharedConv?.conversation_id) return c.json({ data: null });
+
+  const existingConvId = sharedConv.conversation_id as string;
+  const { data: targetProfile } = await db.from("profiles").select("*").eq("id", targetId).maybeSingle();
+  const { data: msgs } = await db
+    .from("messages")
+    .select("content, text, created_at, type")
+    .eq("conversation_id", existingConvId)
+    .order("created_at", { ascending: false })
+    .limit(1);
+  const lastMsg = msgs?.[0];
+  return c.json({
+    data: {
+      id: existingConvId,
+      user: targetProfile ? formatProfile(targetProfile) : emptyUser(targetId),
+      lastMessage: lastMsg ? messagePreview(lastMsg.type, lastMsg.content ?? lastMsg.text) : "",
+      lastMessageTime: lastMsg?.created_at ?? new Date().toISOString(),
+      unreadCount: 0,
+      messages: [],
+      hasMessages: !!lastMsg,
+    },
+  });
 });
 
 conversationsRouter.get("/:id", async (c) => {
@@ -1115,7 +1173,9 @@ conversationsRouter.post("/start/:userId", async (c) => {
   const db = supabaseAdmin;
 
   const targetId = c.req.param("userId");
-  console.log(`[conversations/start] userId=${userId} targetId=${targetId}`);
+  // Optional: lookup-only (no insert) so opening Message never creates empties.
+  const createIfMissing = c.req.query("create") !== "0";
+  console.log(`[conversations/start] userId=${userId} targetId=${targetId} create=${createIfMissing}`);
 
   if (!targetId || targetId === userId) {
     return c.json({ error: { message: "Cannot start a conversation with yourself" } }, 400);
@@ -1187,6 +1247,10 @@ conversationsRouter.post("/start/:userId", async (c) => {
         messages: [],
       },
     });
+  }
+
+  if (!createIfMissing) {
+    return c.json({ data: null });
   }
 
   // Create the conversation. `db` is the service-role client when
