@@ -382,12 +382,14 @@ friendsRouter.get("/", async (c) => {
   }
 
   const allIds = [...new Set([...friendIds, ...pendingRequesterIds, ...pendingSentIds])];
-  const excludeIds = [userId, ...friendIds, ...pendingRequesterIds, ...pendingSentIds, ...blockedSet];
+  // Keep outgoing-pending recipients in People discovery; annotate status instead of hiding them.
+  const excludeIds = [userId, ...friendIds, ...pendingRequesterIds, ...blockedSet];
 
-  // Keep the first suggested page small so Friends opens quickly; /discover pages the rest.
+  // First People-on-Path+ page is 5; /friends/discover loads the rest in batches of 5.
+  const PEOPLE_PAGE_SIZE = 5;
   const [profileMap, suggestedLoad] = await Promise.all([
     loadProfilesByIds(allIds),
-    loadRankedDiscoverProfiles(excludeIds, friendIds, 0, 12),
+    loadRankedDiscoverProfiles(excludeIds, friendIds, 0, PEOPLE_PAGE_SIZE),
   ]);
 
   await enrichMissingIdentity(profileMap);
@@ -449,11 +451,16 @@ friendsRouter.get("/", async (c) => {
 
   const suggested = (suggestedLoad.rows ?? [])
     .filter((r) => !isDeletionHiddenProfile(r.profile))
-    .map((r) => ({
-      ...formatProfile(suggestedProfileMap[r.profile.id] ?? r.profile),
-      friendshipStatus: "none" as const,
-      mutualFriends: r.mutualFriends,
-    }));
+    .map((r) => {
+      const id = r.profile.id as string;
+      const pendingId = friendshipIdByPendingSent[id];
+      return {
+        ...formatProfile(suggestedProfileMap[id] ?? r.profile),
+        friendshipStatus: pendingId ? ("pending_sent" as const) : ("none" as const),
+        ...(pendingId ? { friendshipId: pendingId } : {}),
+        mutualFriends: r.mutualFriends,
+      };
+    });
 
   return c.json({
     data: {
@@ -463,7 +470,8 @@ friendsRouter.get("/", async (c) => {
       pendingSent: pendingSentFriends,
       requests,
       suggested,
-      suggestedHasMore: suggested.length >= 12,
+      suggestedHasMore: suggested.length >= PEOPLE_PAGE_SIZE,
+      suggestedPageSize: PEOPLE_PAGE_SIZE,
       friendLimit: MAX_FRIENDS,
       friendSlotsUsed: acceptedFriends.length + pendingSentFriends.length,
     },
@@ -528,7 +536,8 @@ friendsRouter.get("/outgoing", async (c) => {
   return c.json({ data: { pendingSent } });
 });
 
-/** Paginated directory of other members (excludes self, friends, pending, blocked). */
+/** Paginated directory of other members (excludes self, friends, incoming pending, blocked).
+ * Outgoing pending recipients remain listed with friendshipStatus=pending_sent. */
 friendsRouter.get("/discover", async (c) => {
   const user = c.get("user");
   const userId = c.get("userId");
@@ -536,8 +545,8 @@ friendsRouter.get("/discover", async (c) => {
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const offset = Math.max(0, Number.parseInt(String(c.req.query("offset") ?? "0"), 10) || 0);
-  const limitRaw = Number.parseInt(String(c.req.query("limit") ?? "7"), 10);
-  const limit = Math.min(50, Math.max(1, Number.isFinite(limitRaw) ? limitRaw : 7));
+  const limitRaw = Number.parseInt(String(c.req.query("limit") ?? "5"), 10);
+  const limit = Math.min(50, Math.max(1, Number.isFinite(limitRaw) ? limitRaw : 5));
 
   const userClient = createUserClient(token);
 
@@ -560,7 +569,7 @@ friendsRouter.get("/discover", async (c) => {
       .eq("status", "pending"),
     userClient
       .from("friendships")
-      .select("receiver_id")
+      .select("id, receiver_id")
       .eq("requester_id", userId)
       .eq("status", "pending"),
   ]);
@@ -572,8 +581,12 @@ friendsRouter.get("/discover", async (c) => {
   const pendingRequesterIds = (pendingFriendshipsResult.data ?? [])
     .map((f: any) => f.requester_id)
     .filter((id: string) => !blockedSet.has(id));
-  const pendingSentIds = (pendingSentResult.data ?? []).map((f: any) => f.receiver_id);
-  const excludeIds = [userId, ...friendIds, ...pendingRequesterIds, ...pendingSentIds, ...blockedSet];
+  const friendshipIdByPendingSent: Record<string, string> = {};
+  for (const f of pendingSentResult.data ?? []) {
+    if (f?.receiver_id) friendshipIdByPendingSent[f.receiver_id] = f.id;
+  }
+  // Do not hide outgoing-pending recipients from discovery.
+  const excludeIds = [userId, ...friendIds, ...pendingRequesterIds, ...blockedSet];
 
   const { rows, error } = await loadRankedDiscoverProfiles(excludeIds, friendIds, offset, limit);
 
@@ -590,11 +603,17 @@ friendsRouter.get("/discover", async (c) => {
 
   const users = (rows ?? [])
     .filter((r) => !isDeletionHiddenProfile(r.profile))
-    .map((r) => ({
-      ...formatProfile(discoverMap[r.profile.id] ?? r.profile),
-      friendshipStatus: "none" as const,
-      mutualFriends: r.mutualFriends,
-    }));
+    .map((r) => {
+      const id = r.profile.id as string;
+      const pendingId = friendshipIdByPendingSent[id];
+      return {
+        ...formatProfile(discoverMap[id] ?? r.profile),
+        friendshipStatus: pendingId ? ("pending_sent" as const) : ("none" as const),
+        ...(pendingId ? { friendshipId: pendingId } : {}),
+        mutualFriends: r.mutualFriends,
+      };
+    });
+  // hasMore based on raw row count so a soft-deleted filter does not freeze paging.
   const hasMore = (rows ?? []).length === limit;
   const nextOffset = offset + limit;
 

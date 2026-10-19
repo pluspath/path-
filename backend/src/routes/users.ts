@@ -1467,12 +1467,14 @@ usersRouter.get("/:id/posts", async (c) => {
     return !!(p.content || p.image_url || p.location || p.type === "location");
   };
 
-  const SELECT =
-    "*, profiles!user_id(*), reactions(user_id, type)";
+  const SELECT = "*, profiles!user_id(*), reactions(user_id, type)";
 
-  // Load the user's full post list (paged from DB), then filter + slice in memory.
-  // Cursor-only over-fetch previously under-reported hasMore and froze UIs at ~20.
-  const allRows: any[] = [];
+  // Stream newest→oldest until we have a page (or the full list when wantAll).
+  // Loading every post before slicing made Moments appear stuck on the skeleton.
+  const visible: any[] = [];
+  let scannedAll = false;
+  const need = wantAll ? Number.POSITIVE_INFINITY : limit + 1;
+
   for (let from = 0; ; from += 500) {
     let { data: batch, error: batchErr } = await supabaseAdmin
       .from("posts")
@@ -1494,23 +1496,34 @@ usersRouter.get("/:id/posts", async (c) => {
       batch = basic.data ?? [];
       if (basic.error) {
         console.error("[users/posts] query failed:", basic.error.message);
+        scannedAll = true;
         break;
       }
     }
 
     const rows = batch ?? [];
-    if (rows.length === 0) break;
-    allRows.push(...rows);
-    if (rows.length < 500) break;
-  }
+    if (rows.length === 0) {
+      scannedAll = true;
+      break;
+    }
 
-  const visibleAll = allRows.filter((p) => passesAudience(p) && passesSection(p));
-  const fullVisibleCount = visibleAll.length;
-  let visible = visibleAll;
-  if (cursor) {
-    visible = visible.filter((p: any) =>
-      isOlderThanCursor(String(p.created_at ?? ""), String(p.id ?? ""), cursor)
-    );
+    for (const p of rows) {
+      if (!passesAudience(p) || !passesSection(p)) continue;
+      if (
+        cursor &&
+        !isOlderThanCursor(String(p.created_at ?? ""), String(p.id ?? ""), cursor)
+      ) {
+        continue;
+      }
+      visible.push(p);
+      if (visible.length >= need) break;
+    }
+
+    if (visible.length >= need) break;
+    if (rows.length < 500) {
+      scannedAll = true;
+      break;
+    }
   }
 
   const hasMore = !wantAll && visible.length > limit;
@@ -1534,8 +1547,7 @@ usersRouter.get("/:id/posts", async (c) => {
     nextCursor,
     hasMore,
     limit: wantAll ? page.length : limit,
-    // Full filtered timeline size (ignores cursor) — client can trust Moments stat.
-    totalVisible: cursor ? undefined : fullVisibleCount,
+    totalVisible: cursor || !scannedAll || hasMore ? undefined : visible.length,
   });
 });
 
