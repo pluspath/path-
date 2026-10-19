@@ -206,11 +206,14 @@ async function loadDiscoverProfiles(
 ): Promise<{ rows: any[]; error: any | null }> {
   const exclude = notInList(excludeIds);
 
+  // Deterministic order: newest first, id as stable tie-breaker.
+  // Must not depend on friendship / pending status.
   const { data, error } = await supabaseAdmin
     .from("profiles")
     .select("*")
     .filter("id", "not.in", exclude)
     .order("created_at", { ascending: false })
+    .order("id", { ascending: true })
     .range(offset, offset + limit - 1);
 
   if (!error) return { rows: data ?? [], error: null };
@@ -223,6 +226,7 @@ async function loadDiscoverProfiles(
     .from("profiles")
     .select("*")
     .order("created_at", { ascending: false })
+    .order("id", { ascending: true })
     .range(0, windowEnd);
 
   if (fallbackError) return { rows: [], error: fallbackError };
