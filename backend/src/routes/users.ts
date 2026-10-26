@@ -231,6 +231,10 @@ function formatProfile(
     pushNotificationsEnabled: p.push_notifications_enabled ?? true,
     emailNotificationsEnabled: p.email_notifications_enabled ?? false,
     preferredLanguage: p.preferred_language === "ar" ? "ar" : "en",
+    themePreference:
+      p.theme_preference === "light" || p.theme_preference === "dark" || p.theme_preference === "system"
+        ? p.theme_preference
+        : "system",
     ...privacy,
   };
 }
@@ -755,6 +759,11 @@ usersRouter.put("/me", async (c) => {
 
   const body = await c.req.json();
 
+  if (body.themePreference === "light" || body.themePreference === "dark" || body.themePreference === "system") {
+    const { ensureThemePreferenceColumn } = await import("../lib/schema");
+    await ensureThemePreferenceColumn();
+  }
+
   if (body.username) {
     const trimmedUsername = body.username.toLowerCase().trim().replace(/^@+/, "");
     if (!USERNAME_RE.test(trimmedUsername)) {
@@ -806,6 +815,9 @@ usersRouter.put("/me", async (c) => {
   }
   if (body.preferredLanguage !== undefined) {
     updateData.preferred_language = body.preferredLanguage === "ar" ? "ar" : "en";
+  }
+  if (body.themePreference === "light" || body.themePreference === "dark" || body.themePreference === "system") {
+    updateData.theme_preference = body.themePreference;
   }
   if (body.showFriendsToFriends !== undefined) updateData.show_friends_to_friends = !!body.showFriendsToFriends;
   if (body.showFriendsToOthers !== undefined) updateData.show_friends_to_others = !!body.showFriendsToOthers;

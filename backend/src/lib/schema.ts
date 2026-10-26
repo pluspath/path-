@@ -70,6 +70,25 @@ export async function ensureRepathColumn(): Promise<boolean> {
   return ok;
 }
 
+let themePreferenceReady: boolean | null = null;
+
+/** Persist the user's light/dark/system choice on their profile. */
+export async function ensureThemePreferenceColumn(): Promise<boolean> {
+  if (themePreferenceReady === true) return true;
+  await ensureExecSqlFunction();
+  const ok = await runDdl(
+    "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS theme_preference text;"
+  );
+  if (ok) {
+    themePreferenceReady = true;
+    console.log("[schema] theme_preference column ready");
+    await runDdl("NOTIFY pgrst, 'reload schema';");
+  } else {
+    console.warn("[schema] Could not ensure theme_preference column");
+  }
+  return ok;
+}
+
 /** Probe whether repath_of is usable (cached after first successful ensure). */
 export async function isRepathColumnReady(): Promise<boolean> {
   if (repathColumnReady === true) return true;
