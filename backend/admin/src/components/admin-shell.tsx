@@ -45,16 +45,21 @@ const navGroups: { label: string; items: (AdminNavItem & { icon: typeof Users })
     items: [{ href: "/dashboard", label: "Dashboard", icon: LayoutDashboard, permission: "dashboard:read" }],
   },
   {
-    label: "Community",
+    label: "Verification",
     items: [
-      { href: "/users", label: "Users", icon: Users, permission: "users:read" },
       {
         href: VERIFIED_ACCOUNTS_HREF,
         label: VERIFIED_ACCOUNTS_LABEL,
         icon: BadgeCheck,
         permission: "users:verify",
-        roles: ["super_admin", "admin"],
+        alwaysVisibleExceptModerator: true,
       },
+    ],
+  },
+  {
+    label: "Community",
+    items: [
+      { href: "/users", label: "Users", icon: Users, permission: "users:read" },
       { href: "/posts", label: "Posts", icon: FileText, permission: "posts:read" },
       { href: "/comments", label: "Comments", icon: MessageSquareText, permission: "comments:read" },
       { href: "/friendships", label: "Friendships", icon: HeartHandshake, permission: "friendships:read" },

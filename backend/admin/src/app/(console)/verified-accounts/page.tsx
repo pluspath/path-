@@ -140,8 +140,8 @@ export default function VerifiedAccountsPage() {
   return (
     <div className="space-y-6" data-testid="verified-accounts-page">
       <PageHeader
-        title="Verified Accounts"
-        description="Grant or revoke the Path+ verification badge. This is an administrator badge, not a legal identity check."
+        title="Account Verification"
+        description="Grant or remove the blue verification badge. Only an administrator can do this from the dashboard. People cannot give themselves the badge in the app."
       />
       <Card>
         <CardHeader>

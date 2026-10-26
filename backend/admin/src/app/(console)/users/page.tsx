@@ -25,6 +25,7 @@ type UserRow = {
   created_at?: string;
   postCount?: number;
   friendCount?: number;
+  is_verified?: boolean | null;
 };
 
 type UserDetail = {
@@ -38,7 +39,9 @@ type UserDetail = {
 };
 
 function UsersPageInner() {
-  const { hasPermission } = useAuth();
+  const { hasPermission, user } = useAuth();
+  const canVerify =
+    hasPermission("users:verify") || user?.role === "super_admin" || user?.role === "admin";
   const searchParams = useSearchParams();
   const [rows, setRows] = useState<UserRow[]>([]);
   const [meta, setMeta] = useState({ total: 0, page: 1, limit: 20, totalPages: 1 });
@@ -263,10 +266,54 @@ function UsersPageInner() {
                   <Badge variant={selected.profile.status === "suspended" ? "danger" : "success"}>
                     {String(selected.profile.status || "active")}
                   </Badge>
+                  <Badge variant={selected.profile.is_verified === true ? "success" : "muted"}>
+                    {selected.profile.is_verified === true ? "Blue badge" : "No badge"}
+                  </Badge>
                   <Badge variant={selected.emailConfirmed ? "success" : "warning"}>
                     {selected.emailConfirmed ? "Email verified" : "Email unverified"}
                   </Badge>
                 </div>
+
+                <Card>
+                  <CardHeader>
+                    <CardTitle>Verification badge</CardTitle>
+                  </CardHeader>
+                  <CardContent className="space-y-3 text-sm">
+                    <p className="text-slate-600 dark:text-slate-300">
+                      This is the blue check shown beside the name in the app. Only an administrator can grant or remove it here.
+                    </p>
+                    {canVerify && selected.profile.is_verified === true ? (
+                      <Button
+                        variant="destructive"
+                        disabled={busy}
+                        onClick={() => {
+                          if (!confirm("Remove the blue verification badge from this account?")) return;
+                          void runAction(
+                            () =>
+                              api.post(`/users/${selected.profile.id}/verification`, { verified: false }),
+                            "Verification badge removed"
+                          );
+                        }}
+                      >
+                        Remove badge
+                      </Button>
+                    ) : null}
+                    {canVerify && selected.profile.is_verified !== true ? (
+                      <Button
+                        disabled={busy}
+                        onClick={() =>
+                          void runAction(
+                            () =>
+                              api.post(`/users/${selected.profile.id}/verification`, { verified: true }),
+                            "Verification badge granted"
+                          )
+                        }
+                      >
+                        Grant badge
+                      </Button>
+                    ) : null}
+                  </CardContent>
+                </Card>
 
                 <Card>
                   <CardHeader>

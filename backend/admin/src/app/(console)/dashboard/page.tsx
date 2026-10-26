@@ -10,8 +10,10 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import Link from "next/link";
 import {
   Activity,
+  BadgeCheck,
   Bell,
   FileText,
   HeartHandshake,
@@ -104,6 +106,22 @@ export default function DashboardPage() {
         title="Dashboard"
         description="Live Path+ application statistics and recent operational activity"
       />
+
+      <Link href="/verified-accounts" className="block" data-testid="dashboard-account-verification">
+        <Card className="transition duration-200 hover:-translate-y-0.5 hover:shadow-atlas">
+          <CardContent className="flex items-center gap-4 pt-5">
+            <div className="flex h-11 w-11 items-center justify-center rounded-lg bg-sky-50 text-sky-500 dark:bg-sky-950/40">
+              <BadgeCheck className="h-5 w-5" />
+            </div>
+            <div>
+              <p className="font-semibold text-navy dark:text-cream">Account Verification</p>
+              <p className="text-sm text-muted">
+                Grant or remove the blue verification badge. Only an administrator can do this.
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+      </Link>
 
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
         {kpiMeta.map((c) => {

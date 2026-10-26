@@ -5,14 +5,16 @@ const verifiedAccounts = {
   href: "/verified-accounts",
   label: VERIFIED_ACCOUNTS_LABEL,
   permission: "users:verify",
-  roles: ["super_admin", "admin"] as const,
+  alwaysVisibleExceptModerator: true,
 };
 
 describe("admin navigation", () => {
-  test("shows Verified Accounts to an admin whose session predates users:verify", () => {
-    const permissions = ["dashboard:read", "users:read", "users:write", "posts:read"];
+  test("shows Account Verification to every role except moderator", () => {
+    const permissions = ["dashboard:read", "users:read"];
+    expect(VERIFIED_ACCOUNTS_LABEL).toBe("Account Verification");
     expect(isNavItemVisible(verifiedAccounts, permissions, "admin")).toBe(true);
     expect(isNavItemVisible(verifiedAccounts, permissions, "super_admin")).toBe(true);
+    expect(isNavItemVisible(verifiedAccounts, permissions, "owner")).toBe(true);
   });
 
   test("shows Verified Accounts when the permission is present", () => {
