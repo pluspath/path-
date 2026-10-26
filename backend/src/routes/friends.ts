@@ -80,6 +80,7 @@ function formatProfile(p: any) {
     name,
     username,
     avatar: resolveAvatarUrl(p.id, p.avatar_url, p.gender),
+    verified: p.is_verified === true,
     bio: p.bio ?? "",
     location: String(p.location ?? "").trim(),
     // Raw birthday is private — never exposed in friend lists / suggestions.

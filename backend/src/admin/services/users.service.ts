@@ -4,6 +4,7 @@ import { dataRepository } from "../repositories/data.repository";
 import { logRepository } from "../repositories/log.repository";
 import { toCsv, toPaginated } from "../utils/pagination";
 import { sanitizeText } from "../utils/sanitize";
+import { stripVerificationFields, verificationPatch } from "../../lib/verification";
 
 export const usersService = {
   async list(opts: { page: number; limit: number; offset: number; search?: string; status?: string }) {
@@ -76,6 +77,9 @@ export const usersService = {
     for (const [k, v] of Object.entries(patch)) {
       clean[k] = typeof v === "string" ? sanitizeText(v) : v;
     }
+    const safe = stripVerificationFields(clean);
+    Object.keys(clean).forEach((key) => delete clean[key]);
+    Object.assign(clean, safe);
     if (clean.status === "suspended") {
       clean.suspended_at = new Date().toISOString();
     }
@@ -103,6 +107,31 @@ export const usersService = {
       { status: "suspended", suspended_reason: reason ?? "Suspended by admin" },
       actor
     );
+  },
+
+  async setVerification(id: string, verified: boolean, actor: { id: string; name: string }) {
+    const existing = await dataRepository.getProfile(id);
+    if (!existing) return null;
+    const patch = verificationPatch(verified, actor.id);
+    const updated = await dataRepository.updateProfile(id, patch);
+    await logRepository.create({
+      category: "admin_activity",
+      action: verified ? "verification_granted" : "verification_revoked",
+      actor_type: "admin",
+      actor_id: actor.id,
+      actor_name: actor.name,
+      target_type: "user",
+      target_id: id,
+      metadata: { verified },
+    });
+    return {
+      id,
+      verified: updated?.is_verified === true,
+      verifiedAt: updated?.verified_at ?? null,
+      verifiedBy: updated?.verified_by ?? null,
+      revokedAt: updated?.verification_revoked_at ?? null,
+      revokedBy: updated?.verification_revoked_by ?? null,
+    };
   },
 
   async activate(id: string, actor: { id: string; name: string }) {

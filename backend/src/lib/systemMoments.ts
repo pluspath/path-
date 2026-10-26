@@ -256,16 +256,17 @@ export async function refreshFriendshipAvatars(posts: any[]): Promise<void> {
 
     const { data: profiles } = await supabaseAdmin
       .from("profiles")
-      .select("id, full_name, username, avatar_url, gender")
+      .select("id, full_name, username, avatar_url, gender, is_verified")
       .in("id", Array.from(friendIds));
 
-    const liveById: Record<string, { avatar: string; name: string }> = {};
+    const liveById: Record<string, { avatar: string; name: string; verified: boolean }> = {};
     for (const pr of profiles ?? []) {
       const username = String(pr.username ?? "").trim();
       const fullName = String(pr.full_name ?? "").trim();
       liveById[pr.id] = {
         avatar: resolveAvatarUrl(pr.id, pr.avatar_url, pr.gender),
         name: fullName || username || "Member",
+        verified: pr.is_verified === true,
       };
     }
 
@@ -276,6 +277,7 @@ export async function refreshFriendshipAvatars(posts: any[]): Promise<void> {
         if (f?.id && f.id in liveById) {
           f.avatar = liveById[f.id].avatar;
           f.name = liveById[f.id].name;
+          f.verified = liveById[f.id].verified;
         }
       }
       // `image` is the type-icon avatar shown in the timeline. It maps to the

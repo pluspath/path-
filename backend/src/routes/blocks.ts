@@ -48,6 +48,7 @@ blocksRouter.get("/", async (c) => {
               name: p.full_name ?? "",
               username: p.username ?? "",
               avatar: resolveAvatarUrl(p.id, p.avatar_url, p.gender),
+              verified: p.is_verified === true,
             }
           : { id: b.blocked_id, name: "User", username: "", avatar: "" },
         createdAt: b.created_at,

@@ -92,6 +92,32 @@ export async function ensureThemePreferenceColumn(): Promise<boolean> {
   return ok;
 }
 
+let verifiedColumnReady: boolean | null = null;
+
+/**
+ * Account verification badge. Existing and new profiles stay unverified
+ * until an administrator grants the badge.
+ */
+export async function ensureVerifiedColumn(): Promise<boolean> {
+  if (verifiedColumnReady === true) return true;
+  await ensureExecSqlFunction();
+  const ok = await runDdl(`
+    ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS is_verified boolean NOT NULL DEFAULT false;
+    ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS verified_at timestamptz;
+    ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS verified_by text;
+    ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS verification_revoked_at timestamptz;
+    ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS verification_revoked_by text;
+  `);
+  if (ok) {
+    verifiedColumnReady = true;
+    console.log("[schema] is_verified column ready");
+    await runDdl("NOTIFY pgrst, 'reload schema';");
+  } else {
+    console.warn("[schema] Could not ensure is_verified column");
+  }
+  return ok;
+}
+
 /** Probe whether repath_of is usable (cached after first successful ensure). */
 export async function isRepathColumnReady(): Promise<boolean> {
   if (repathColumnReady === true) return true;

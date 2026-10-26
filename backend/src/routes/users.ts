@@ -11,6 +11,7 @@ import { isDeletionHiddenProfile } from "../lib/account-deletion";
 import { parseLimit, parseCursor, encodeCursor, isOlderThanCursor } from "../lib/pagination";
 import { ensureUserHasUsername } from "../lib/username-backfill";
 import { refreshAuthProfileCache } from "../lib/auth-profile-cache";
+import { profilePatchTriesToSetVerification } from "../lib/verification";
 import type { HonoVariables, Profile } from "../types";
 
 const USERNAME_RE = /^[a-z0-9_]{3,30}$/;
@@ -235,6 +236,7 @@ function formatProfile(
       p.theme_preference === "light" || p.theme_preference === "dark" || p.theme_preference === "system"
         ? p.theme_preference
         : "light",
+    verified: p.is_verified === true,
     ...privacy,
   };
 }
@@ -758,6 +760,9 @@ usersRouter.put("/me", async (c) => {
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const body = await c.req.json();
+  if (profilePatchTriesToSetVerification(body)) {
+    return c.json({ error: { message: "Verification status cannot be changed from a profile update" } }, 403);
+  }
 
   if (body.themePreference === "light" || body.themePreference === "dark" || body.themePreference === "system") {
     const { ensureThemePreferenceColumn } = await import("../lib/schema");

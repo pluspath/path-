@@ -52,6 +52,7 @@ function formatProfile(p: any) {
     name: p.full_name ?? "",
     username: p.username ?? "",
     avatar: resolveAvatarUrl(p.id, p.avatar_url, p.gender),
+    verified: p.is_verified === true,
     bio: p.bio ?? "",
     location: p.location ?? "",
     birthday: p.birthday ?? "",

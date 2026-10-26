@@ -284,6 +284,7 @@ notificationsRouter.get("/", async (c) => {
             name: profile.full_name ?? "",
             username: profile.username ?? "",
             avatar: resolveAvatarUrl(profile.id, profile.avatar_url, profile.gender),
+            verified: profile.is_verified === true,
             bio: profile.bio ?? "",
             location: profile.location ?? "",
             gender: profile.gender ?? undefined,

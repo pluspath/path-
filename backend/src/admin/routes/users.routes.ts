@@ -110,6 +110,23 @@ usersRoutes.post(
   }
 );
 
+usersRoutes.post(
+  "/:id/verification",
+  requirePermission("users:verify"),
+  zValidator("json", z.object({ verified: z.boolean() })),
+  async (c) => {
+    const id = c.req.param("id");
+    if (!z.string().uuid().safeParse(id).success) return fail(c, "Invalid account id", 400);
+    try {
+      const updated = await usersService.setVerification(id, c.req.valid("json").verified, getActor(c));
+      if (!updated) return fail(c, "User not found", 404);
+      return ok(c, updated);
+    } catch (e) {
+      return fail(c, e instanceof Error ? e.message : "Verification update failed", 500);
+    }
+  }
+);
+
 usersRoutes.post("/:id/verify-email", requirePermission("users:write"), async (c) => {
   try {
     await usersService.verifyEmail(c.req.param("id"), getActor(c));

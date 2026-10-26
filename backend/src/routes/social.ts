@@ -433,6 +433,7 @@ socialRouter.get("/search", async (c) => {
           name: p.full_name ?? "",
           username: p.username ?? "",
           avatar: resolveAvatarUrl(p.id, p.avatar_url, p.gender),
+          verified: p.is_verified === true,
           bio: p.bio ?? "",
           friendshipStatus,
           friendshipId,

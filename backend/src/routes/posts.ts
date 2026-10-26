@@ -39,6 +39,7 @@ function formatCommentUser(userId: string, profile: any) {
     name: String(profile?.full_name ?? profile?.name ?? "").trim(),
     username: String(profile?.username ?? "").trim(),
     avatar: resolveAvatarUrl(userId, profile?.avatar_url, profile?.gender),
+    verified: profile?.is_verified === true,
   };
 }
 
@@ -1280,7 +1281,7 @@ postsRouter.get("/:id/comments", async (c) => {
   // Newest-first fetch (limit+1), then reverse to ascending for display.
   let commentsQuery = supabaseAdmin
     .from("comments")
-    .select("id, post_id, user_id, content, created_at, profiles:user_id(id, full_name, username, avatar_url, gender)")
+    .select("id, post_id, user_id, content, created_at, profiles:user_id(id, full_name, username, avatar_url, gender, is_verified)")
     .eq("post_id", id)
     .order("created_at", { ascending: false })
     .limit(limit + 1);
@@ -1544,7 +1545,7 @@ postsRouter.patch("/:id/comments/:commentId", async (c) => {
     .from("comments")
     .update({ content })
     .eq("id", commentId)
-    .select("id, post_id, user_id, content, created_at, profiles:user_id(id, full_name, username, avatar_url, gender)")
+    .select("id, post_id, user_id, content, created_at, profiles:user_id(id, full_name, username, avatar_url, gender, is_verified)")
     .single();
 
   if (updateError || !updated) {

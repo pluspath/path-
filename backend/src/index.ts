@@ -374,9 +374,10 @@ AS $$ SELECT id FROM auth.users WHERE lower(email) = lower(target_email) LIMIT 1
           console.warn(`[migration] exec_sql failed: ${error.message}`);
         }
       }
-      const { ensureRepathColumn, ensureThemePreferenceColumn } = await import("./lib/schema");
+      const { ensureRepathColumn, ensureThemePreferenceColumn, ensureVerifiedColumn } = await import("./lib/schema");
       await ensureRepathColumn();
       await ensureThemePreferenceColumn();
+      await ensureVerifiedColumn();
       const { ensureInboxColumns } = await import("./lib/inbox-columns");
       await ensureInboxColumns();
       await ensurePostsBucketForChat();

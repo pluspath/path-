@@ -14,6 +14,7 @@ export const PERMISSIONS = {
   "users:write": ["super_admin", "admin"],
   "users:delete": ["super_admin"],
   "users:suspend": ["super_admin", "admin"],
+  "users:verify": ["super_admin", "admin"],
   "posts:read": ["super_admin", "admin", "moderator"],
   "posts:write": ["super_admin", "admin", "moderator"],
   "posts:delete": ["super_admin", "admin"],

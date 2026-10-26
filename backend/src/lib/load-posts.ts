@@ -68,7 +68,7 @@ export async function hydrateReactionProfiles(posts: any[]): Promise<void> {
     // Only columns that exist on every Path+ profiles schema (no bare `name`).
     const { data, error } = await supabaseAdmin
       .from("profiles")
-      .select("id, full_name, username, avatar_url, gender")
+      .select("id, full_name, username, avatar_url, gender, is_verified")
       .in("id", chunk);
     if (error) {
       console.warn("[posts] hydrateReactionProfiles failed:", error.message);

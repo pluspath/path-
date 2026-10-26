@@ -5,6 +5,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import {
   Activity,
+  BadgeCheck,
   Bell,
   FileText,
   FolderOpen,
@@ -42,6 +43,7 @@ const navGroups = [
     label: "Community",
     items: [
       { href: "/users", label: "Users", icon: Users, permission: "users:read" },
+      { href: "/verification", label: "Verification", icon: BadgeCheck, permission: "users:verify" },
       { href: "/posts", label: "Posts", icon: FileText, permission: "posts:read" },
       { href: "/comments", label: "Comments", icon: MessageSquareText, permission: "comments:read" },
       { href: "/friendships", label: "Friendships", icon: HeartHandshake, permission: "friendships:read" },
