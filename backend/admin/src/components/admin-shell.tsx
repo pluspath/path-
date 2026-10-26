@@ -30,11 +30,16 @@ import {
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { useAuth } from "@/lib/auth";
+import { isNavItemVisible, VERIFIED_ACCOUNTS_HREF, VERIFIED_ACCOUNTS_LABEL, type AdminNavItem } from "@/lib/nav";
 import { cn } from "@/lib/utils";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 
-const navGroups = [
+const crumbLabels: Record<string, string> = {
+  "verified-accounts": VERIFIED_ACCOUNTS_LABEL,
+};
+
+const navGroups: { label: string; items: (AdminNavItem & { icon: typeof Users })[] }[] = [
   {
     label: "Overview",
     items: [{ href: "/dashboard", label: "Dashboard", icon: LayoutDashboard, permission: "dashboard:read" }],
@@ -43,7 +48,13 @@ const navGroups = [
     label: "Community",
     items: [
       { href: "/users", label: "Users", icon: Users, permission: "users:read" },
-      { href: "/verification", label: "Verification", icon: BadgeCheck, permission: "users:verify" },
+      {
+        href: VERIFIED_ACCOUNTS_HREF,
+        label: VERIFIED_ACCOUNTS_LABEL,
+        icon: BadgeCheck,
+        permission: "users:verify",
+        roles: ["super_admin", "admin"],
+      },
       { href: "/posts", label: "Posts", icon: FileText, permission: "posts:read" },
       { href: "/comments", label: "Comments", icon: MessageSquareText, permission: "comments:read" },
       { href: "/friendships", label: "Friendships", icon: HeartHandshake, permission: "friendships:read" },
@@ -92,7 +103,7 @@ function PathPlusMark({ className }: { className?: string }) {
 }
 
 export function AdminShell({ children }: { children: React.ReactNode }) {
-  const { user, loading, logout, hasPermission } = useAuth();
+  const { user, permissions, loading, logout } = useAuth();
   const pathname = usePathname();
   const router = useRouter();
   const { theme, setTheme, resolvedTheme } = useTheme();
@@ -109,9 +120,12 @@ export function AdminShell({ children }: { children: React.ReactNode }) {
   const groups = useMemo(
     () =>
       navGroups
-        .map((g) => ({ ...g, items: g.items.filter((n) => hasPermission(n.permission)) }))
+        .map((g) => ({
+          ...g,
+          items: g.items.filter((n) => isNavItemVisible(n, permissions, user?.role)),
+        }))
         .filter((g) => g.items.length > 0),
-    [hasPermission]
+    [permissions, user?.role]
   );
 
   if (loading || !user) {
@@ -174,6 +188,7 @@ export function AdminShell({ children }: { children: React.ReactNode }) {
                       <Link
                         key={item.href}
                         href={item.href}
+                        data-testid={`nav-${item.href.replace(/^\//, "").replace(/\//g, "-")}`}
                         onClick={() => setOpen(false)}
                         className={cn(
                           "flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-[13px] font-medium transition-colors",
@@ -228,7 +243,7 @@ export function AdminShell({ children }: { children: React.ReactNode }) {
                         : "text-muted"
                     )}
                   >
-                    {c}
+                    {crumbLabels[c] ?? c.replace(/-/g, " ")}
                   </span>
                 </span>
               ))}

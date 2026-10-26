@@ -1,5 +1,7 @@
+import { findAuthUserByEmail } from "../../lib/auth-users";
 import { hydratePostProfiles } from "../../lib/load-posts";
 import { supabaseAdmin } from "../../supabase";
+import { profileSearchFilter } from "../utils/profile-search";
 
 function dbError(error: unknown, fallback: string): Error {
   if (error instanceof Error && error.message.trim()) return error;
@@ -36,9 +38,17 @@ export const dataRepository = {
 
     if (opts.status) query = query.eq("status", opts.status);
     if (opts.search) {
-      query = query.or(
-        `username.ilike.%${opts.search}%,full_name.ilike.%${opts.search}%,location.ilike.%${opts.search}%`
-      );
+      let emailUserId: string | null = null;
+      if (opts.search.includes("@")) {
+        try {
+          const found = await findAuthUserByEmail(opts.search);
+          if (found.ok && found.user?.id) emailUserId = found.user.id;
+        } catch {
+          emailUserId = null;
+        }
+      }
+      const filter = profileSearchFilter(opts.search, emailUserId);
+      if (filter) query = query.or(filter);
     }
 
     const { data, error, count } = await query;
