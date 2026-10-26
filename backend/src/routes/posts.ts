@@ -15,13 +15,12 @@ import { notifyMentions } from "../lib/mentions";
 import { encodeImages } from "../lib/images";
 import { getBlockedIds } from "../lib/blocks";
 import { parseDurationToMinutes } from "../lib/duration";
-import { POST_SELECT, loadPosts, attachOriginals } from "../lib/load-posts";
+import { POST_SELECT, loadPosts, attachOriginals, loadPostsByIds } from "../lib/load-posts";
 import { resolveAvatarUrl } from "../lib/avatar";
 import { halfLineSnippet } from "../lib/moment-preview";
-import {
-  filterDeletionHiddenPosts,
-  getDeletionHiddenUserIds,
-} from "../lib/account-deletion";
+import { getDeletionHiddenUserIds } from "../lib/account-deletion";
+import { fetchNewestMomentBatch } from "../lib/moment-feed";
+import { walkNewestPage } from "../lib/moment-order";
 import {
   parseLimit,
   parseCursor,
@@ -78,15 +77,15 @@ postsRouter.get("/", async (c) => {
   const userClient = createUserClient(token);
   const limit = parseLimit(c.req.query("limit"), 20, 50);
   const cursor = parseCursor(c.req.query("cursor"));
-  // Over-fetch so visibility/block filters still leave enough for one page.
-  const fetchLimit = Math.min(Math.max(limit * 2, limit + 10), 100);
+  // Batch is larger than the page so audience filters still fill one page.
+  // The database orders each batch before this limit is applied.
+  const batchSize = Math.min(Math.max(limit * 3, limit + 10), 80);
 
-  // Privacy: the home timeline shows ONLY the current user's own moments plus
-  // moments from ACCEPTED (mutual) friends. Pending/requested relationships
-  // must never expose any moments — for every moment type, including the
-  // "Joined Path+" auto-moments.
+  // Privacy: own moments, moments from accepted friends, and public moments.
+  // Pending friendships never expose moments. Private moments stay with the
+  // author. Close-friends moments stay with people that author starred.
   // Parallelize the hot-path lookups that used to run as a waterfall.
-  const [friendshipsResult, blockedIds, whoStarredMe] = await Promise.all([
+  const [friendshipsResult, blockedIds, whoStarredMe, deletionHidden] = await Promise.all([
     supabaseAdmin
       .from("friendships")
       .select("requester_id, receiver_id")
@@ -94,6 +93,7 @@ postsRouter.get("/", async (c) => {
       .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
     getBlockedIds(userId),
     getWhoStarredMe(userId),
+    getDeletionHiddenUserIds(),
   ]);
 
   const { data: acceptedFriendships, error: friendsErr } = friendshipsResult;
@@ -120,95 +120,60 @@ postsRouter.get("/", async (c) => {
 
   const friendIdSet = new Set(friendIds);
 
-  const buildFriendQuery = (select: string) => {
-    let q = supabaseAdmin
-      .from("posts")
-      .select(select)
-      .in("user_id", allowedUserIds)
-      .order("created_at", { ascending: false })
-      .limit(fetchLimit);
-    // lte + in-memory id tiebreak so same-timestamp rows aren't skipped.
-    if (cursor?.createdAt) q = q.lte("created_at", cursor.createdAt);
-    return q;
-  };
-  const buildPublicQuery = (select: string) => {
-    let q = supabaseAdmin
-      .from("posts")
-      .select(select)
-      .eq("audience", "public")
-      .order("created_at", { ascending: false })
-      .limit(fetchLimit);
-    if (cursor?.createdAt) q = q.lte("created_at", cursor.createdAt);
-    return q;
-  };
-
-  const [friendFeed, publicFeed] = await Promise.all([
-    loadPosts(buildFriendQuery),
-    loadPosts(buildPublicQuery),
-  ]);
-
-  const { data: posts, error: postsErr } = friendFeed;
-  if (postsErr) {
-    console.error("[posts] feed query failed:", postsErr.message);
+  // Page after ordering. Friend moments and public moments are separate
+  // streams so a limited public window cannot push a newer friend moment
+  // off the first page, and a refresh without new rows returns the same page.
+  let walked;
+  try {
+    walked = await walkNewestPage({
+      cursor,
+      limit,
+      batchSize,
+      fetchFriends: (pageCursor, size) =>
+        fetchNewestMomentBatch((q) => q.in("user_id", allowedUserIds), pageCursor, size),
+      fetchPublic: async (pageCursor, size) => {
+        try {
+          return await fetchNewestMomentBatch((q) => q.eq("audience", "public"), pageCursor, size);
+        } catch (e) {
+          console.warn("[posts] public moment window failed:", e instanceof Error ? e.message : e);
+          return [];
+        }
+      },
+      accept: (p: any) => {
+        if (!p?.id) return false;
+        if (p.user_id !== userId && blockedSet.has(p.user_id)) return false;
+        if (p.user_id !== userId && deletionHidden.has(p.user_id)) return false;
+        if (p.user_id === userId) return true;
+        const audience = p.audience ?? "friends";
+        if (audience === "private") return false;
+        if (audience === "close") return whoStarredMe.has(p.user_id);
+        if (audience === "public") return true;
+        return friendIdSet.has(p.user_id);
+      },
+    });
+  } catch (e) {
+    console.error("[posts] feed query failed:", e instanceof Error ? e.message : e);
+    return c.json({ error: { message: "Failed to load moments" } }, 500);
   }
 
-  const { data: publicPosts } = publicFeed;
-
-  const publicFromOthers = (publicPosts ?? []).filter(
-    (p: any) =>
-      p.user_id !== userId &&
-      !friendIdSet.has(p.user_id) &&
-      !blockedSet.has(p.user_id)
-  );
-
-  const mergedById = new Map<string, any>();
-  for (const p of [...(posts ?? []), ...publicFromOthers]) {
-    if (p?.id) mergedById.set(p.id, p);
-  }
-  let allPosts = Array.from(mergedById.values()).sort(
-    (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-  );
-
-  // Id tiebreak when cursor includes `|id` (DB lt only filters created_at).
-  if (cursor) {
-    allPosts = allPosts.filter((p: any) =>
-      isOlderThanCursor(String(p.created_at ?? ""), String(p.id ?? ""), cursor)
-    );
+  let ordered: any[] = [];
+  try {
+    ordered = await loadPostsByIds(walked.page.map((p) => p.id));
+    await attachOriginals(userClient, ordered);
+  } catch (e) {
+    console.error("[posts] feed hydrate failed:", e instanceof Error ? e.message : e);
+    return c.json({ error: { message: "Failed to load moments" } }, 500);
   }
 
-  // Per-post audience enforcement. `whoStarredMe` = the set of authors who have
-  // privately starred ME as a close friend (read with the admin client because
-  // RLS hides other users' close_friends rows). A post with audience='close' is
-  // delivered only to the author's starred close friends; 'private' is author-
-  // only; everything else (incl. a missing `audience` column) behaves as today.
-  const visible = allPosts.filter((p: any) => {
-    if (p.user_id === userId) return true; // my own moments always show
-    const audience = p.audience ?? "friends";
-    if (audience === "private") return false;
-    if (audience === "close") return whoStarredMe.has(p.user_id);
-    return true; // 'public' | 'friends' | unknown
-  });
-
-  // Hide content from accounts in the 30-day deletion grace window.
-  // Parallelize attachOriginals with the (cached) deletion-hidden lookup.
-  const [deletionHidden] = await Promise.all([
-    getDeletionHiddenUserIds(),
-    attachOriginals(userClient, visible),
-  ]);
-  const visibleAfterDeletion = filterDeletionHiddenPosts(visible, deletionHidden, userId);
-
-  const hasMore = visibleAfterDeletion.length > limit;
-  const page = hasMore ? visibleAfterDeletion.slice(0, limit) : visibleAfterDeletion;
-  const last = page.length > 0 ? page[page.length - 1] : null;
-  const nextCursor =
-    hasMore && last?.created_at && last?.id
-      ? encodeCursor(String(last.created_at), String(last.id))
-      : null;
-
-  const formatted = page.map((p) => formatPost(p, userId ?? undefined, blockedIds));
+  const formatted = ordered.map((p) => formatPost(p, userId ?? undefined, blockedIds));
   await refreshFriendshipAvatars(formatted); // always show friends' CURRENT avatars
   await refreshReactionActors(formatted); // live names + avatars on likes
-  return c.json({ data: formatted, nextCursor, hasMore, limit });
+  return c.json({
+    data: formatted,
+    nextCursor: walked.nextCursor,
+    hasMore: walked.hasMore,
+    limit,
+  });
 });
 
 // Matches #hashtag tokens: latin + accented + Arabic letters, digits, underscore.

@@ -150,3 +150,17 @@ async function attachReactionsForPosts(posts: any[]): Promise<void> {
     p.reactions = byPost.get(p.id) ?? [];
   }
 }
+
+/** Hydrate full posts for an already-ordered id list. Result keeps that order. */
+export async function loadPostsByIds(ids: string[]): Promise<any[]> {
+  const unique = Array.from(new Set(ids.filter(Boolean)));
+  if (unique.length === 0) return [];
+  const { data, error } = await loadPosts((select) =>
+    supabaseAdmin.from("posts").select(select).in("id", unique)
+  );
+  if (error) throw new Error(error.message);
+  const byId = new Map((data ?? []).map((row: any) => [String(row.id).toLowerCase(), row]));
+  return ids
+    .map((id) => byId.get(String(id).toLowerCase()))
+    .filter(Boolean);
+}

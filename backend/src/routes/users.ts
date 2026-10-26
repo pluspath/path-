@@ -8,7 +8,10 @@ import { formatDuration } from "../lib/duration";
 import { upsertUserDevice, deactivateUserDevices, getPushTokensForUser, getPushStatusForUser, sendPushNotificationDetailed, getUnreadNotificationBadgeCount } from "../lib/push";
 import { isCustomAvatar, defaultAvatarForGender, ensureGenderDefaultAvatar, resolveAvatarUrl, normalizeGender } from "../lib/avatar";
 import { isDeletionHiddenProfile } from "../lib/account-deletion";
-import { parseLimit, parseCursor, encodeCursor, isOlderThanCursor } from "../lib/pagination";
+import { parseLimit, parseCursor } from "../lib/pagination";
+import { fetchNewestMomentBatch } from "../lib/moment-feed";
+import { walkNewestPage } from "../lib/moment-order";
+import { attachOriginals, loadPostsByIds } from "../lib/load-posts";
 import { ensureUserHasUsername } from "../lib/username-backfill";
 import { refreshAuthProfileCache } from "../lib/auth-profile-cache";
 import { profilePatchTriesToSetVerification } from "../lib/verification";
@@ -1484,87 +1487,45 @@ usersRouter.get("/:id/posts", async (c) => {
     return !!(p.content || p.image_url || p.location || p.type === "location");
   };
 
-  const SELECT = "*, profiles!user_id(*), reactions(user_id, type)";
-
-  // Stream newest→oldest until we have a page (or the full list when wantAll).
-  // Loading every post before slicing made Moments appear stuck on the skeleton.
-  const visible: any[] = [];
-  let scannedAll = false;
-  const need = wantAll ? Number.POSITIVE_INFINITY : limit + 1;
-
-  for (let from = 0; ; from += 500) {
-    let { data: batch, error: batchErr } = await supabaseAdmin
-      .from("posts")
-      .select(SELECT)
-      .eq("user_id", id)
-      .order("created_at", { ascending: false })
-      .order("id", { ascending: false })
-      .range(from, from + 499);
-
-    if (batchErr) {
-      console.warn("[users/posts] nested select failed, retrying basic:", batchErr.message);
-      const basic = await supabaseAdmin
-        .from("posts")
-        .select("*, profiles!user_id(*)")
-        .eq("user_id", id)
-        .order("created_at", { ascending: false })
-        .order("id", { ascending: false })
-        .range(from, from + 499);
-      batch = basic.data ?? [];
-      if (basic.error) {
-        console.error("[users/posts] query failed:", basic.error.message);
-        scannedAll = true;
-        break;
-      }
-    }
-
-    const rows = batch ?? [];
-    if (rows.length === 0) {
-      scannedAll = true;
-      break;
-    }
-
-    for (const p of rows) {
-      if (!passesAudience(p) || !passesSection(p)) continue;
-      if (
-        cursor &&
-        !isOlderThanCursor(String(p.created_at ?? ""), String(p.id ?? ""), cursor)
-      ) {
-        continue;
-      }
-      visible.push(p);
-      if (visible.length >= need) break;
-    }
-
-    if (visible.length >= need) break;
-    if (rows.length < 500) {
-      scannedAll = true;
-      break;
-    }
+  // Order by created_at (then id) before paging. Do not embed reactions here:
+  // that join made the database limit cut joined rows, so the profile could
+  // come back oldest-first or in a different order on each refresh.
+  const pageLimit = wantAll ? 500 : limit;
+  const batchSize = Math.min(100, Math.max(40, Math.min(pageLimit, 80)));
+  let walked;
+  try {
+    walked = await walkNewestPage({
+      cursor,
+      limit: pageLimit,
+      batchSize,
+      fetchFriends: (pageCursor, size) =>
+        fetchNewestMomentBatch((q) => q.eq("user_id", id), pageCursor, size),
+      accept: (p) => passesAudience(p) && passesSection(p),
+    });
+  } catch (e) {
+    console.error("[users/posts] query failed:", e instanceof Error ? e.message : e);
+    return c.json({ error: { message: "Failed to load moments" } }, 500);
   }
 
-  const hasMore = !wantAll && visible.length > limit;
-  const page = hasMore ? visible.slice(0, limit) : visible.slice(0, wantAll ? visible.length : limit);
-  const last = page.length > 0 ? page[page.length - 1] : null;
-  const nextCursor =
-    hasMore && last?.created_at && last?.id
-      ? encodeCursor(String(last.created_at), String(last.id))
-      : null;
+  let ordered: any[] = [];
+  try {
+    ordered = await loadPostsByIds(walked.page.map((p) => p.id));
+    await attachOriginals(null, ordered);
+  } catch (e) {
+    console.error("[users/posts] hydrate failed:", e instanceof Error ? e.message : e);
+    return c.json({ error: { message: "Failed to load moments" } }, 500);
+  }
 
-  const { attachOriginals, hydrateReactionProfiles } = await import("../lib/load-posts");
-  await attachOriginals(null, page);
-  await hydrateReactionProfiles(page);
-
-  const formatted = page.map((p) => formatPost(p, userId ?? undefined, blockedIds));
+  const formatted = ordered.map((p) => formatPost(p, userId ?? undefined, blockedIds));
   await refreshFriendshipAvatars(formatted);
   await refreshReactionActors(formatted);
 
   return c.json({
     data: formatted,
-    nextCursor,
-    hasMore,
-    limit: wantAll ? page.length : limit,
-    totalVisible: cursor || !scannedAll || hasMore ? undefined : visible.length,
+    nextCursor: walked.nextCursor,
+    hasMore: walked.hasMore,
+    limit: wantAll ? formatted.length : limit,
+    totalVisible: cursor || walked.hasMore ? undefined : formatted.length,
   });
 });
 
