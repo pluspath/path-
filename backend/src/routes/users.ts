@@ -234,7 +234,7 @@ function formatProfile(
     themePreference:
       p.theme_preference === "light" || p.theme_preference === "dark" || p.theme_preference === "system"
         ? p.theme_preference
-        : "system",
+        : "light",
     ...privacy,
   };
 }

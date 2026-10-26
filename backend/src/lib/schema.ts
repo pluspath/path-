@@ -77,8 +77,11 @@ export async function ensureThemePreferenceColumn(): Promise<boolean> {
   if (themePreferenceReady === true) return true;
   await ensureExecSqlFunction();
   const ok = await runDdl(
-    "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS theme_preference text;"
+    "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS theme_preference text DEFAULT 'light';"
   );
+  if (ok) {
+    await runDdl("ALTER TABLE public.profiles ALTER COLUMN theme_preference SET DEFAULT 'light';");
+  }
   if (ok) {
     themePreferenceReady = true;
     console.log("[schema] theme_preference column ready");
