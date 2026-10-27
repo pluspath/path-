@@ -4,6 +4,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+export PATH="${BUN_INSTALL:-$HOME/.bun}/bin:/usr/local/bin:/usr/bin:$PATH"
 
 echo "==> Stopping pathplus-api"
 pm2 stop pathplus-api || true

@@ -17,7 +17,8 @@ module.exports = {
       name: "pathplus-api",
       cwd: __dirname,
       script: "src/index.ts",
-      interpreter: "bun",
+      // Absolute path avoids PM2 crash-loops when the process env PATH lacks Bun.
+      interpreter: "/root/.bun/bin/bun",
       instances: 1,
       exec_mode: "fork",
       autorestart: true,
