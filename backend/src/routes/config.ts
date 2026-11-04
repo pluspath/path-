@@ -29,6 +29,12 @@ configRouter.get("/", (c) => {
         sharePosts: true,
         searchUsers: true,
         suggestedFriends: true,
+        whatsNew: true,
+      },
+      // One-time "What's New" popup. Bump `id` to show it again to everyone.
+      announcement: {
+        id: "pathplus-update-2026-11-01",
+        active: true,
       },
       momentTypes: [
         "photo",

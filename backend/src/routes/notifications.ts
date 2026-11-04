@@ -339,6 +339,9 @@ notificationsRouter.get("/badge", async (c) => {
       appIcon,
       unreadNotifications: breakdown.notifications,
       unreadMessages: breakdown.messages,
+      // Message Requests split (non-friend DMs). requestMessages ⊆ messages.
+      requestMessages: breakdown.requestMessages,
+      friendMessages: breakdown.friendMessages,
     },
   });
 });

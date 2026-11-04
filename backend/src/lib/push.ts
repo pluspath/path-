@@ -4,6 +4,13 @@
 // Failures are logged; main app actions never depend on push delivery.
 import { env } from "../env";
 import { isPushEnabled } from "./external-config";
+import { getBlockedIds } from "./blocks";
+import {
+  isMessageRequestFor,
+  loadConversationsWithIncoming,
+  loadFriendshipStates,
+  loadPeerByConversation,
+} from "./message-requests";
 
 const EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send";
 const EXPO_PUSH_RECEIPTS_URL = "https://exp.host/--/api/v2/push/getReceipts";
@@ -178,16 +185,19 @@ async function countUnreadNotifications(client: any, userId: string): Promise<nu
 
 
 /** Unread DMs — exact COUNT per conversation (avoids PostgREST row caps). */
-async function countUnreadDirectMessages(client: any, userId: string): Promise<number> {
+async function countUnreadDirectMessages(
+  client: any,
+  userId: string
+): Promise<{ total: number; requests: number }> {
   try {
     const { data: participations } = await client
       .from("conversation_participants")
       .select("conversation_id, last_read_at")
       .eq("user_id", userId);
     const parts = participations ?? [];
-    if (parts.length === 0) return 0;
+    if (parts.length === 0) return { total: 0, requests: 0 };
 
-    let total = 0;
+    const perConv: Record<string, number> = {};
     const chunkSize = 25;
     for (let i = 0; i < parts.length; i += chunkSize) {
       const chunk = parts.slice(i, i + chunkSize);
@@ -207,12 +217,45 @@ async function countUnreadDirectMessages(client: any, userId: string): Promise<n
           return count ?? 0;
         })
       );
-      for (const n of counts) total += n;
+      chunk.forEach((p: any, idx: number) => {
+        perConv[p.conversation_id] = counts[idx] ?? 0;
+      });
     }
-    return total;
+
+    // Split unread DMs into friend threads vs Message Requests (non-friends).
+    // Threads with blocked users are dropped — they are hidden from the inbox,
+    // so their unreads must never keep a badge alive.
+    const unreadConvIds = Object.keys(perConv).filter((id) => (perConv[id] ?? 0) > 0);
+    let total = 0;
+    let requests = 0;
+    if (unreadConvIds.length === 0) return { total: 0, requests: 0 };
+    try {
+      const [peerByConv, blockedIds, incomingByConv] = await Promise.all([
+        loadPeerByConversation(userId, unreadConvIds, client),
+        getBlockedIds(userId, client),
+        loadConversationsWithIncoming(userId, unreadConvIds, client),
+      ]);
+      const blocked = new Set(blockedIds);
+      const peerIds = Object.values(peerByConv);
+      const states = await loadFriendshipStates(userId, peerIds, client);
+      for (const convId of unreadConvIds) {
+        const peerId = peerByConv[convId];
+        if (peerId && blocked.has(peerId)) continue;
+        const n = perConv[convId] ?? 0;
+        total += n;
+        if (isMessageRequestFor(peerId ? states[peerId] : undefined, incomingByConv.has(convId))) {
+          requests += n;
+        }
+      }
+    } catch (e) {
+      console.warn("[push] unread DM request split failed:", e);
+      total = unreadConvIds.reduce((sum, id) => sum + (perConv[id] ?? 0), 0);
+      requests = 0;
+    }
+    return { total, requests };
   } catch (e) {
     console.warn("[push] unread DM count failed:", e);
-    return 0;
+    return { total: 0, requests: 0 };
   }
 }
 
@@ -220,6 +263,10 @@ export type BadgeBreakdown = {
   notifications: number;
   messages: number;
   total: number;
+  /** Unread DMs from non-friends (Message Requests). Subset of `messages`. */
+  requestMessages: number;
+  /** Unread DMs from friends. `messages - requestMessages`. */
+  friendMessages: number;
 };
 
 /** Exact unread notification count (bell) — excludes ping/message rows. */
@@ -234,16 +281,23 @@ export async function countUnreadNotificationsForUser(
  * App-icon badge = unread social notifications (bell) + unread DMs (messages).
  */
 export async function getBadgeBreakdown(client: any, userId: string): Promise<BadgeBreakdown> {
-  const [notifications, messages] = await Promise.all([
+  const [notifications, dms] = await Promise.all([
     countUnreadNotifications(client, userId),
     countUnreadDirectMessages(client, userId),
   ]);
   const safeNotifications = Math.max(0, notifications);
-  const safeMessages = Math.max(0, messages);
+  const safeMessages = Math.max(0, dms.total);
+  const safeRequests = Math.min(safeMessages, Math.max(0, dms.requests));
   // Uncapped raw sum for clients; OS APIs still clamp to 99 when applying.
   const rawTotal = safeNotifications + safeMessages;
   const total = Math.max(0, Math.min(99, rawTotal));
-  return { notifications: safeNotifications, messages: safeMessages, total };
+  return {
+    notifications: safeNotifications,
+    messages: safeMessages,
+    total,
+    requestMessages: safeRequests,
+    friendMessages: safeMessages - safeRequests,
+  };
 }
 
 /**

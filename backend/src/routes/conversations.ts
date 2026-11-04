@@ -5,6 +5,12 @@ import { encodeImages, decodeImages } from "../lib/images";
 import { getBlockedIds, isBlocked } from "../lib/blocks";
 import { resolveAvatarUrl } from "../lib/avatar";
 import { ensureInboxColumns } from "../lib/inbox-columns";
+import {
+  isMessageRequestFor,
+  loadConversationsWithIncoming,
+  loadFriendshipStates,
+  loadPeerByConversation,
+} from "../lib/message-requests";
 import type { HonoVariables } from "../types";
 
 const conversationsRouter = new Hono<{ Variables: HonoVariables }>();
@@ -232,6 +238,18 @@ const emptyUser = (id = "unknown") => ({
   momentCount: 0,
 });
 
+/** True when the viewer is blocked either way from the peer in this 1:1 thread. */
+async function isBlockedWithPeer(
+  userId: string,
+  conversationId: string,
+  db: any = supabaseAdmin
+): Promise<boolean> {
+  const peers = await loadPeerByConversation(userId, [conversationId], db);
+  const peerId = peers[conversationId];
+  if (!peerId) return false;
+  return isBlocked(userId, peerId, db);
+}
+
 conversationsRouter.get("/", async (c) => {
   // Auth is JWT-derived userId (set only after supabase.auth.getUser succeeds).
   const userId = c.get("userId");
@@ -297,8 +315,12 @@ conversationsRouter.get("/", async (c) => {
     const visibleIds = visibleConversations.map((c: any) => c.id);
     if (visibleIds.length === 0) return c.json({ data: [] });
 
-    const otherUserIds = [
-      ...new Set(visibleIds.map((id: string) => otherUserIdByConv[id]).filter(Boolean)),
+    const otherUserIds: string[] = [
+      ...new Set(
+        visibleIds
+          .map((id: string) => otherUserIdByConv[id])
+          .filter((id): id is string => typeof id === "string" && id.length > 0)
+      ),
     ];
 
     // One newest message per conversation + profiles + unread in parallel.
@@ -340,6 +362,14 @@ conversationsRouter.get("/", async (c) => {
       }
     }
 
+    // Message Requests: friendship + inbound peer messages (no extra tables).
+    const [friendshipByPeer, incomingByConv] = await Promise.all([
+      loadFriendshipStates(userId, otherUserIds, db),
+      loadConversationsWithIncoming(userId, visibleIds, db),
+    ]);
+    const bucketRaw = String(c.req.query("bucket") ?? "all").toLowerCase();
+    const bucket = bucketRaw === "inbox" || bucketRaw === "requests" ? bucketRaw : "all";
+
     // Only conversations with at least one message belong in the Chats list.
     // Opening Message without sending must not create a visible empty row.
     const result = visibleConversations
@@ -349,6 +379,8 @@ conversationsRouter.get("/", async (c) => {
         if (!lastMsg) return null;
         const previewText = lastMsg?.content ?? lastMsg?.text ?? "";
         const pinnedAt = pinnedAtByConv[conv.id] ?? null;
+        const friendship = otherUserId ? friendshipByPeer[otherUserId] : undefined;
+        const isMessageRequest = isMessageRequestFor(friendship, incomingByConv.has(conv.id));
         return {
           id: conv.id,
           user: (otherUserId && profilesById[otherUserId]) || emptyUser(otherUserId),
@@ -358,10 +390,16 @@ conversationsRouter.get("/", async (c) => {
           unreadCount: unreadByConv[conv.id] ?? 0,
           isPinned: !!pinnedAt,
           pinnedAt,
+          isMessageRequest,
+          friendshipStatus: friendship?.status ?? "none",
+          friendshipId: friendship?.friendshipId ?? null,
           messages: [],
         };
       })
-      .filter(Boolean) as any[];
+      .filter(Boolean)
+      .filter((row: any) =>
+        bucket === "all" ? true : bucket === "requests" ? row.isMessageRequest : !row.isMessageRequest
+      ) as any[];
 
     // Pinned chats stay at the top; within each group sort by latest activity.
     result.sort((a, b) => {
@@ -416,6 +454,8 @@ conversationsRouter.get("/with/:userId", async (c) => {
     .order("created_at", { ascending: false })
     .limit(1);
   const lastMsg = msgs?.[0];
+  const friendship = (await loadFriendshipStates(userId, [targetId], db))[targetId];
+  const incoming = await loadConversationsWithIncoming(userId, [existingConvId], db);
   return c.json({
     data: {
       id: existingConvId,
@@ -425,6 +465,9 @@ conversationsRouter.get("/with/:userId", async (c) => {
       unreadCount: 0,
       messages: [],
       hasMessages: !!lastMsg,
+      isMessageRequest: isMessageRequestFor(friendship, incoming.has(existingConvId)),
+      friendshipStatus: friendship?.status ?? "none",
+      friendshipId: friendship?.friendshipId ?? null,
     },
   });
 });
@@ -616,10 +659,12 @@ conversationsRouter.get("/:id", async (c) => {
     otherUser = profile ? formatProfile(profile) : null;
   } else {
     const newestPage = batch1 as MsgPage;
+    const threadIsEmpty = newestPage.msgs.length === 0;
     const [profileResult, firstUnread, unreadCountRes] = await Promise.all([
       profilePromise,
-      findFirstUnread(),
+      threadIsEmpty ? Promise.resolve(null) : findFirstUnread(),
       (async () => {
+        if (threadIsEmpty) return { count: 0 };
         let countQuery = db
           .from("messages")
           .select("id", { count: "exact", head: true })
@@ -645,6 +690,18 @@ conversationsRouter.get("/:id", async (c) => {
   const nextAfter = hasMoreNewer && newest?.created_at ? String(newest.created_at) : null;
   const mapped = await attachReplyPreviews(db, msgs.map((m: any) => mapMessage(m)), msgs);
 
+  // Message Request state: only when the peer has messaged and you are not friends.
+  let friendship: Awaited<ReturnType<typeof loadFriendshipStates>>[string] | undefined;
+  let hasIncomingFromPeer = false;
+  if (otherUserId) {
+    friendship = (await loadFriendshipStates(userId, [otherUserId], db))[otherUserId];
+    const incoming = await loadConversationsWithIncoming(userId, [id], db);
+    hasIncomingFromPeer = incoming.has(id);
+  }
+  const isMessageRequest = otherUserId
+    ? isMessageRequestFor(friendship, hasIncomingFromPeer)
+    : false;
+
   return c.json({
     data: {
       id: conv.id,
@@ -652,6 +709,9 @@ conversationsRouter.get("/:id", async (c) => {
       lastMessage: last ? messagePreview(last.type, last.content) : "",
       lastMessageTime: conv.updated_at,
       unreadCount,
+      isMessageRequest,
+      friendshipStatus: friendship?.status ?? "none",
+      friendshipId: friendship?.friendshipId ?? null,
       myLastReadAt,
       firstUnreadMessageId,
       otherLastReadAt,
@@ -681,6 +741,24 @@ conversationsRouter.post("/unread-counts", async (c) => {
     .eq("user_id", userId);
 
   const result = await computeUnreadCounts(db, userId, participations ?? []);
+
+  // Threads with blocked people are hidden from the inbox — never count their unreads.
+  try {
+    const unreadIds = Object.keys(result).filter((id) => (result[id] ?? 0) > 0);
+    if (unreadIds.length > 0) {
+      const [peerByConv, blockedIds] = await Promise.all([
+        loadPeerByConversation(userId, unreadIds, db),
+        getBlockedIds(userId, db),
+      ]);
+      const blocked = new Set(blockedIds);
+      for (const convId of unreadIds) {
+        const peer = peerByConv[convId];
+        if (peer && blocked.has(peer)) result[convId] = 0;
+      }
+    }
+  } catch (e) {
+    console.warn("[conversations] unread-counts block filter failed:", e);
+  }
 
   return c.json({ data: result });
 });
@@ -1321,6 +1399,10 @@ conversationsRouter.post("/:id/ping", async (c) => {
     .maybeSingle();
 
   if (!participation) return c.json({ error: { message: "Unauthorized" } }, 403);
+
+  if (await isBlockedWithPeer(userId, id, db)) {
+    return c.json({ error: { message: "Unable to message this user" } }, 403);
+  }
 
   const { data: message, error: pingError } = await db
     .from("messages")
