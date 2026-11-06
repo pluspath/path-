@@ -222,6 +222,7 @@ app.get("/__marketing", (c) =>
         "CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON public.messages (conversation_id, created_at DESC);",
         "CREATE INDEX IF NOT EXISTS idx_conversation_participants_user ON public.conversation_participants (user_id);",
         "ALTER TABLE public.notifications ADD COLUMN IF NOT EXISTS conversation_id UUID;",
+        "ALTER TABLE public.notifications ADD COLUMN IF NOT EXISTS comment_id UUID;",
         "CREATE INDEX IF NOT EXISTS idx_notifications_user_created ON public.notifications (user_id, created_at DESC);",
         // Multi-device push token registry (APNs via Expo Push)
         `CREATE TABLE IF NOT EXISTS public.user_devices (

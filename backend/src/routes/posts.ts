@@ -17,6 +17,7 @@ import { getBlockedIds } from "../lib/blocks";
 import { parseDurationToMinutes } from "../lib/duration";
 import { POST_SELECT, loadPosts, attachOriginals, loadPostsByIds } from "../lib/load-posts";
 import { resolveAvatarUrl } from "../lib/avatar";
+import { attachCommentPreviews, formatCommentUser } from "../lib/comment-previews";
 import { halfLineSnippet } from "../lib/moment-preview";
 import { getDeletionHiddenUserIds } from "../lib/account-deletion";
 import { fetchNewestMomentBatch } from "../lib/moment-feed";
@@ -30,17 +31,6 @@ import {
 import type { HonoVariables } from "../types";
 
 const postsRouter = new Hono<{ Variables: HonoVariables }>();
-
-/** Author payload for comment list / create / edit responses. */
-function formatCommentUser(userId: string, profile: any) {
-  return {
-    id: userId,
-    name: String(profile?.full_name ?? profile?.name ?? "").trim(),
-    username: String(profile?.username ?? "").trim(),
-    avatar: resolveAvatarUrl(userId, profile?.avatar_url, profile?.gender),
-    verified: profile?.is_verified === true,
-  };
-}
 
 // The set of authors who have privately starred `viewerId` as a close friend.
 // Read with the admin client because RLS restricts `close_friends` rows to their
@@ -164,6 +154,9 @@ postsRouter.get("/", async (c) => {
     console.error("[posts] feed hydrate failed:", e instanceof Error ? e.message : e);
     return c.json({ error: { message: "Failed to load moments" } }, 500);
   }
+
+  // Latest 2 comments per moment in one batched query (before formatPost).
+  await attachCommentPreviews(ordered, userId ?? undefined, blockedIds);
 
   const formatted = ordered.map((p) => formatPost(p, userId ?? undefined, blockedIds));
   await refreshFriendshipAvatars(formatted); // always show friends' CURRENT avatars
@@ -309,6 +302,8 @@ postsRouter.get("/hashtag/:tag", async (c) => {
     hasMore && last?.created_at && last?.id
       ? encodeCursor(String(last.created_at), String(last.id))
       : null;
+
+  await attachCommentPreviews(page, userId ?? undefined, blockedIds);
 
   const formatted = page.map((p) => formatPost(p, userId ?? undefined, blockedIds));
   await refreshReactionActors(formatted);
@@ -461,6 +456,8 @@ async function handleInteractedMoments(c: any) {
   const byId = new Map((posts ?? []).map((p: any) => [p.id, p]));
   const orderedPosts = pageIds.map((id) => byId.get(id)).filter(Boolean);
   await attachOriginals(userClient, orderedPosts);
+
+  await attachCommentPreviews(orderedPosts, userId, blockedIds);
 
   const formatted = orderedPosts.map((p: any) => formatPost(p, userId, blockedIds));
   await refreshReactionActors(formatted);
@@ -1353,14 +1350,16 @@ postsRouter.post("/:id/comments", async (c) => {
     return c.json({ error: { message: "Failed to create comment" } }, 500);
   }
 
-  const { data: postData } = await userClient
+  // Service role: post owners' RLS would otherwise silently block commenters
+  // from bumping comment_count, leaving feed previews empty forever.
+  const { data: postData } = await supabaseAdmin
     .from("posts")
-    .select("comment_count")
+    .select("comment_count, user_id, content")
     .eq("id", id)
     .single();
 
   if (postData) {
-    await userClient
+    await supabaseAdmin
       .from("posts")
       .update({ comment_count: (postData.comment_count ?? 0) + 1 })
       .eq("id", id);
@@ -1374,17 +1373,43 @@ postsRouter.post("/:id/comments", async (c) => {
 
   // Notify the post owner (activity feed + push), never about their own comment.
   try {
-    const { data: postOwner } = await userClient.from("posts").select("user_id, content").eq("id", id).maybeSingle();
+    const postOwner = postData;
     if (postOwner && postOwner.user_id !== userId) {
       const snippet = halfLineSnippet((postOwner as { content?: string | null }).content);
-      const { data: inserted } = await supabaseAdmin.from("notifications").insert({
-        user_id: postOwner.user_id,
-        from_user_id: userId,
-        type: "comment",
-        message: "commented on your moment",
-        post_id: id,
-        read: false,
-      }).select("id").single();
+      let inserted: { id: string } | null = null;
+      {
+        const withComment = await supabaseAdmin
+          .from("notifications")
+          .insert({
+            user_id: postOwner.user_id,
+            from_user_id: userId,
+            type: "comment",
+            message: "commented on your moment",
+            post_id: id,
+            comment_id: comment.id,
+            read: false,
+          })
+          .select("id")
+          .single();
+        if (withComment.error && /comment_id|column/i.test(withComment.error.message ?? "")) {
+          // Column not migrated yet — still notify without deep-link id.
+          const fallback = await supabaseAdmin
+            .from("notifications")
+            .insert({
+              user_id: postOwner.user_id,
+              from_user_id: userId,
+              type: "comment",
+              message: "commented on your moment",
+              post_id: id,
+              read: false,
+            })
+            .select("id")
+            .single();
+          inserted = fallback.data;
+        } else {
+          inserted = withComment.data;
+        }
+      }
 
       void sendPushToUser(
         supabaseAdmin,
@@ -1395,6 +1420,7 @@ postsRouter.post("/:id/comments", async (c) => {
           : `${user.full_name} commented on your Moment`,
         {
           postId: id,
+          commentId: comment.id,
           type: "comment",
           fromUserId: userId,
           notificationId: inserted?.id,
@@ -1466,14 +1492,15 @@ postsRouter.delete("/:id/comments/:commentId", async (c) => {
     return c.json({ error: { message: "Failed to delete comment" } }, 500);
   }
 
-  const { data: postData } = await userClient
+  // Service role so non-owners (comment authors) can update the count under RLS.
+  const { data: postData } = await supabaseAdmin
     .from("posts")
     .select("comment_count")
     .eq("id", id)
     .single();
 
   if (postData) {
-    await userClient
+    await supabaseAdmin
       .from("posts")
       .update({ comment_count: Math.max((postData.comment_count ?? 1) - 1, 0) })
       .eq("id", id);

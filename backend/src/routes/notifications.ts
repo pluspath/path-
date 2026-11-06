@@ -301,6 +301,7 @@ notificationsRouter.get("/", async (c) => {
           : { id: "system", name: "Path+", username: "", avatar: "" },
       message: n.message,
       postId: momentId ?? undefined,
+      commentId: n.comment_id ?? undefined,
       // Media Moments → thumbnail. Text Moments → caption. Never both when media exists.
       postImage: (momentId && postImageMap[momentId]) || n.post_image || undefined,
       postSnippet:

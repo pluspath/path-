@@ -11,6 +11,11 @@ import {
   loadFriendshipStates,
   loadPeerByConversation,
 } from "../lib/message-requests";
+import {
+  claimPairConversation,
+  getPairConversationId,
+  setPairConversationId,
+} from "../lib/direct-pairs";
 import type { HonoVariables } from "../types";
 
 const conversationsRouter = new Hono<{ Variables: HonoVariables }>();
@@ -250,6 +255,96 @@ async function isBlockedWithPeer(
   return isBlocked(userId, peerId, db);
 }
 
+/**
+ * Find an exclusive 1:1 conversation between exactly these two users.
+ * Never returns a multi-party thread that merely happens to include both.
+ */
+async function findExclusiveDmId(
+  db: any,
+  userId: string,
+  targetId: string
+): Promise<string | null> {
+  // Fast path: registered pair (direct_conversation_pairs). Only trusted while
+  // the conversation is still a 2-person thread of exactly these users.
+  const pairedId = await getPairConversationId(userId, targetId, db);
+  if (pairedId) {
+    const { data: members } = await db
+      .from("conversation_participants")
+      .select("user_id")
+      .eq("conversation_id", pairedId);
+    const ids = new Set((members ?? []).map((m: any) => m.user_id as string));
+    if ((members ?? []).length === 2 && ids.has(userId) && ids.has(targetId)) return pairedId;
+  }
+
+  const all = await listExclusiveDmIds(db, userId, targetId);
+  const best = all[0]?.id ?? null;
+  if (best) void setPairConversationId(userId, targetId, best, db);
+  return best;
+}
+
+/**
+ * Every exclusive 1:1 conversation between exactly these two users, newest
+ * (updated_at) first. Usually one; more only when legacy duplicates exist.
+ */
+async function listExclusiveDmIds(
+  db: any,
+  userId: string,
+  targetId: string
+): Promise<{ id: string; updatedAt: number }[]> {
+  const { data: myParticipations } = await db
+    .from("conversation_participants")
+    .select("conversation_id")
+    .eq("user_id", userId);
+  const myConvIds = (myParticipations ?? []).map((p: any) => p.conversation_id as string);
+  if (myConvIds.length === 0) return [];
+
+  const candidates: string[] = [];
+  const chunkSize = 100;
+  for (let i = 0; i < myConvIds.length; i += chunkSize) {
+    const chunk = myConvIds.slice(i, i + chunkSize);
+    const { data: shared } = await db
+      .from("conversation_participants")
+      .select("conversation_id")
+      .eq("user_id", targetId)
+      .in("conversation_id", chunk);
+    for (const row of shared ?? []) {
+      if (row.conversation_id) candidates.push(row.conversation_id);
+    }
+  }
+  if (candidates.length === 0) return [];
+
+  const unique = Array.from(new Set(candidates));
+  const found: { id: string; updatedAt: number }[] = [];
+  for (let i = 0; i < unique.length; i += chunkSize) {
+    const chunk = unique.slice(i, i + chunkSize);
+    const [{ data: parts }, { data: convs }] = await Promise.all([
+      db
+        .from("conversation_participants")
+        .select("conversation_id, user_id")
+        .in("conversation_id", chunk),
+      db.from("conversations").select("id, updated_at").in("id", chunk),
+    ]);
+    const byConv: Record<string, string[]> = {};
+    for (const row of parts ?? []) {
+      const list = byConv[row.conversation_id] ?? (byConv[row.conversation_id] = []);
+      list.push(row.user_id);
+    }
+    const updatedAt: Record<string, number> = {};
+    for (const c of convs ?? []) {
+      updatedAt[c.id] = new Date(c.updated_at ?? 0).getTime();
+    }
+    for (const convId of chunk) {
+      const members = byConv[convId] ?? [];
+      if (members.length !== 2) continue;
+      const set = new Set(members);
+      if (!set.has(userId) || !set.has(targetId)) continue;
+      found.push({ id: convId, updatedAt: updatedAt[convId] ?? 0 });
+    }
+  }
+  found.sort((a, b) => b.updatedAt - a.updatedAt);
+  return found;
+}
+
 conversationsRouter.get("/", async (c) => {
   // Auth is JWT-derived userId (set only after supabase.auth.getUser succeeds).
   const userId = c.get("userId");
@@ -303,8 +398,11 @@ conversationsRouter.get("/", async (c) => {
     ]);
 
     const otherUserIdByConv: Record<string, string> = {};
+    // Number of non-viewer participants — exactly 1 means an exclusive 1:1 DM.
+    const otherCountByConv: Record<string, number> = {};
     for (const p of allParticipants ?? []) {
       if (!otherUserIdByConv[p.conversation_id]) otherUserIdByConv[p.conversation_id] = p.user_id;
+      otherCountByConv[p.conversation_id] = (otherCountByConv[p.conversation_id] ?? 0) + 1;
     }
 
     const blockedSet = new Set(blockedIds);
@@ -372,7 +470,7 @@ conversationsRouter.get("/", async (c) => {
 
     // Only conversations with at least one message belong in the Chats list.
     // Opening Message without sending must not create a visible empty row.
-    const result = visibleConversations
+    let result: any[] = visibleConversations
       .map((conv: any) => {
         const otherUserId = otherUserIdByConv[conv.id];
         const lastMsg = lastMsgByConv[conv.id];
@@ -394,12 +492,51 @@ conversationsRouter.get("/", async (c) => {
           friendshipStatus: friendship?.status ?? "none",
           friendshipId: friendship?.friendshipId ?? null,
           messages: [],
+          // Internal (stripped below) — used to collapse duplicate 1:1 threads.
+          _peerId: otherCountByConv[conv.id] === 1 ? otherUserId : null,
         };
       })
-      .filter(Boolean)
+      .filter(Boolean) as any[];
+
+    // One row per peer for exclusive 1:1 DMs: when legacy duplicates exist keep
+    // the newest thread and fold unread/pin state into it. No messages are deleted.
+    const dmGroups = new Map<string, any[]>();
+    const deduped: any[] = [];
+    for (const row of result) {
+      if (row._peerId) {
+        const list = dmGroups.get(row._peerId) ?? [];
+        list.push(row);
+        dmGroups.set(row._peerId, list);
+      } else {
+        deduped.push(row);
+      }
+    }
+    for (const [peerId, list] of dmGroups) {
+      if (list.length === 1) {
+        deduped.push(list[0]);
+        continue;
+      }
+      list.sort(
+        (a, b) => new Date(b.lastMessageTime).getTime() - new Date(a.lastMessageTime).getTime()
+      );
+      const keep = list[0];
+      keep.unreadCount = list.reduce((sum, r) => sum + (r.unreadCount ?? 0), 0);
+      const pinned = list.filter((r) => r.isPinned && r.pinnedAt);
+      if (pinned.length > 0) {
+        pinned.sort((a, b) => new Date(b.pinnedAt).getTime() - new Date(a.pinnedAt).getTime());
+        keep.isPinned = true;
+        keep.pinnedAt = pinned[0].pinnedAt;
+      }
+      // Make /start resolve to the same thread the inbox shows.
+      void setPairConversationId(userId, peerId, keep.id, db);
+      deduped.push(keep);
+    }
+
+    result = deduped
+      .map(({ _peerId: _omit, ...row }: any) => row)
       .filter((row: any) =>
         bucket === "all" ? true : bucket === "requests" ? row.isMessageRequest : !row.isMessageRequest
-      ) as any[];
+      );
 
     // Pinned chats stay at the top; within each group sort by latest activity.
     result.sort((a, b) => {
@@ -428,24 +565,9 @@ conversationsRouter.get("/with/:userId", async (c) => {
     return c.json({ error: { message: "Unable to message this user" } }, 403);
   }
 
-  const { data: myParticipations } = await db
-    .from("conversation_participants")
-    .select("conversation_id")
-    .eq("user_id", userId);
-  const myConvIds = (myParticipations ?? []).map((p: any) => p.conversation_id);
-  if (myConvIds.length === 0) return c.json({ data: null });
+  const existingConvId = await findExclusiveDmId(db, userId, targetId);
+  if (!existingConvId) return c.json({ data: null });
 
-  const { data: sharedConv } = await db
-    .from("conversation_participants")
-    .select("conversation_id")
-    .eq("user_id", targetId)
-    .in("conversation_id", myConvIds)
-    .limit(1)
-    .maybeSingle();
-
-  if (!sharedConv?.conversation_id) return c.json({ data: null });
-
-  const existingConvId = sharedConv.conversation_id as string;
   const { data: targetProfile } = await db.from("profiles").select("*").eq("id", targetId).maybeSingle();
   const { data: msgs } = await db
     .from("messages")
@@ -1002,6 +1124,27 @@ conversationsRouter.post("/:id/read", async (c) => {
 
   if (error) return c.json({ error: { message: "Failed to mark read" } }, 500);
 
+  // The inbox folds legacy duplicate 1:1 threads into one row (unread summed),
+  // so reading it must also clear the hidden duplicates with the same peer.
+  try {
+    const peers = await loadPeerByConversation(userId, [id], db);
+    const peerId = peers[id];
+    if (peerId) {
+      const exclusive = (await listExclusiveDmIds(db, userId, peerId)).map((s) => s.id);
+      // Only when this thread is itself an exclusive DM (never for group chats).
+      const siblings = exclusive.includes(id) ? exclusive.filter((sid) => sid !== id) : [];
+      if (siblings.length > 0 && siblings.length < 50) {
+        await db
+          .from("conversation_participants")
+          .update({ last_read_at: new Date().toISOString() })
+          .in("conversation_id", siblings)
+          .eq("user_id", userId);
+      }
+    }
+  } catch (e) {
+    console.warn("[conversations] sibling read failed:", e instanceof Error ? e.message : e);
+  }
+
   return c.json({ data: { ok: true } });
 });
 
@@ -1265,39 +1408,25 @@ conversationsRouter.post("/start/:userId", async (c) => {
     return c.json({ error: { message: "Unable to message this user" } }, 403);
   }
 
-  // Check for existing 1-on-1 conversation between these two users
-  const { data: myParticipations } = await db
-    .from("conversation_participants")
-    .select("conversation_id")
-    .eq("user_id", userId);
-
-  const myConvIds = (myParticipations ?? []).map((p: any) => p.conversation_id);
-  console.log(`[conversations/start] myConvIds count=${myConvIds.length}`);
-
-  let existingConvId: string | null = null;
-  if (myConvIds.length > 0) {
-    const { data: sharedConv } = await db
-      .from("conversation_participants")
-      .select("conversation_id")
-      .eq("user_id", targetId)
-      .in("conversation_id", myConvIds)
-      .limit(1)
-      .maybeSingle();
-    existingConvId = sharedConv?.conversation_id ?? null;
-  }
+  // Exclusive 1:1 only — never reuse a multi-party conversation that happens
+  // to include both users.
+  const existingConvId = await findExclusiveDmId(db, userId, targetId);
+  console.log(
+    `[conversations/start] exclusive match=${existingConvId ?? "none"}`
+  );
 
   if (existingConvId) {
     console.log(`[conversations/start] existing conv found: ${existingConvId}`);
-    // Repair: ensure BOTH participants are present (fixes "only recipient can open").
+    // Repair only when a participant row is missing on a confirmed 2-person DM.
     const { data: parts } = await db
       .from("conversation_participants")
       .select("user_id")
       .eq("conversation_id", existingConvId);
     const present = new Set((parts ?? []).map((p: any) => p.user_id));
-    if (!present.has(userId)) {
+    if (present.size <= 2 && !present.has(userId)) {
       await db.from("conversation_participants").insert({ conversation_id: existingConvId, user_id: userId });
     }
-    if (!present.has(targetId)) {
+    if (present.size <= 2 && !present.has(targetId)) {
       await db.from("conversation_participants").insert({ conversation_id: existingConvId, user_id: targetId });
     }
 
@@ -1364,6 +1493,46 @@ conversationsRouter.post("/start/:userId", async (c) => {
     await db.from("conversation_participants").delete().eq("conversation_id", newConv.id);
     await db.from("conversations").delete().eq("id", newConv.id);
     return c.json({ error: { message: "Failed to create conversation" } }, 500);
+  }
+
+  // Register the pair. If a concurrent request already created the DM, discard
+  // this brand-new (message-less) thread and return the registered one instead.
+  let ownerId = await claimPairConversation(userId, targetId, newConv.id, db);
+  if (ownerId !== newConv.id) {
+    // Guard against a stale pointer (e.g. participants removed): only yield to a
+    // registered thread that is still a 2-person DM of exactly these users.
+    const { data: ownerMembers } = await db
+      .from("conversation_participants")
+      .select("user_id")
+      .eq("conversation_id", ownerId);
+    const memberIds = new Set((ownerMembers ?? []).map((m: any) => m.user_id as string));
+    const ownerValid = (ownerMembers ?? []).length === 2 && memberIds.has(userId) && memberIds.has(targetId);
+    if (!ownerValid) {
+      await setPairConversationId(userId, targetId, newConv.id, db);
+      ownerId = newConv.id;
+    }
+  }
+  if (ownerId !== newConv.id) {
+    console.log(`[conversations/start] lost pair race; using ${ownerId}, dropping ${newConv.id}`);
+    await db.from("conversation_participants").delete().eq("conversation_id", newConv.id);
+    await db.from("conversations").delete().eq("id", newConv.id);
+    await db
+      .from("conversation_participants")
+      .update({ hidden_at: null })
+      .eq("conversation_id", ownerId)
+      .eq("user_id", userId);
+    const { data: ownerConv } = await db.from("conversations").select("*").eq("id", ownerId).maybeSingle();
+    const { data: ownerProfile } = await db.from("profiles").select("*").eq("id", targetId).single();
+    return c.json({
+      data: {
+        id: ownerId,
+        user: ownerProfile ? formatProfile(ownerProfile) : emptyUser(targetId),
+        lastMessage: "",
+        lastMessageTime: ownerConv?.updated_at ?? new Date().toISOString(),
+        unreadCount: 0,
+        messages: [],
+      },
+    });
   }
 
   const { data: targetProfile } = await db.from("profiles").select("*").eq("id", targetId).single();

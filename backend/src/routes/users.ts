@@ -12,6 +12,7 @@ import { parseLimit, parseCursor } from "../lib/pagination";
 import { fetchNewestMomentBatch } from "../lib/moment-feed";
 import { walkNewestPage } from "../lib/moment-order";
 import { attachOriginals, loadPostsByIds } from "../lib/load-posts";
+import { attachCommentPreviews, formatPreviewComments } from "../lib/comment-previews";
 import { ensureUserHasUsername } from "../lib/username-backfill";
 import { refreshAuthProfileCache } from "../lib/auth-profile-cache";
 import { profilePatchTriesToSetVerification } from "../lib/verification";
@@ -457,6 +458,8 @@ export function formatPost(p: any, viewerId?: string, blockedIds: string[] = [])
     reactionCount: Array.isArray(p.reactions) ? p.reactions.length : 0,
     reactions: formatReactions(p.reactions ?? [], viewerId, p.user_id, blockedIds),
     commentCount: p.comment_count ?? 0,
+    // Latest (up to 2) comments for feed cards; same shape as GET comments items.
+    previewComments: formatPreviewComments(p),
     createdAt: p.created_at,
     // Reshare ("Repath"): `repath_of` is the original moment id (absent until the
     // column exists). `original` is the nested original row, attached by the
@@ -1515,6 +1518,8 @@ usersRouter.get("/:id/posts", async (c) => {
     console.error("[users/posts] hydrate failed:", e instanceof Error ? e.message : e);
     return c.json({ error: { message: "Failed to load moments" } }, 500);
   }
+
+  await attachCommentPreviews(ordered, userId ?? undefined, blockedIds);
 
   const formatted = ordered.map((p) => formatPost(p, userId ?? undefined, blockedIds));
   await refreshFriendshipAvatars(formatted);
