@@ -438,13 +438,10 @@ conversationsRouter.get("/", async (c) => {
         .in("conversation_id", visibleIds)
         .order("created_at", { ascending: false })
         .limit(msgLimit),
+      // select("*") so is_verified always arrives — same as chat GET /:id.
+      // Inbox rows must expose verified the same way an open chat header does.
       otherUserIds.length > 0
-        ? db
-            .from("profiles")
-            .select(
-              "id, full_name, username, avatar_url, gender, bio, location, birthday, cover_url, created_at, is_verified"
-            )
-            .in("id", otherUserIds)
+        ? db.from("profiles").select("*").in("id", otherUserIds)
         : Promise.resolve({ data: [] as any[], error: null as any }),
       computeUnreadCounts(
         db,
@@ -457,19 +454,31 @@ conversationsRouter.get("/", async (c) => {
     ]);
 
     let profiles = profilesResult.data;
-    // If is_verified isn't selectable yet, still return names/avatars (badge stays false).
-    if (profilesResult.error && /is_verified|column/i.test(profilesResult.error.message ?? "")) {
-      console.warn("[conversations] is_verified select failed, retrying without it:", profilesResult.error.message);
+    if (profilesResult.error) {
+      console.warn("[conversations] profiles load failed:", profilesResult.error.message);
       const fallback = await db
         .from("profiles")
-        .select("id, full_name, username, avatar_url, gender, bio, location, birthday, cover_url, created_at")
+        .select(
+          "id, full_name, username, avatar_url, gender, bio, location, birthday, cover_url, created_at, is_verified"
+        )
         .in("id", otherUserIds);
-      profiles = fallback.data;
-    } else if (profilesResult.error) {
-      console.warn("[conversations] profiles load failed:", profilesResult.error.message);
+      if (fallback.error && /is_verified|column/i.test(fallback.error.message ?? "")) {
+        const bare = await db
+          .from("profiles")
+          .select("id, full_name, username, avatar_url, gender, bio, location, birthday, cover_url, created_at")
+          .in("id", otherUserIds);
+        profiles = bare.data;
+      } else {
+        profiles = fallback.data;
+      }
     }
     const profilesById: Record<string, any> = {};
-    for (const p of profiles ?? []) profilesById[p.id] = formatProfile(p);
+    for (const p of profiles ?? []) {
+      const formatted = formatProfile(p);
+      // Always emit a boolean so clients never miss the inbox seal.
+      formatted.verified = p?.is_verified === true;
+      profilesById[p.id] = formatted;
+    }
 
     const lastMsgByConv: Record<string, any> = {};
     for (const m of lastMsgsResult.data ?? []) {
@@ -787,8 +796,15 @@ conversationsRouter.get("/:id", async (c) => {
     }, undefined as any) ?? null;
 
   // Batch 2: profile (+ unread metadata for the initial newest-page open).
+  // Explicit is_verified so chat headers always receive the public badge flag.
   const profilePromise = otherUserId
-    ? db.from("profiles").select("*").eq("id", otherUserId).single()
+    ? db
+        .from("profiles")
+        .select(
+          "id, full_name, username, avatar_url, gender, bio, location, birthday, cover_url, created_at, is_verified"
+        )
+        .eq("id", otherUserId)
+        .single()
     : Promise.resolve({ data: null });
 
   let msgPage: MsgPage;

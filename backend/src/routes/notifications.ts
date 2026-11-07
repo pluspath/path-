@@ -208,7 +208,10 @@ notificationsRouter.get("/", async (c) => {
   const fromUserIds = [...new Set(page.map((n: any) => actorIdOf(n)).filter(Boolean))];
   let profileMap: Record<string, any> = {};
   if (fromUserIds.length > 0) {
-    const { data: profiles } = await supabaseAdmin.from("profiles").select("*").in("id", fromUserIds as string[]);
+    const { data: profiles } = await supabaseAdmin
+      .from("profiles")
+      .select("id, full_name, username, avatar_url, gender, bio, location, is_verified")
+      .in("id", fromUserIds as string[]);
     for (const p of profiles ?? []) profileMap[p.id] = p;
   }
 
@@ -295,10 +298,11 @@ notificationsRouter.get("/", async (c) => {
               name: "",
               username: "",
               avatar: defaultAvatarForGender(actorId),
+              verified: false,
               bio: "",
               location: "",
             }
-          : { id: "system", name: "Path+", username: "", avatar: "" },
+          : { id: "system", name: "Path+", username: "", avatar: "", verified: false },
       message: n.message,
       postId: momentId ?? undefined,
       commentId: n.comment_id ?? undefined,
