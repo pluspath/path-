@@ -16,6 +16,7 @@ import {
   getPairConversationId,
   setPairConversationId,
 } from "../lib/direct-pairs";
+import { publicVerificationStatus } from "../lib/verification";
 import type { HonoVariables } from "../types";
 
 const conversationsRouter = new Hono<{ Variables: HonoVariables }>();
@@ -58,12 +59,16 @@ async function computeUnreadCounts(
 }
 
 function formatProfile(p: any) {
+  const username = String(p.username ?? "").trim();
+  const name = String(p.full_name ?? p.name ?? "").trim() || username;
   return {
     id: p.id,
-    name: p.full_name ?? "",
-    username: p.username ?? "",
+    name,
+    username,
     avatar: resolveAvatarUrl(p.id, p.avatar_url, p.gender),
-    verified: p.is_verified === true,
+    gender: p.gender ?? "",
+    // Messages / chat rows must carry the same public badge flag as friends & posts.
+    ...publicVerificationStatus(p),
     bio: p.bio ?? "",
     location: p.location ?? "",
     birthday: p.birthday ?? "",
@@ -233,6 +238,8 @@ const emptyUser = (id = "unknown") => ({
   name: "Unknown",
   avatar: "",
   username: "",
+  gender: "",
+  verified: false,
   bio: "",
   location: "",
   birthday: "",
@@ -435,10 +442,10 @@ conversationsRouter.get("/", async (c) => {
         ? db
             .from("profiles")
             .select(
-              "id, full_name, username, avatar_url, gender, bio, location, birthday, cover_url, created_at"
+              "id, full_name, username, avatar_url, gender, bio, location, birthday, cover_url, created_at, is_verified"
             )
             .in("id", otherUserIds)
-        : Promise.resolve({ data: [] as any[] }),
+        : Promise.resolve({ data: [] as any[], error: null as any }),
       computeUnreadCounts(
         db,
         userId,
@@ -449,7 +456,18 @@ conversationsRouter.get("/", async (c) => {
       ),
     ]);
 
-    const profiles = profilesResult.data;
+    let profiles = profilesResult.data;
+    // If is_verified isn't selectable yet, still return names/avatars (badge stays false).
+    if (profilesResult.error && /is_verified|column/i.test(profilesResult.error.message ?? "")) {
+      console.warn("[conversations] is_verified select failed, retrying without it:", profilesResult.error.message);
+      const fallback = await db
+        .from("profiles")
+        .select("id, full_name, username, avatar_url, gender, bio, location, birthday, cover_url, created_at")
+        .in("id", otherUserIds);
+      profiles = fallback.data;
+    } else if (profilesResult.error) {
+      console.warn("[conversations] profiles load failed:", profilesResult.error.message);
+    }
     const profilesById: Record<string, any> = {};
     for (const p of profiles ?? []) profilesById[p.id] = formatProfile(p);
 

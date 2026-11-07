@@ -1,8 +1,8 @@
 import { supabaseAdmin } from "../supabase";
 import { resolveAvatarUrl } from "./avatar";
 
-/** Max preview comments attached to each feed moment. */
-export const COMMENT_PREVIEW_LIMIT = 2;
+/** Max preview comments attached to each feed moment (newest one under the card). */
+export const COMMENT_PREVIEW_LIMIT = 1;
 
 /** Author payload for comment list / create / edit / preview responses. */
 export function formatCommentUser(userId: string, profile: any) {
@@ -28,7 +28,7 @@ export function formatCommentRow(comment: any) {
 }
 
 /**
- * Attach the newest {@link COMMENT_PREVIEW_LIMIT} comments (shown oldest → newest)
+ * Attach the newest {@link COMMENT_PREVIEW_LIMIT} comment(s)
  * to every post in `posts` as `preview_comments`, already formatted for the API.
  * Uses ONE query for the whole page (no N+1). Also covers nested `original`
  * posts (repaths).
