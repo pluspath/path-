@@ -27,11 +27,46 @@ export function formatCommentRow(comment: any) {
   };
 }
 
+const PREVIEW_SELECT =
+  "id, post_id, user_id, content, created_at, profiles:user_id(id, full_name, username, avatar_url, gender, is_verified)";
+
+/**
+ * Load the newest preview comment(s) for one post.
+ * Per-post queries avoid a hot post starving the rest of the page.
+ */
+async function fetchNewestForPost(
+  postId: string,
+  viewerId: string,
+  blocked: Set<string>,
+  fetchLimit: number
+): Promise<any[]> {
+  const { data, error } = await supabaseAdmin
+    .from("comments")
+    .select(PREVIEW_SELECT)
+    .eq("post_id", postId)
+    .order("created_at", { ascending: false })
+    .limit(fetchLimit);
+
+  if (error) {
+    console.warn("[comment-previews] post query failed:", postId, error.message);
+    return [];
+  }
+
+  const kept: any[] = [];
+  for (const row of data ?? []) {
+    if (!row?.post_id || !row.user_id) continue;
+    if (row.user_id !== viewerId && blocked.has(row.user_id)) continue;
+    kept.push(row);
+    if (kept.length >= COMMENT_PREVIEW_LIMIT) break;
+  }
+  return kept;
+}
+
 /**
  * Attach the newest {@link COMMENT_PREVIEW_LIMIT} comment(s)
  * to every post in `posts` as `preview_comments`, already formatted for the API.
- * Uses ONE query for the whole page (no N+1). Also covers nested `original`
- * posts (repaths).
+ * Loads newest-per-post in parallel so each moment gets its own latest comment.
+ * Also covers nested `original` posts (repaths).
  *
  * Never throws — previews are best-effort and must not break the feed.
  */
@@ -56,34 +91,23 @@ export async function attachCommentPreviews(
     if (ids.length === 0 || !viewerId) return;
 
     const blocked = new Set(blockedIds);
-    // comment_count can drift, so it is not used to skip posts. Cap the single
-    // query: enough headroom per post for blocked authors, bounded overall.
-    const perPost = COMMENT_PREVIEW_LIMIT + (blocked.size > 0 ? 8 : 0) + 10;
-    const rowCap = Math.min(ids.length * perPost, 1500);
+    // Extra rows so blocked authors can be skipped without leaving the preview empty.
+    const fetchLimit = COMMENT_PREVIEW_LIMIT + (blocked.size > 0 ? 12 : 0);
 
-    const { data, error } = await supabaseAdmin
-      .from("comments")
-      .select(
-        "id, post_id, user_id, content, created_at, profiles:user_id(id, full_name, username, avatar_url, gender, is_verified)"
-      )
-      .in("post_id", ids)
-      .order("created_at", { ascending: false })
-      .limit(rowCap);
-
-    if (error) {
-      console.warn("[comment-previews] query failed:", error.message);
-      return;
-    }
-
-    // Rows arrive newest-first; keep the newest N per post.
     const byPost = new Map<string, any[]>();
-    for (const row of data ?? []) {
-      if (!row?.post_id || !row.user_id) continue;
-      if (row.user_id !== viewerId && blocked.has(row.user_id)) continue;
-      const list = byPost.get(row.post_id) ?? [];
-      if (list.length >= COMMENT_PREVIEW_LIMIT) continue;
-      list.push(row);
-      byPost.set(row.post_id, list);
+    // Bound concurrency so a large page does not open dozens of sockets at once.
+    const CONCURRENCY = 8;
+    for (let i = 0; i < ids.length; i += CONCURRENCY) {
+      const slice = ids.slice(i, i + CONCURRENCY);
+      const results = await Promise.all(
+        slice.map(async (postId) => {
+          const rows = await fetchNewestForPost(postId, viewerId, blocked, fetchLimit);
+          return [postId, rows] as const;
+        })
+      );
+      for (const [postId, rows] of results) {
+        if (rows.length) byPost.set(postId, rows);
+      }
     }
 
     for (const p of targets) {

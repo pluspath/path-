@@ -364,22 +364,23 @@ friendsRouter.get("/", async (c) => {
 
   const friendIds = (acceptedFriendships ?? [])
     .map((f: any) => (f.requester_id === userId ? f.receiver_id : f.requester_id))
-    .filter((id: string) => !blockedSet.has(id));
+    .filter((id: string) => !!id && id !== userId && !blockedSet.has(id));
 
   // Map each friend's id -> the friendship row id, so the client can unfriend.
   const friendshipIdByFriend: Record<string, string> = {};
   for (const f of acceptedFriendships ?? []) {
     const otherId = f.requester_id === userId ? f.receiver_id : f.requester_id;
+    if (!otherId || otherId === userId) continue;
     friendshipIdByFriend[otherId] = f.id;
   }
 
   const pendingRequesterIds = (pendingFriendships ?? [])
     .map((f: any) => f.requester_id)
-    .filter((id: string) => !blockedSet.has(id));
+    .filter((id: string) => !!id && id !== userId && !blockedSet.has(id));
 
   const pendingSentIds = (pendingSentFriendships ?? [])
     .map((f: any) => f.receiver_id)
-    .filter((id: string) => !blockedSet.has(id));
+    .filter((id: string) => !!id && id !== userId && !blockedSet.has(id));
 
   const friendshipIdByPendingSent: Record<string, string> = {};
   for (const f of pendingSentFriendships ?? []) {
@@ -582,13 +583,15 @@ friendsRouter.get("/discover", async (c) => {
   const blockedSet = new Set(blockedIds);
   const friendIds = (acceptedFriendshipsResult.data ?? [])
     .map((f: any) => (f.requester_id === userId ? f.receiver_id : f.requester_id))
-    .filter((id: string) => !blockedSet.has(id));
+    .filter((id: string) => !!id && id !== userId && !blockedSet.has(id));
   const pendingRequesterIds = (pendingFriendshipsResult.data ?? [])
     .map((f: any) => f.requester_id)
-    .filter((id: string) => !blockedSet.has(id));
+    .filter((id: string) => !!id && id !== userId && !blockedSet.has(id));
   const friendshipIdByPendingSent: Record<string, string> = {};
   for (const f of pendingSentResult.data ?? []) {
-    if (f?.receiver_id) friendshipIdByPendingSent[f.receiver_id] = f.id;
+    if (f?.receiver_id && f.receiver_id !== userId) {
+      friendshipIdByPendingSent[f.receiver_id] = f.id;
+    }
   }
   // Do not hide outgoing-pending recipients from discovery.
   const excludeIds = [userId, ...friendIds, ...pendingRequesterIds, ...blockedSet];

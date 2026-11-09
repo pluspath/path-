@@ -1447,12 +1447,9 @@ usersRouter.get("/:id/posts", async (c) => {
 
   const isFriend = isOwner ? true : userId ? await areFriends(userId, id) : false;
 
-  // Obsolete per-section post/moment visibility switches were removed from the
-  // app. Keep the default Path+ rule: owner + friends see the timeline; do not
-  // let stale DB flags hide content from friends.
-  if (!isOwner && !isFriend) {
-    return c.json({ error: { message: "Moments are only visible to friends" } }, 403);
-  }
+  // Non-friends may still see PUBLIC moments on this profile (even when the
+  // profile/friends list is private). Friends-only / close / private moments
+  // stay gated by passesAudience below — do not hard-403 the whole timeline.
 
   const limit = wantAll ? 500 : parseLimit(c.req.query("limit"), 20, 100);
   const cursor = parseCursor(c.req.query("cursor"));
