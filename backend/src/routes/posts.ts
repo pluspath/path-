@@ -28,6 +28,12 @@ import {
   encodeCursor,
   isOlderThanCursor,
 } from "../lib/pagination";
+import {
+  canViewerSeeMoment,
+  loadMomentVisibilityContext,
+  scrubInvisibleOriginals,
+  viewerCanAccessMoment,
+} from "../lib/moment-visibility";
 import type { HonoVariables } from "../types";
 
 const postsRouter = new Hono<{ Variables: HonoVariables }>();
@@ -155,8 +161,12 @@ postsRouter.get("/", async (c) => {
     return c.json({ error: { message: "Failed to load moments" } }, 500);
   }
 
-  // Latest 2 comments per moment in one batched query (before formatPost).
+  // Latest preview comment per moment in one batched query (before formatPost).
   await attachCommentPreviews(ordered, userId ?? undefined, blockedIds);
+  if (userId) {
+    const visCtx = await loadMomentVisibilityContext(userId);
+    scrubInvisibleOriginals(ordered, userId, visCtx);
+  }
 
   const formatted = ordered.map((p) => formatPost(p, userId ?? undefined, blockedIds));
   await refreshFriendshipAvatars(formatted); // always show friends' CURRENT avatars
@@ -513,9 +523,16 @@ postsRouter.get("/:id", async (c) => {
     }
   }
 
+  // Moment audience gate — independent of profile privacy.
+  const visCtx = userId ? await loadMomentVisibilityContext(userId) : null;
+  if (!userId || !visCtx || !canViewerSeeMoment(userId, post, visCtx)) {
+    return c.json({ error: { message: "Post not found" } }, 404);
+  }
+
   // Same preview selection as the feed (viewer-priority).
-  await attachCommentPreviews([post], userId ?? undefined, blockedIds);
-  const formatted = formatPost(post, userId ?? undefined, blockedIds);
+  await attachCommentPreviews([post], userId, blockedIds);
+  scrubInvisibleOriginals([post], userId, visCtx);
+  const formatted = formatPost(post, userId, blockedIds);
   await refreshReactionActors([formatted]);
   return c.json({ data: formatted });
 });
@@ -919,6 +936,16 @@ postsRouter.post("/:id/reactions", async (c) => {
   const { id } = c.req.param();
   const { type } = await c.req.json();
   const userClient = createUserClient(token);
+
+  const { data: targetMoment } = await supabaseAdmin
+    .from("posts")
+    .select("id, user_id, audience")
+    .eq("id", id)
+    .maybeSingle();
+  if (!targetMoment || !(await viewerCanAccessMoment(userId, targetMoment))) {
+    return c.json({ error: { message: "Post not found" } }, 404);
+  }
+
   // The client always sends a plain emoji; normalize defensively.
   const incoming = baseReactionType(type);
 
@@ -1060,6 +1087,15 @@ postsRouter.post("/:id/reactions/lock", async (c) => {
 
   const { id } = c.req.param();
 
+  const { data: lockTarget } = await supabaseAdmin
+    .from("posts")
+    .select("id, user_id, audience")
+    .eq("id", id)
+    .maybeSingle();
+  if (!lockTarget || !(await viewerCanAccessMoment(userId, lockTarget))) {
+    return c.json({ error: { message: "Post not found" } }, 404);
+  }
+
   const { data: existing } = await supabaseAdmin
     .from("reactions")
     .select("id, type")
@@ -1102,7 +1138,14 @@ postsRouter.post("/:id/view", async (c) => {
 
   const { id } = c.req.param();
 
-  const { data: ownerRow } = await supabaseAdmin.from("posts").select("user_id").eq("id", id).maybeSingle();
+  const { data: ownerRow } = await supabaseAdmin
+    .from("posts")
+    .select("user_id, audience")
+    .eq("id", id)
+    .maybeSingle();
+  if (!ownerRow || !(await viewerCanAccessMoment(userId, ownerRow))) {
+    return c.json({ error: { message: "Post not found" } }, 404);
+  }
   if (!ownerRow) return c.json({ error: { message: "Post not found" } }, 404);
   // The author seeing their own moment is not a "view".
   if (ownerRow.user_id === userId) return c.body(null, 204);
@@ -1239,6 +1282,9 @@ postsRouter.get("/:id/comments", async (c) => {
     .maybeSingle();
 
   if (!postRow) return c.json({ error: { message: "Post not found" } }, 404);
+  if (!(await viewerCanAccessMoment(userId, postRow))) {
+    return c.json({ error: { message: "Post not found" } }, 404);
+  }
 
   const whoStarredMe = userId ? await getWhoStarredMe(userId) : new Set<string>();
 
@@ -1334,10 +1380,13 @@ postsRouter.post("/:id/comments", async (c) => {
   // Service role so RLS can't hide the comments_disabled flag.
   const { data: targetPost } = await supabaseAdmin
     .from("posts")
-    .select("id, comments_disabled, user_id")
+    .select("id, comments_disabled, user_id, audience")
     .eq("id", id)
     .maybeSingle();
-  if (targetPost?.comments_disabled) {
+  if (!targetPost || !(await viewerCanAccessMoment(userId, targetPost))) {
+    return c.json({ error: { message: "Post not found" } }, 404);
+  }
+  if (targetPost.comments_disabled) {
     return c.json({ error: { message: "Comments are turned off for this moment" } }, 403);
   }
 

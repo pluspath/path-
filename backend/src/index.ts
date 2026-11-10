@@ -368,6 +368,34 @@ AS $$ SELECT id FROM auth.users WHERE lower(email) = lower(target_email) LIMIT 1
         "REVOKE ALL ON FUNCTION public.auth_user_id_by_email(text) FROM PUBLIC",
         "REVOKE ALL ON FUNCTION public.auth_user_id_by_email(text) FROM anon",
         "REVOKE ALL ON FUNCTION public.auth_user_id_by_email(text) FROM authenticated",
+        // Phase 4: never allow self-friendships / self-requests.
+        "DELETE FROM public.friendships WHERE requester_id IS NOT NULL AND receiver_id IS NOT NULL AND requester_id = receiver_id",
+        `DO $$ BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = 'friendships_no_self'
+              AND conrelid = 'public.friendships'::regclass
+          ) THEN
+            ALTER TABLE public.friendships
+              ADD CONSTRAINT friendships_no_self
+              CHECK (requester_id <> receiver_id);
+          END IF;
+        END $$`,
+        // Keep denormalized comment_count aligned with live comments (preview reliability).
+        `UPDATE public.posts AS p
+SET comment_count = sub.cnt
+FROM (
+  SELECT post_id, COUNT(*)::int AS cnt
+  FROM public.comments
+  GROUP BY post_id
+) AS sub
+WHERE p.id = sub.post_id
+  AND COALESCE(p.comment_count, 0) <> sub.cnt`,
+        `UPDATE public.posts AS p
+SET comment_count = 0
+WHERE COALESCE(p.comment_count, 0) > 0
+  AND NOT EXISTS (SELECT 1 FROM public.comments c WHERE c.post_id = p.id)`,
+        "CREATE INDEX IF NOT EXISTS idx_comments_post_id_created_at_desc ON public.comments (post_id, created_at DESC)",
       ];
       for (const sql of statements) {
         const { error } = await supabaseAdmin.rpc("exec_sql", { sql });

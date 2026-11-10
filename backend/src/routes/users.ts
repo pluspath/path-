@@ -508,7 +508,12 @@ usersRouter.get("/search", async (c) => {
 
   // Use service role so RLS never blanks discovery (same as /friends/discover).
   // Fetch limit+1 to detect hasMore (after block/deletion filters we may drop some).
-  let profileQuery = supabaseAdmin.from("profiles").select("*").range(offset, offset + limit);
+  // Never include the authenticated user in people search.
+  let profileQuery = supabaseAdmin
+    .from("profiles")
+    .select("*")
+    .neq("id", userId)
+    .range(offset, offset + limit);
   if (usernameMode) {
     profileQuery = profileQuery.ilike("username", `${q}%`);
   } else {

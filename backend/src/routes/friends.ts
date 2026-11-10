@@ -205,6 +205,7 @@ async function loadDiscoverProfiles(
   offset: number,
   limit: number
 ): Promise<{ rows: any[]; error: any | null }> {
+  // Defensive: caller should always pass the viewer id; keep a second filter below.
   const exclude = notInList(excludeIds);
 
   // Deterministic order: newest first, id as stable tie-breaker.
@@ -217,7 +218,13 @@ async function loadDiscoverProfiles(
     .order("id", { ascending: true })
     .range(offset, offset + limit - 1);
 
-  if (!error) return { rows: data ?? [], error: null };
+  if (!error) {
+    const excluded = new Set(excludeIds);
+    return {
+      rows: (data ?? []).filter((p: any) => p?.id && !excluded.has(p.id)),
+      error: null,
+    };
+  }
 
   console.warn("[friends/discover] not.in filter failed, falling back:", error.message);
 
@@ -456,7 +463,7 @@ friendsRouter.get("/", async (c) => {
     .filter((r: any) => r.user && !isDeletionHiddenProfile(profileMap[r.user.id] ?? null));
 
   const suggested = (suggestedLoad.rows ?? [])
-    .filter((r) => !isDeletionHiddenProfile(r.profile))
+    .filter((r) => r?.profile?.id && r.profile.id !== userId && !isDeletionHiddenProfile(r.profile))
     .map((r) => {
       const id = r.profile.id as string;
       const pendingId = friendshipIdByPendingSent[id];
@@ -610,7 +617,7 @@ friendsRouter.get("/discover", async (c) => {
   await enrichMissingIdentity(discoverMap);
 
   const users = (rows ?? [])
-    .filter((r) => !isDeletionHiddenProfile(r.profile))
+    .filter((r) => r?.profile?.id && r.profile.id !== userId && !isDeletionHiddenProfile(r.profile))
     .map((r) => {
       const id = r.profile.id as string;
       const pendingId = friendshipIdByPendingSent[id];
@@ -642,8 +649,13 @@ friendsRouter.post("/request/:userId", async (c) => {
   const token = c.get("accessToken");
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
-  const { userId: targetId } = c.req.param();
-  if (targetId === userId) return c.json({ error: { message: "Cannot friend yourself" } }, 400);
+  // Sender always comes from the authenticated session — never trust a body sender id.
+  const { userId: rawTargetId } = c.req.param();
+  const targetId = String(rawTargetId ?? "").trim();
+  if (!targetId) return c.json({ error: { message: "User not found" } }, 404);
+  if (targetId === userId) {
+    return c.json({ error: { message: "Cannot friend yourself" } }, 400);
+  }
 
   // Can't send a request to (or from) someone in a block relationship.
   if (await isBlocked(userId, targetId)) {
@@ -854,6 +866,9 @@ friendsRouter.get("/status/:userId", async (c) => {
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const { userId: targetId } = c.req.param();
+  if (!targetId || targetId === userId) {
+    return c.json({ data: { status: "none", friendshipId: null, mutualFriends: 0 } });
+  }
   const userClient = createUserClient(token);
 
   const { data: friendship } = await userClient

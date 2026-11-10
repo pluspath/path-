@@ -4,8 +4,14 @@ import { formatPost, refreshReactionActors } from "./users";
 import { sanitizeSearchQuery } from "../lib/auth-helpers";
 import { getBlockedIds } from "../lib/blocks";
 import { attachOriginals, hydrateReactionProfiles } from "../lib/load-posts";
+import { attachCommentPreviews } from "../lib/comment-previews";
 import { resolveAvatarUrl } from "../lib/avatar";
 import { env } from "../env";
+import {
+  canViewerSeeMoment,
+  loadMomentVisibilityContext,
+  scrubInvisibleOriginals,
+} from "../lib/moment-visibility";
 import type { HonoVariables } from "../types";
 
 const socialRouter = new Hono<{ Variables: HonoVariables }>();
@@ -42,16 +48,13 @@ socialRouter.get("/trending", async (c) => {
   for (const f of friendships ?? []) {
     friendIds.add(f.requester_id === userId ? f.receiver_id : f.requester_id);
   }
-  const blockedIdsSet = new Set(blockedIds);
+  const visCtx = await loadMomentVisibilityContext(userId);
+  // Prefer friendship set already loaded above (same source).
+  visCtx.friendIds = friendIds;
+  visCtx.blockedIds = new Set(blockedIds);
 
   const scored = (posts ?? [])
-    .filter((p: any) => {
-      if (blockedIdsSet.has(p.user_id)) return false;
-      if (p.user_id === userId) return true;
-      const visibility = p.profiles?.post_visibility === "everyone" ? "everyone" : "friends";
-      if (visibility === "everyone") return true;
-      return friendIds.has(p.user_id);
-    })
+    .filter((p: any) => canViewerSeeMoment(userId, p, visCtx))
     .map((p: any) => {
       const reactionScore = (p.reactions?.length ?? 0) * 3;
       const commentScore = (p.comment_count ?? 0) * 4;
@@ -64,8 +67,10 @@ socialRouter.get("/trending", async (c) => {
     .map(({ post }) => post);
 
   await attachOriginals(null, scored);
+  scrubInvisibleOriginals(scored, userId, visCtx);
   await hydrateReactionProfiles(scored);
-  const formatted = scored.map((post) => formatPost(post));
+  await attachCommentPreviews(scored, userId, blockedIds);
+  const formatted = scored.map((post) => formatPost(post, userId, blockedIds));
   await refreshReactionActors(formatted);
   return c.json({ data: formatted });
 });
@@ -105,7 +110,9 @@ socialRouter.get("/saved", async (c) => {
 
   const rawOrdered = postIds.map((id: string) => postMap[id]).filter(Boolean);
   await hydrateReactionProfiles(rawOrdered);
-  const ordered = rawOrdered.map((p: any) => ({ ...formatPost(p), isSaved: true }));
+  const blockedIds = await getBlockedIds(userId);
+  await attachCommentPreviews(rawOrdered, userId, blockedIds);
+  const ordered = rawOrdered.map((p: any) => ({ ...formatPost(p, userId, blockedIds), isSaved: true }));
   await refreshReactionActors(ordered);
 
   return c.json({ data: ordered });
@@ -198,6 +205,7 @@ socialRouter.get("/liked-moments", async (c) => {
 
   await attachOriginals(null, visible);
   await hydrateReactionProfiles(visible);
+  await attachCommentPreviews(visible, userId, blockedIds);
   const formatted = visible.map((p: any) => formatPost(p, userId, blockedIds));
   await refreshReactionActors(formatted);
 

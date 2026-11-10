@@ -5,6 +5,17 @@ import { newestPerPost, pickCommentPreview } from "./comment-preview-select";
 /** Max preview comments attached to each feed moment (exactly one under the card). */
 export const COMMENT_PREVIEW_LIMIT = 1;
 
+const BARE_SELECT = "id, post_id, user_id, content, created_at";
+
+const PREVIEW_SELECT =
+  "id, post_id, user_id, content, created_at, profiles:user_id(id, full_name, username, avatar_url, gender, is_verified)";
+
+/** How many newest comments to scan per Moment when picking overall latest (blocked skip). */
+const OVERALL_SCAN = 32;
+
+/** Parallel per-Moment fetches for Moments where the viewer has not commented. */
+const OVERALL_CONCURRENCY = 8;
+
 /** Author payload for comment list / create / edit / preview responses. */
 export function formatCommentUser(userId: string, profile: any) {
   const p = Array.isArray(profile) ? profile[0] : profile;
@@ -32,64 +43,89 @@ export function formatCommentRow(comment: any) {
   };
 }
 
-const PREVIEW_SELECT =
-  "id, post_id, user_id, content, created_at, profiles:user_id(id, full_name, username, avatar_url, gender, is_verified)";
+/** Load profiles for a set of user ids in one query and attach onto comment rows. */
+async function hydrateCommentProfiles(rows: any[]): Promise<void> {
+  const need = rows.filter((r) => r && !r.profiles && !r.user);
+  if (need.length === 0) return;
+
+  const userIds = Array.from(
+    new Set(
+      need
+        .map((r) => r?.user_id)
+        .filter((id): id is string => typeof id === "string" && id.length > 0),
+    ),
+  );
+  if (userIds.length === 0) return;
+
+  const { data: profiles, error } = await supabaseAdmin
+    .from("profiles")
+    .select("id, full_name, username, avatar_url, gender, is_verified")
+    .in("id", userIds);
+
+  if (error) {
+    console.warn("[comment-previews] profile hydrate failed:", error.message);
+    return;
+  }
+
+  const byId = new Map((profiles ?? []).map((p: any) => [p.id, p]));
+  for (const row of need) {
+    if (!row?.user_id) continue;
+    row.profiles = byId.get(row.user_id) ?? null;
+  }
+}
 
 /**
- * Load candidate comments for one post and pick the preview using viewer priority.
- * Extra rows let blocked authors be skipped without leaving the preview empty.
+ * Latest eligible comment for one Moment (viewer priority already handled by caller).
+ * Fetches a short newest window so blocked authors can be skipped without an empty preview.
  */
-async function fetchCommentRowsForPost(postId: string, fetchLimit: number): Promise<any[]> {
-  const withProfiles = await supabaseAdmin
+async function fetchOverallPreviewForPost(
+  postId: string,
+  viewerId: string,
+  blocked: Set<string>,
+): Promise<any | null> {
+  const { data, error } = await supabaseAdmin
     .from("comments")
     .select(PREVIEW_SELECT)
     .eq("post_id", postId)
     .order("created_at", { ascending: false })
-    .limit(fetchLimit);
+    .order("id", { ascending: false })
+    .limit(OVERALL_SCAN);
 
-  if (!withProfiles.error) return withProfiles.data ?? [];
-
-  // Fallback without embed if the profiles FK/select fails — still return the comment text.
-  console.warn(
-    "[comment-previews] post query with profiles failed:",
-    postId,
-    withProfiles.error.message,
-  );
-  const bare = await supabaseAdmin
-    .from("comments")
-    .select("id, post_id, user_id, content, created_at")
-    .eq("post_id", postId)
-    .order("created_at", { ascending: false })
-    .limit(fetchLimit);
-
-  if (bare.error) {
-    console.warn("[comment-previews] bare post query failed:", postId, bare.error.message);
-    return [];
+  if (error) {
+    console.warn("[comment-previews] post query failed:", postId, error.message);
+    // Bare fallback without embed if the profiles join fails.
+    const bare = await supabaseAdmin
+      .from("comments")
+      .select(BARE_SELECT)
+      .eq("post_id", postId)
+      .order("created_at", { ascending: false })
+      .order("id", { ascending: false })
+      .limit(OVERALL_SCAN);
+    if (bare.error) {
+      console.warn("[comment-previews] bare post query failed:", postId, bare.error.message);
+      return null;
+    }
+    return pickCommentPreview(bare.data ?? [], viewerId, blocked);
   }
-  return bare.data ?? [];
-}
 
-async function fetchPreviewForPost(
-  postId: string,
-  viewerId: string,
-  blocked: Set<string>,
-  fetchLimit: number,
-): Promise<any | null> {
-  const data = await fetchCommentRowsForPost(postId, fetchLimit);
-  return pickCommentPreview(data, viewerId, blocked);
+  return pickCommentPreview(data ?? [], viewerId, blocked);
 }
 
 /**
  * Attach exactly one selected preview comment to every post in `posts`
  * as `preview_comments` (formatted for the API).
  *
- * Selection (authenticated viewer from session):
+ * Selection (authenticated viewer from session — never from client body):
  * 1. Viewer's most recent comment on that Moment
  * 2. Else the latest overall comment (blocked authors skipped)
  * 3. Else none
  *
- * Strategy: one batch query for the viewer's comments across the page, then
- * per-post fetches only for Moments where the viewer has not commented.
+ * Strategy:
+ * - One batch query for the viewer's comments across the whole page
+ * - Concurrent per-Moment fetches only for Moments where the viewer has not commented
+ *   (avoids a single cross-post LIMIT that starves quieter Moments)
+ * - Does NOT depend on denormalized comment_count (historical counts can be stuck at 0)
+ *
  * Never throws — previews are best-effort and must not break the feed.
  */
 export async function attachCommentPreviews(
@@ -113,37 +149,49 @@ export async function attachCommentPreviews(
           .filter((id): id is string => typeof id === "string" && id.length > 0),
       ),
     );
-    // Same rule as the comments list endpoint: comments need an authenticated viewer.
     if (ids.length === 0 || !viewerId) return;
 
     const blocked = new Set(blockedIds);
     const byPost = new Map<string, any>();
 
-    // 1) Batch: viewer's newest comment per Moment on this page.
-    const { data: mineRows, error: mineError } = await supabaseAdmin
+    // ── Query 1: viewer's comments on this page (priority source) ──────────
+    const mineRes = await supabaseAdmin
       .from("comments")
       .select(PREVIEW_SELECT)
       .in("post_id", ids)
       .eq("user_id", viewerId)
-      .order("created_at", { ascending: false });
+      .order("created_at", { ascending: false })
+      .order("id", { ascending: false });
 
-    if (mineError) {
-      console.warn("[comment-previews] viewer batch failed:", mineError.message);
+    if (mineRes.error) {
+      console.warn("[comment-previews] viewer batch failed:", mineRes.error.message);
+      const bareMine = await supabaseAdmin
+        .from("comments")
+        .select(BARE_SELECT)
+        .in("post_id", ids)
+        .eq("user_id", viewerId)
+        .order("created_at", { ascending: false })
+        .order("id", { ascending: false });
+      if (!bareMine.error) {
+        for (const [postId, row] of newestPerPost(bareMine.data ?? [])) {
+          byPost.set(postId, row);
+        }
+      }
     } else {
-      for (const [postId, row] of newestPerPost(mineRows ?? [])) {
+      for (const [postId, row] of newestPerPost(mineRes.data ?? [])) {
         byPost.set(postId, row);
       }
     }
 
-    // 2) Moments without a viewer comment → latest overall (blocked skipped).
+    // ── Query 2: per-Moment latest overall for posts without a viewer comment ─
+    // Never skip based on comment_count — historical denormalized counts may be 0
+    // even when comments exist in the database.
     const needOverall = ids.filter((id) => !byPost.has(id));
-    const fetchLimit = COMMENT_PREVIEW_LIMIT + 24 + (blocked.size > 0 ? 12 : 0);
-    const CONCURRENCY = 8;
-    for (let i = 0; i < needOverall.length; i += CONCURRENCY) {
-      const slice = needOverall.slice(i, i + CONCURRENCY);
+    for (let i = 0; i < needOverall.length; i += OVERALL_CONCURRENCY) {
+      const slice = needOverall.slice(i, i + OVERALL_CONCURRENCY);
       const results = await Promise.all(
         slice.map(async (postId) => {
-          const picked = await fetchPreviewForPost(postId, viewerId, blocked, fetchLimit);
+          const picked = await fetchOverallPreviewForPost(postId, viewerId, blocked);
           return [postId, picked] as const;
         }),
       );
@@ -152,11 +200,16 @@ export async function attachCommentPreviews(
       }
     }
 
+    const pickedRows = Array.from(byPost.values());
+    if (pickedRows.length === 0) return;
+
+    await hydrateCommentProfiles(pickedRows);
+
     for (const p of targets) {
       const row = byPost.get(p.id);
       if (!row) continue;
       p.preview_comments = [formatCommentRow(row)];
-      // Keep feed "Read all N" honest when the stored counter lagged behind.
+      // Keep denormalized count at least consistent with a visible preview.
       p.comment_count = Math.max(Number(p.comment_count ?? 0) || 0, 1);
     }
   } catch (e) {
@@ -171,7 +224,11 @@ export function formatPreviewComments(p: any): any[] {
     : Array.isArray(p?.previewComments)
       ? p.previewComments
       : [];
-  return raw.map((c: any) =>
-    c && c.post_id !== undefined && c.createdAt === undefined ? formatCommentRow(c) : c,
-  );
+  return raw
+    .map((c: any) => {
+      if (!c) return null;
+      if (c.user && c.userId != null && c.createdAt != null && c.content != null) return c;
+      return formatCommentRow(c);
+    })
+    .filter(Boolean);
 }
