@@ -513,6 +513,8 @@ postsRouter.get("/:id", async (c) => {
     }
   }
 
+  // Same preview selection as the feed (viewer-priority).
+  await attachCommentPreviews([post], userId ?? undefined, blockedIds);
   const formatted = formatPost(post, userId ?? undefined, blockedIds);
   await refreshReactionActors([formatted]);
   return c.json({ data: formatted });

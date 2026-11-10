@@ -457,8 +457,16 @@ export function formatPost(p: any, viewerId?: string, blockedIds: string[] = [])
     // these, not reactions.length (locked likes are stripped for non-owners).
     reactionCount: Array.isArray(p.reactions) ? p.reactions.length : 0,
     reactions: formatReactions(p.reactions ?? [], viewerId, p.user_id, blockedIds),
-    commentCount: p.comment_count ?? 0,
-    // Latest (up to 2) comments for feed cards; same shape as GET comments items.
+    // Prefer stored count; never report 0 when a preview comment is attached.
+    commentCount: Math.max(
+      Number(p.comment_count ?? 0) || 0,
+      Array.isArray(p.preview_comments)
+        ? p.preview_comments.length
+        : Array.isArray(p.previewComments)
+          ? p.previewComments.length
+          : 0,
+    ),
+    // Selected preview comment for feed cards (viewer-priority on the server).
     previewComments: formatPreviewComments(p),
     createdAt: p.created_at,
     // Reshare ("Repath"): `repath_of` is the original moment id (absent until the
