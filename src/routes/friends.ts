@@ -1,23 +1,34 @@
+import { createHash } from "node:crypto";
 import { Hono } from "hono";
 import { createUserClient, supabaseAdmin } from "../supabase";
-import { sendPushNotification, getPushToken } from "../lib/push";
+import { sendPushToUser } from "../lib/push";
 import { ensureFriendshipMoments } from "../lib/systemMoments";
 import { getBlockedIds, isBlocked } from "../lib/blocks";
+import { resolveAvatarUrl } from "../lib/avatar";
+import { isDeletionHiddenProfile } from "../lib/account-deletion";
 import type { HonoVariables } from "../types";
 
 const friendsRouter = new Hono<{ Variables: HonoVariables }>();
 
-// Close friends ("starred" friends) are PRIVATE to the owner: a row in
-// `close_friends` means owner_id has starred friend_id. RLS restricts every
-// row to its owner, so the starred person is never notified and can't see it.
-// The table may not exist yet (the one-line SQL hasn't been run) — every read
-// here tolerates that and degrades to "no close friends".
+/** Accepted friends + outgoing pending requests count toward this cap. */
+const MAX_FRIENDS = 150;
+
+// Close friends ("starred" friends) are PRIVATE to the owner.
+// Schema drift: some DBs use `user_id`, others use `owner_id`. Support both.
 async function getCloseFriendIds(userClient: any, ownerId: string): Promise<Set<string>> {
   try {
-    const { data, error } = await userClient
+    let { data, error } = await userClient
       .from("close_friends")
       .select("friend_id")
-      .eq("owner_id", ownerId);
+      .eq("user_id", ownerId);
+
+    if (error && /owner_id|column|user_id/i.test(error.message ?? "")) {
+      ({ data, error } = await userClient
+        .from("close_friends")
+        .select("friend_id")
+        .eq("owner_id", ownerId));
+    }
+
     if (error || !data) return new Set();
     return new Set(data.map((r: any) => r.friend_id));
   } catch {
@@ -25,23 +36,346 @@ async function getCloseFriendIds(userClient: any, ownerId: string): Promise<Set<
   }
 }
 
+async function upsertCloseFriend(userClient: any, ownerId: string, friendId: string) {
+  // Prefer user_id (matches mobile + common production bootstrap).
+  let { error } = await userClient
+    .from("close_friends")
+    .upsert({ user_id: ownerId, friend_id: friendId }, { onConflict: "user_id,friend_id" });
+
+  if (!error) return null;
+
+  if (/owner_id|column|user_id|onConflict|conflict/i.test(error.message ?? "")) {
+    // Try owner_id schema, then plain inserts.
+    ({ error } = await userClient
+      .from("close_friends")
+      .upsert({ owner_id: ownerId, friend_id: friendId }, { onConflict: "owner_id,friend_id" }));
+    if (!error) return null;
+
+    ({ error } = await userClient
+      .from("close_friends")
+      .insert({ user_id: ownerId, friend_id: friendId }));
+    if (!error || /duplicate|unique/i.test(error.message ?? "")) return null;
+
+    ({ error } = await userClient
+      .from("close_friends")
+      .insert({ owner_id: ownerId, friend_id: friendId }));
+    if (!error || /duplicate|unique/i.test(error.message ?? "")) return null;
+  }
+
+  return error;
+}
+
+async function deleteCloseFriend(userClient: any, ownerId: string, friendId: string) {
+  await userClient.from("close_friends").delete().eq("user_id", ownerId).eq("friend_id", friendId);
+  await userClient.from("close_friends").delete().eq("owner_id", ownerId).eq("friend_id", friendId);
+}
+
 function formatProfile(p: any) {
+  const username = String(p.username ?? "").trim();
+  // Prefer display name; fall back to @username so list rows never look empty.
+  const name =
+    String(p.full_name ?? p.name ?? "").trim() ||
+    username;
   return {
     id: p.id,
-    name: p.full_name ?? "",
-    username: p.username ?? "",
-    avatar: p.avatar_url ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${p.id}`,
+    name,
+    username,
+    avatar: resolveAvatarUrl(p.id, p.avatar_url, p.gender),
+    verified: p.is_verified === true,
     bio: p.bio ?? "",
-    location: p.location ?? "",
+    location: String(p.location ?? "").trim(),
     // Raw birthday is private — never exposed in friend lists / suggestions.
     birthday: "",
     gender: p.gender ?? "",
     coverPhoto: p.cover_url ?? "https://images.unsplash.com/photo-1519638399535-1b036603ac77?w=800",
     joinDate: p.created_at ?? new Date().toISOString(),
-    friendCount: 0,
-    postCount: 0,
-    momentCount: 0,
+    // Omit count fields — zeros here poisoned friend-profile caches so visitors
+    // saw likeCount 0 instead of the real total from GET /api/:id(/stats).
   };
+}
+
+/** Load profiles in chunks via service role (avoids RLS gaps + PostgREST .in limits). */
+async function loadProfilesByIds(ids: string[]): Promise<Record<string, any>> {
+  const map: Record<string, any> = {};
+  const unique = Array.from(new Set(ids.filter(Boolean)));
+  for (const chunk of chunkIds(unique, 80)) {
+    const { data, error } = await supabaseAdmin.from("profiles").select("*").in("id", chunk);
+    if (error) {
+      console.warn("[friends] profile chunk failed:", error.message);
+      continue;
+    }
+    for (const p of data ?? []) map[p.id] = p;
+  }
+  return map;
+}
+
+/**
+ * Older / partial profile rows sometimes lack full_name or username even though
+ * auth metadata still has them. Fill blanks so friend lists show a real label.
+ */
+async function enrichMissingIdentity(profileMap: Record<string, any>): Promise<void> {
+  const need = Object.values(profileMap).filter((p: any) => {
+    const name = String(p?.full_name ?? p?.name ?? "").trim();
+    const username = String(p?.username ?? "").trim();
+    return !name || !username;
+  });
+  if (need.length === 0) return;
+
+  await Promise.all(
+    need.map(async (p: any) => {
+      try {
+        const { data: authData } = await supabaseAdmin.auth.admin.getUserById(p.id);
+        const meta = authData?.user?.user_metadata ?? {};
+        const metaName = String(meta.full_name ?? meta.name ?? "").trim();
+        const metaUsername = String(meta.username ?? "").trim();
+        if (!String(p.full_name ?? "").trim() && metaName) p.full_name = metaName;
+        if (!String(p.username ?? "").trim() && metaUsername) p.username = metaUsername;
+      } catch {
+        /* best-effort */
+      }
+    })
+  );
+}
+
+/** Build a PostgREST `not.in.(…)` value; quote UUIDs for safe parsing. */
+function notInList(ids: string[]): string {
+  const unique = Array.from(new Set(ids.filter(Boolean)));
+  if (unique.length === 0) return "()";
+  return `(${unique.map((id) => `"${id}"`).join(",")})`;
+}
+
+function chunkIds<T>(items: T[], size: number): T[][] {
+  if (items.length === 0) return [];
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
+/**
+ * Count how many of `myFriendIds` each non-excluded person shares as friends
+ * (friends-of-friends). Higher count = stronger mutual connection.
+ */
+// Discover pages (and GET /friends) all recompute the same friends-of-friends graph.
+// Cache the ranked counts briefly, keyed by the exact friend/exclude sets, so paging
+// through People does not re-run the heavy friendships fan-out for every offset.
+// The key changes automatically when the viewer's own friends/blocks/requests change.
+const MUTUAL_CACHE_TTL_MS = 60_000;
+const MUTUAL_CACHE_MAX = 300;
+const mutualCountCache = new Map<string, { counts: Map<string, number>; expires: number }>();
+const mutualCountInflight = new Map<string, Promise<Map<string, number>>>();
+
+function mutualCacheKey(myFriendIds: string[], excludeIds: string[]): string {
+  const h = createHash("sha1");
+  h.update([...new Set(myFriendIds)].sort().join(","));
+  h.update("|");
+  h.update([...new Set(excludeIds)].sort().join(","));
+  return h.digest("base64url");
+}
+
+async function buildMutualFriendCounts(
+  myFriendIds: string[],
+  excludeIds: string[]
+): Promise<Map<string, number>> {
+  if (myFriendIds.length === 0) return new Map<string, number>();
+
+  const key = mutualCacheKey(myFriendIds, excludeIds);
+  const now = Date.now();
+  const hit = mutualCountCache.get(key);
+  if (hit && hit.expires > now) return hit.counts;
+  const inflight = mutualCountInflight.get(key);
+  if (inflight) return inflight;
+
+  const run = computeMutualFriendCounts(myFriendIds, excludeIds)
+    .then(({ counts, complete }) => {
+      // Never cache a partial result produced by a failed query.
+      if (complete) {
+        if (mutualCountCache.size >= MUTUAL_CACHE_MAX) {
+          for (const [k, v] of mutualCountCache) {
+            if (v.expires <= Date.now()) mutualCountCache.delete(k);
+          }
+          if (mutualCountCache.size >= MUTUAL_CACHE_MAX) {
+            const oldest = mutualCountCache.keys().next().value;
+            if (oldest) mutualCountCache.delete(oldest);
+          }
+        }
+        mutualCountCache.set(key, { counts, expires: Date.now() + MUTUAL_CACHE_TTL_MS });
+      }
+      return counts;
+    })
+    .finally(() => {
+      mutualCountInflight.delete(key);
+    });
+  mutualCountInflight.set(key, run);
+  return run;
+}
+
+async function computeMutualFriendCounts(
+  myFriendIds: string[],
+  excludeIds: string[]
+): Promise<{ counts: Map<string, number>; complete: boolean }> {
+  const counts = new Map<string, number>();
+  let complete = true;
+
+  const excluded = new Set(excludeIds);
+  const myFriends = new Set(myFriendIds);
+
+  for (const chunk of chunkIds(myFriendIds, 80)) {
+    const [asRequester, asReceiver] = await Promise.all([
+      supabaseAdmin
+        .from("friendships")
+        .select("requester_id, receiver_id")
+        .eq("status", "accepted")
+        .in("requester_id", chunk),
+      supabaseAdmin
+        .from("friendships")
+        .select("requester_id, receiver_id")
+        .eq("status", "accepted")
+        .in("receiver_id", chunk),
+    ]);
+
+    if (asRequester.error) {
+      complete = false;
+      console.warn("[friends/discover] mutual requester query failed:", asRequester.error.message);
+    }
+    if (asReceiver.error) {
+      complete = false;
+      console.warn("[friends/discover] mutual receiver query failed:", asReceiver.error.message);
+    }
+
+    for (const row of [...(asRequester.data ?? []), ...(asReceiver.data ?? [])]) {
+      const a = row.requester_id as string;
+      const b = row.receiver_id as string;
+      // Candidate is the side that is NOT already my friend.
+      if (myFriends.has(a) && !myFriends.has(b) && !excluded.has(b)) {
+        counts.set(b, (counts.get(b) ?? 0) + 1);
+      } else if (myFriends.has(b) && !myFriends.has(a) && !excluded.has(a)) {
+        counts.set(a, (counts.get(a) ?? 0) + 1);
+      }
+    }
+  }
+
+  return { counts, complete };
+}
+
+async function loadDiscoverProfiles(
+  excludeIds: string[],
+  offset: number,
+  limit: number
+): Promise<{ rows: any[]; error: any | null }> {
+  // Defensive: caller should always pass the viewer id; keep a second filter below.
+  const exclude = notInList(excludeIds);
+
+  // Deterministic order: newest first, id as stable tie-breaker.
+  // Must not depend on friendship / pending status.
+  const { data, error } = await supabaseAdmin
+    .from("profiles")
+    .select("*")
+    .filter("id", "not.in", exclude)
+    .order("created_at", { ascending: false })
+    .order("id", { ascending: true })
+    .range(offset, offset + limit - 1);
+
+  if (!error) {
+    const excluded = new Set(excludeIds);
+    return {
+      rows: (data ?? []).filter((p: any) => p?.id && !excluded.has(p.id)),
+      error: null,
+    };
+  }
+
+  console.warn("[friends/discover] not.in filter failed, falling back:", error.message);
+
+  // Fallback: load a wider newest window and drop excluded ids in memory.
+  const windowEnd = Math.min(Math.max(offset + limit + excludeIds.length + 40, 80), 300) - 1;
+  const { data: all, error: fallbackError } = await supabaseAdmin
+    .from("profiles")
+    .select("*")
+    .order("created_at", { ascending: false })
+    .order("id", { ascending: true })
+    .range(0, windowEnd);
+
+  if (fallbackError) return { rows: [], error: fallbackError };
+
+  const excluded = new Set(excludeIds);
+  const filtered = (all ?? []).filter((p: any) => p?.id && !excluded.has(p.id));
+  return { rows: filtered.slice(offset, offset + limit), error: null };
+}
+
+type RankedDiscoverRow = { profile: any; mutualFriends: number };
+
+/**
+ * People on Path+: mutual friends first (higher count first), then everyone else.
+ * Pagination is over this ranked sequence so scrolling stays consistent.
+ */
+async function loadRankedDiscoverProfiles(
+  excludeIds: string[],
+  myFriendIds: string[],
+  offset: number,
+  limit: number
+): Promise<{ rows: RankedDiscoverRow[]; error: any | null; mutualTotal: number }> {
+  const mutualCounts = await buildMutualFriendCounts(myFriendIds, excludeIds);
+  const mutualSorted = Array.from(mutualCounts.entries()).sort((a, b) => {
+    if (b[1] !== a[1]) return b[1] - a[1];
+    return a[0].localeCompare(b[0]);
+  });
+  const mutualIds = mutualSorted.map(([id]) => id);
+  const mutualTotal = mutualIds.length;
+
+  const pageIds: string[] = [];
+  const pageMutual = new Map<string, number>();
+
+  if (offset < mutualTotal) {
+    for (const id of mutualIds.slice(offset, offset + limit)) {
+      pageIds.push(id);
+      pageMutual.set(id, mutualCounts.get(id) ?? 0);
+    }
+  }
+
+  const stillNeed = limit - pageIds.length;
+  let fillError: any | null = null;
+  const fillProfiles: any[] = [];
+
+  if (stillNeed > 0) {
+    const nonMutualOffset = Math.max(0, offset - mutualTotal);
+    const fillExclude = [...excludeIds, ...mutualIds];
+    const filled = await loadDiscoverProfiles(fillExclude, nonMutualOffset, stillNeed);
+    fillError = filled.error;
+    for (const p of filled.rows ?? []) {
+      if (!p?.id || pageMutual.has(p.id)) continue;
+      pageIds.push(p.id);
+      pageMutual.set(p.id, 0);
+      fillProfiles.push(p);
+    }
+  }
+
+  if (pageIds.length === 0) {
+    return { rows: [], error: fillError, mutualTotal };
+  }
+
+  const needFetch = pageIds.filter((id) => !fillProfiles.some((p) => p.id === id));
+  let fetched: any[] = [];
+  if (needFetch.length > 0) {
+    const { data, error } = await supabaseAdmin.from("profiles").select("*").in("id", needFetch);
+    if (error) {
+      console.warn("[friends/discover] ranked profile fetch failed:", error.message);
+      return { rows: [], error, mutualTotal };
+    }
+    fetched = data ?? [];
+  }
+
+  const profileById = new Map<string, any>();
+  for (const p of [...fetched, ...fillProfiles]) {
+    if (p?.id) profileById.set(p.id, p);
+  }
+
+  const rows: RankedDiscoverRow[] = [];
+  for (const id of pageIds) {
+    const profile = profileById.get(id);
+    if (!profile) continue;
+    rows.push({ profile, mutualFriends: pageMutual.get(id) ?? 0 });
+  }
+
+  return { rows, error: null, mutualTotal };
 }
 
 friendsRouter.get("/", async (c) => {
@@ -52,83 +386,327 @@ friendsRouter.get("/", async (c) => {
 
   const userClient = createUserClient(token);
 
-  // Blocked-in-either-direction ids are hidden from friends, requests, and
-  // suggestions throughout this response.
-  const blockedSet = new Set(await getBlockedIds(userId));
+  // Parallelize friendships + blocks + close-friends (was a long waterfall).
+  // Outgoing pending uses admin so RLS never hides people you already requested.
+  const [
+    blockedIds,
+    acceptedFriendshipsResult,
+    pendingFriendshipsResult,
+    pendingSentResult,
+    closeFriendSet,
+  ] = await Promise.all([
+    getBlockedIds(userId),
+    userClient
+      .from("friendships")
+      .select("id, requester_id, receiver_id")
+      .eq("status", "accepted")
+      .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
+    userClient
+      .from("friendships")
+      .select("id, requester_id, created_at")
+      .eq("receiver_id", userId)
+      .eq("status", "pending"),
+    supabaseAdmin
+      .from("friendships")
+      .select("id, receiver_id, status")
+      .eq("requester_id", userId)
+      .neq("status", "accepted"),
+    getCloseFriendIds(supabaseAdmin, userId),
+  ]);
 
-  const { data: acceptedFriendships } = await userClient
-    .from("friendships")
-    .select("id, requester_id, receiver_id")
-    .eq("status", "accepted")
-    .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`);
+  const blockedSet = new Set(blockedIds);
+  const { data: acceptedFriendships } = acceptedFriendshipsResult;
+  const { data: pendingFriendships } = pendingFriendshipsResult;
+  const { data: pendingSentRaw, error: pendingSentError } = pendingSentResult;
+  if (pendingSentError) {
+    console.warn("[friends] pending-sent query failed:", pendingSentError.message);
+  }
+  const pendingSentFriendships = (pendingSentRaw ?? []).filter((f: any) => {
+    const status = String(f.status ?? "").toLowerCase();
+    return status === "pending" || status === "requested" || status === "pending_sent";
+  });
 
   const friendIds = (acceptedFriendships ?? [])
     .map((f: any) => (f.requester_id === userId ? f.receiver_id : f.requester_id))
-    .filter((id: string) => !blockedSet.has(id));
+    .filter((id: string) => !!id && id !== userId && !blockedSet.has(id));
 
   // Map each friend's id -> the friendship row id, so the client can unfriend.
   const friendshipIdByFriend: Record<string, string> = {};
   for (const f of acceptedFriendships ?? []) {
     const otherId = f.requester_id === userId ? f.receiver_id : f.requester_id;
+    if (!otherId || otherId === userId) continue;
     friendshipIdByFriend[otherId] = f.id;
   }
 
-  // Which of my friends I've privately starred as close friends.
-  const closeFriendSet = await getCloseFriendIds(userClient, userId);
-
-  const { data: pendingFriendships } = await userClient
-    .from("friendships")
-    .select("id, requester_id, created_at")
-    .eq("receiver_id", userId)
-    .eq("status", "pending");
-
   const pendingRequesterIds = (pendingFriendships ?? [])
     .map((f: any) => f.requester_id)
-    .filter((id: string) => !blockedSet.has(id));
+    .filter((id: string) => !!id && id !== userId && !blockedSet.has(id));
 
-  const { data: pendingSentFriendships } = await userClient
-    .from("friendships")
-    .select("id, receiver_id")
-    .eq("requester_id", userId)
-    .eq("status", "pending");
+  const pendingSentIds = (pendingSentFriendships ?? [])
+    .map((f: any) => f.receiver_id)
+    .filter((id: string) => !!id && id !== userId && !blockedSet.has(id));
 
-  const pendingSentIds = (pendingSentFriendships ?? []).map((f: any) => f.receiver_id);
-
-  const allIds = [...new Set([...friendIds, ...pendingRequesterIds])];
-
-  let profileMap: Record<string, any> = {};
-  if (allIds.length > 0) {
-    const { data: profiles } = await userClient.from("profiles").select("*").in("id", allIds);
-    for (const p of profiles ?? []) profileMap[p.id] = p;
+  const friendshipIdByPendingSent: Record<string, string> = {};
+  for (const f of pendingSentFriendships ?? []) {
+    friendshipIdByPendingSent[f.receiver_id] = f.id;
   }
 
-  const friends = friendIds
+  const allIds = [...new Set([...friendIds, ...pendingRequesterIds, ...pendingSentIds])];
+  // Keep outgoing-pending recipients in People discovery; annotate status instead of hiding them.
+  const excludeIds = [userId, ...friendIds, ...pendingRequesterIds, ...blockedSet];
+
+  // First People-on-Path+ page is 5; /friends/discover loads the rest in batches of 5.
+  const PEOPLE_PAGE_SIZE = 5;
+  const [profileMap, suggestedLoad] = await Promise.all([
+    loadProfilesByIds(allIds),
+    loadRankedDiscoverProfiles(excludeIds, friendIds, 0, PEOPLE_PAGE_SIZE),
+  ]);
+
+  await enrichMissingIdentity(profileMap);
+
+  if (suggestedLoad.error) {
+    console.warn("[friends] suggested load failed:", suggestedLoad.error.message);
+  }
+
+  // Fill blank identity on discover suggestions too (same root cause).
+  const suggestedProfileMap: Record<string, any> = {};
+  for (const r of suggestedLoad.rows ?? []) {
+    if (r?.profile?.id) suggestedProfileMap[r.profile.id] = r.profile;
+  }
+  await enrichMissingIdentity(suggestedProfileMap);
+
+  const acceptedFriends = friendIds
     .map((id: string) => profileMap[id])
-    .filter(Boolean)
+    .filter((p: any) => p && !isDeletionHiddenProfile(p))
     .map((p: any) => ({
       ...formatProfile(p),
       friendshipStatus: "friends" as const,
       friendshipId: friendshipIdByFriend[p.id],
-      // The star state — single source of truth, read from `close_friends`.
       isCloseFriend: closeFriendSet.has(p.id),
     }));
+
+  // Outgoing pending requests stay visible on the friends page until accepted/cancelled.
+  // Never drop a pending row just because the profile row is thin/missing.
+  const pendingSentFriends = pendingSentIds
+    .filter((id: string) => {
+      const p = profileMap[id];
+      return !p || !isDeletionHiddenProfile(p);
+    })
+    .map((id: string) => {
+      const p = profileMap[id];
+      const base = p
+        ? formatProfile(p)
+        : { id, name: "Unknown", username: "", avatar: resolveAvatarUrl(id, null, null) };
+      return {
+        ...base,
+        friendshipStatus: "pending_sent" as const,
+        friendshipId: friendshipIdByPendingSent[id],
+        isCloseFriend: false,
+      };
+    });
+
+  // Pending outgoing requests first so they stay visible at the top of Your Friends.
+  const friends = [...pendingSentFriends, ...acceptedFriends];
   const requests = (pendingFriendships ?? [])
     .filter((f: any) => !blockedSet.has(f.requester_id))
     .map((f: any) => ({
       id: f.id,
-      user: profileMap[f.requester_id] ? formatProfile(profileMap[f.requester_id]) : { id: f.requester_id, name: "Unknown" },
+      user: profileMap[f.requester_id]
+        ? formatProfile(profileMap[f.requester_id])
+        : { id: f.requester_id, name: "Unknown", username: "", avatar: "" },
       mutualFriends: 0,
       createdAt: f.created_at,
-    }));
+    }))
+    .filter((r: any) => r.user && !isDeletionHiddenProfile(profileMap[r.user.id] ?? null));
 
-  const excludeIds = [userId, ...friendIds, ...pendingRequesterIds, ...pendingSentIds, ...blockedSet];
-  const { data: suggested } = await userClient
-    .from("profiles")
-    .select("*")
-    .not("id", "in", `(${excludeIds.join(",")})`)
-    .limit(5);
+  const suggested = (suggestedLoad.rows ?? [])
+    .filter((r) => r?.profile?.id && r.profile.id !== userId && !isDeletionHiddenProfile(r.profile))
+    .map((r) => {
+      const id = r.profile.id as string;
+      const pendingId = friendshipIdByPendingSent[id];
+      return {
+        ...formatProfile(suggestedProfileMap[id] ?? r.profile),
+        friendshipStatus: pendingId ? ("pending_sent" as const) : ("none" as const),
+        ...(pendingId ? { friendshipId: pendingId } : {}),
+        mutualFriends: r.mutualFriends,
+      };
+    });
 
-  return c.json({ data: { friends, requests, suggested: (suggested ?? []).map(formatProfile) } });
+  return c.json({
+    data: {
+      friends,
+      // Explicit copy so older / partial clients can merge pending even if they
+      // only render accepted friends from `friends`.
+      pendingSent: pendingSentFriends,
+      requests,
+      suggested,
+      suggestedHasMore: suggested.length >= PEOPLE_PAGE_SIZE,
+      suggestedPageSize: PEOPLE_PAGE_SIZE,
+      friendLimit: MAX_FRIENDS,
+      friendSlotsUsed: acceptedFriends.length + pendingSentFriends.length,
+    },
+  });
+});
+
+/** Outgoing friend requests that have not been accepted yet. */
+friendsRouter.get("/outgoing", async (c) => {
+  const user = c.get("user");
+  const userId = c.get("userId");
+  if (!user || !userId) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const blockedIds = await getBlockedIds(userId);
+  const blockedSet = new Set(blockedIds);
+
+  const { data: rows, error } = await supabaseAdmin
+    .from("friendships")
+    .select("id, receiver_id, status")
+    .eq("requester_id", userId)
+    .neq("status", "accepted");
+
+  if (error) {
+    console.error("[friends/outgoing] query failed:", error.message);
+    return c.json({ error: { message: "Failed to load pending requests" } }, 500);
+  }
+
+  const pendingRows = (rows ?? []).filter((f: any) => {
+    const status = String(f.status ?? "").toLowerCase();
+    return status === "pending" || status === "requested" || status === "pending_sent";
+  });
+
+  const ids = pendingRows
+    .map((f: any) => f.receiver_id as string)
+    .filter((id: string) => id && !blockedSet.has(id));
+
+  const profileMap = await loadProfilesByIds(ids);
+  await enrichMissingIdentity(profileMap);
+
+  const friendshipIdByPendingSent: Record<string, string> = {};
+  for (const f of pendingRows) {
+    friendshipIdByPendingSent[f.receiver_id] = f.id;
+  }
+
+  const pendingSent = ids
+    .filter((id) => {
+      const p = profileMap[id];
+      return !p || !isDeletionHiddenProfile(p);
+    })
+    .map((id) => {
+      const p = profileMap[id];
+      const base = p
+        ? formatProfile(p)
+        : { id, name: "Unknown", username: "", avatar: resolveAvatarUrl(id, null, null) };
+      return {
+        ...base,
+        friendshipStatus: "pending_sent" as const,
+        friendshipId: friendshipIdByPendingSent[id],
+        isCloseFriend: false,
+      };
+    });
+
+  return c.json({ data: { pendingSent } });
+});
+
+/** Paginated directory of other members (excludes self, friends, incoming pending, blocked).
+ * Outgoing pending recipients remain listed with friendshipStatus=pending_sent. */
+friendsRouter.get("/discover", async (c) => {
+  const user = c.get("user");
+  const userId = c.get("userId");
+  const token = c.get("accessToken");
+  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  // Discover rebuilds a friends-of-friends graph — skip while Disk I/O is recovering.
+  const { isSupabaseCircuitOpen } = await import("../lib/supabase-circuit");
+  if (isSupabaseCircuitOpen()) {
+    // Same shape as a normal page so the client stops paging cleanly.
+    return c.json({
+      data: { users: [], offset: 0, limit: 0, nextOffset: 0, hasMore: false },
+    });
+  }
+
+  const offset = Math.max(0, Number.parseInt(String(c.req.query("offset") ?? "0"), 10) || 0);
+  const limitRaw = Number.parseInt(String(c.req.query("limit") ?? "5"), 10);
+  const limit = Math.min(50, Math.max(1, Number.isFinite(limitRaw) ? limitRaw : 5));
+
+  const userClient = createUserClient(token);
+
+  const [
+    blockedIds,
+    acceptedFriendshipsResult,
+    pendingFriendshipsResult,
+    pendingSentResult,
+  ] = await Promise.all([
+    getBlockedIds(userId),
+    userClient
+      .from("friendships")
+      .select("requester_id, receiver_id")
+      .eq("status", "accepted")
+      .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
+    userClient
+      .from("friendships")
+      .select("requester_id")
+      .eq("receiver_id", userId)
+      .eq("status", "pending"),
+    userClient
+      .from("friendships")
+      .select("id, receiver_id")
+      .eq("requester_id", userId)
+      .eq("status", "pending"),
+  ]);
+
+  const blockedSet = new Set(blockedIds);
+  const friendIds = (acceptedFriendshipsResult.data ?? [])
+    .map((f: any) => (f.requester_id === userId ? f.receiver_id : f.requester_id))
+    .filter((id: string) => !!id && id !== userId && !blockedSet.has(id));
+  const pendingRequesterIds = (pendingFriendshipsResult.data ?? [])
+    .map((f: any) => f.requester_id)
+    .filter((id: string) => !!id && id !== userId && !blockedSet.has(id));
+  const friendshipIdByPendingSent: Record<string, string> = {};
+  for (const f of pendingSentResult.data ?? []) {
+    if (f?.receiver_id && f.receiver_id !== userId) {
+      friendshipIdByPendingSent[f.receiver_id] = f.id;
+    }
+  }
+  // Do not hide outgoing-pending recipients from discovery.
+  const excludeIds = [userId, ...friendIds, ...pendingRequesterIds, ...blockedSet];
+
+  const { rows, error } = await loadRankedDiscoverProfiles(excludeIds, friendIds, offset, limit);
+
+  if (error) {
+    console.error("[friends/discover] query failed:", error.message);
+    return c.json({ error: { message: "Failed to load people" } }, 500);
+  }
+
+  const discoverMap: Record<string, any> = {};
+  for (const r of rows ?? []) {
+    if (r?.profile?.id) discoverMap[r.profile.id] = r.profile;
+  }
+  await enrichMissingIdentity(discoverMap);
+
+  const users = (rows ?? [])
+    .filter((r) => r?.profile?.id && r.profile.id !== userId && !isDeletionHiddenProfile(r.profile))
+    .map((r) => {
+      const id = r.profile.id as string;
+      const pendingId = friendshipIdByPendingSent[id];
+      return {
+        ...formatProfile(discoverMap[id] ?? r.profile),
+        friendshipStatus: pendingId ? ("pending_sent" as const) : ("none" as const),
+        ...(pendingId ? { friendshipId: pendingId } : {}),
+        mutualFriends: r.mutualFriends,
+      };
+    });
+  // hasMore based on raw row count so a soft-deleted filter does not freeze paging.
+  const hasMore = (rows ?? []).length === limit;
+  const nextOffset = offset + limit;
+
+  return c.json({
+    data: {
+      users,
+      offset,
+      limit,
+      nextOffset,
+      hasMore,
+    },
+  });
 });
 
 friendsRouter.post("/request/:userId", async (c) => {
@@ -137,60 +715,127 @@ friendsRouter.post("/request/:userId", async (c) => {
   const token = c.get("accessToken");
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
-  const { userId: targetId } = c.req.param();
-  if (targetId === userId) return c.json({ error: { message: "Cannot friend yourself" } }, 400);
+  // Sender always comes from the authenticated session — never trust a body sender id.
+  const { userId: rawTargetId } = c.req.param();
+  const targetId = String(rawTargetId ?? "").trim();
+  if (!targetId) return c.json({ error: { message: "User not found" } }, 404);
+  if (targetId === userId) {
+    return c.json({ error: { message: "Cannot friend yourself" } }, 400);
+  }
 
   // Can't send a request to (or from) someone in a block relationship.
   if (await isBlocked(userId, targetId)) {
     return c.json({ error: { message: "Unable to send request" } }, 403);
   }
 
-  const userClient = createUserClient(token);
+  const { data: targetProfile } = await supabaseAdmin
+    .from("profiles")
+    .select("status, suspended_reason")
+    .eq("id", targetId)
+    .maybeSingle();
+  if (!targetProfile || isDeletionHiddenProfile(targetProfile)) {
+    return c.json({ error: { message: "User not found" } }, 404);
+  }
 
-  const { data: existing } = await userClient
+  // Count accepted friends + outgoing pending toward the circle cap.
+  // Multiple outgoing requests are allowed until this limit is reached.
+  const [{ count: acceptedCount }, { count: pendingSentCount }] = await Promise.all([
+    supabaseAdmin
+      .from("friendships")
+      .select("id", { count: "exact", head: true })
+      .eq("status", "accepted")
+      .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
+    supabaseAdmin
+      .from("friendships")
+      .select("id", { count: "exact", head: true })
+      .eq("requester_id", userId)
+      .eq("status", "pending"),
+  ]);
+  const slotsUsed = (acceptedCount ?? 0) + (pendingSentCount ?? 0);
+  if (slotsUsed >= MAX_FRIENDS) {
+    return c.json(
+      {
+        error: {
+          message: `Friend limit reached (${MAX_FRIENDS}). Remove a friend or cancel a pending request first.`,
+        },
+      },
+      400
+    );
+  }
+
+  const { data: existing } = await supabaseAdmin
     .from("friendships")
-    .select("id")
-    .or(`and(requester_id.eq.${userId},receiver_id.eq.${targetId}),and(requester_id.eq.${targetId},receiver_id.eq.${userId})`)
+    .select("id, status, requester_id, receiver_id")
+    .or(
+      `and(requester_id.eq.${userId},receiver_id.eq.${targetId}),and(requester_id.eq.${targetId},receiver_id.eq.${userId})`
+    )
     .maybeSingle();
 
-  if (existing) return c.json({ error: { message: "Friend request already exists" } }, 409);
+  if (existing) {
+    if (existing.status === "accepted") {
+      return c.json({ error: { message: "Already friends" } }, 409);
+    }
+    // Idempotent: re-sending an existing pending request returns the same row.
+    return c.json(
+      {
+        data: {
+          ...existing,
+          id: existing.id,
+          friendshipId: existing.id,
+        },
+      },
+      200
+    );
+  }
 
-  const { data: friendship, error } = await userClient
+  // Service role insert avoids intermittent RLS / JWT edge cases that looked like
+  // "only one request at a time" failures after a burst of sends.
+  const { data: friendship, error } = await supabaseAdmin
     .from("friendships")
     .insert({ requester_id: userId, receiver_id: targetId, status: "pending" })
     .select()
     .single();
 
-  if (error) return c.json({ error: { message: "Failed to send request" } }, 500);
+  if (error) {
+    console.error("[friends] request insert failed:", error.message);
+    return c.json({ error: { message: "Failed to send request" } }, 500);
+  }
 
   // Insert the in-app notification with the admin client: the sender is
   // writing a row owned by the recipient, which RLS on userClient blocks.
   try {
-    await supabaseAdmin.from("notifications").insert({
+    const { data: inserted } = await supabaseAdmin.from("notifications").insert({
       user_id: targetId,
       from_user_id: userId,
       type: "friend_request",
       message: `${user.full_name} sent you a friend request`,
       read: false,
-    });
-  } catch (e) {
-    console.error("[notifications] friend_request insert error:", e);
-  }
+    }).select("id").single();
 
-  // Send push notification to target user
-  try {
-    const pushToken = await getPushToken(supabaseAdmin, targetId);
-    await sendPushNotification(
-      pushToken,
+    void sendPushToUser(
+      supabaseAdmin,
+      targetId,
       "Friend Request",
       `${user.full_name} sent you a friend request`,
-      { type: "friend_request", fromUserId: userId }
+      {
+        type: "friend_request",
+        fromUserId: userId,
+        notificationId: inserted?.id,
+      }
     );
   } catch (e) {
-    console.error("[push] friend request notification error:", e);
+    console.error("[notifications] friend_request insert/push error:", e);
   }
 
-  return c.json({ data: friendship }, 201);
+  return c.json(
+    {
+      data: {
+        ...friendship,
+        friendshipId: friendship.id,
+      },
+    },
+    201
+  );
 });
 
 friendsRouter.post("/accept/:id", async (c) => {
@@ -222,15 +867,27 @@ friendsRouter.post("/accept/:id", async (c) => {
   // admin client since this row is owned by the requester, not the accepter,
   // and RLS on userClient would silently block the insert.
   try {
-    await supabaseAdmin.from("notifications").insert({
+    const { data: acceptedNotif } = await supabaseAdmin.from("notifications").insert({
       user_id: friendship.requester_id,
       from_user_id: userId,
       type: "friend_accepted",
       message: `${user.full_name} accepted your friend request`,
       read: false,
-    });
+    }).select("id").single();
+
+    void sendPushToUser(
+      supabaseAdmin,
+      friendship.requester_id,
+      user.full_name || "Path+",
+      `${user.full_name} accepted your friend request`,
+      {
+        type: "friend_accepted",
+        fromUserId: userId,
+        notificationId: acceptedNotif?.id,
+      }
+    );
   } catch (e) {
-    console.error("[notifications] friend_accepted insert error:", e);
+    console.error("[notifications] friend_accepted insert/push error:", e);
   }
 
   // Also notify the ACCEPTER (this user) so BOTH people get a Notifications
@@ -242,27 +899,27 @@ friendsRouter.post("/accept/:id", async (c) => {
       .eq("id", friendship.requester_id)
       .maybeSingle();
     const requesterName = requesterProfile?.full_name ?? "Someone";
-    await supabaseAdmin.from("notifications").insert({
+    const { data: nowFriendsNotif } = await supabaseAdmin.from("notifications").insert({
       user_id: userId,
       from_user_id: friendship.requester_id,
       type: "now_friends",
       message: `You are now friends with ${requesterName}`,
       read: false,
-    });
-  } catch (e) {
-    console.error("[notifications] now_friends insert error:", e);
-  }
+    }).select("id").single();
 
-  try {
-    const pushToken = await getPushToken(supabaseAdmin, friendship.requester_id);
-    await sendPushNotification(
-      pushToken,
-      "Friend Request Accepted",
-      `${user.full_name} accepted your friend request`,
-      { type: "friend_accepted", fromUserId: userId }
+    void sendPushToUser(
+      supabaseAdmin,
+      userId,
+      "New Friend",
+      `You are now friends with ${requesterName}`,
+      {
+        type: "now_friends",
+        fromUserId: friendship.requester_id,
+        notificationId: nowFriendsNotif?.id,
+      }
     );
   } catch (e) {
-    console.error("[push] friend accepted notification error:", e);
+    console.error("[notifications] now_friends insert/push error:", e);
   }
 
   return c.json({ data: updated });
@@ -275,6 +932,9 @@ friendsRouter.get("/status/:userId", async (c) => {
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const { userId: targetId } = c.req.param();
+  if (!targetId || targetId === userId) {
+    return c.json({ data: { status: "none", friendshipId: null, mutualFriends: 0 } });
+  }
   const userClient = createUserClient(token);
 
   const { data: friendship } = await userClient
@@ -345,37 +1005,35 @@ friendsRouter.delete("/:id", async (c) => {
 // friends. Single source of truth for the home timeline's STAR filter.
 // Returns [] (never errors) if the close_friends table isn't set up yet.
 friendsRouter.get("/close-ids", async (c) => {
-  const user = c.get("user");
   const userId = c.get("userId");
   const token = c.get("accessToken");
-  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+  if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
-  const userClient = createUserClient(token);
-  const set = await getCloseFriendIds(userClient, userId);
+  // Service role so RLS / column quirks can't return an empty list after a successful star.
+  const set = await getCloseFriendIds(supabaseAdmin, userId);
   return c.json({ data: Array.from(set) });
 });
 
 // POST /api/friends/close/:userId — privately star a friend as a close friend.
-// Idempotent (upsert). No notification is ever sent; the other person can't see it.
 friendsRouter.post("/close/:userId", async (c) => {
-  const user = c.get("user");
   const userId = c.get("userId");
   const token = c.get("accessToken");
-  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+  if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
-  const { userId: targetId } = c.req.param();
-  if (targetId === userId) return c.json({ error: { message: "Cannot star yourself" } }, 400);
+  const targetId = c.req.param("userId");
+  if (!targetId || targetId === userId) {
+    return c.json({ error: { message: "Cannot star yourself" } }, 400);
+  }
 
-  const userClient = createUserClient(token);
-  const { error } = await userClient
-    .from("close_friends")
-    .upsert({ owner_id: userId, friend_id: targetId }, { onConflict: "owner_id,friend_id" });
+  // Prefer service role so missing RLS policies can't undo the optimistic UI.
+  const db = supabaseAdmin;
+  const error = await upsertCloseFriend(db, userId, targetId);
 
   if (error) {
-    // Most likely the table hasn't been created yet — tell the client clearly.
     if (/close_friends|relation|table|schema/i.test(error.message ?? "")) {
-      return c.json({ error: { message: "Close Friends isn't set up yet. Run the one-line SQL to enable it." } }, 400);
+      return c.json({ error: { message: "Close Friends isn't set up yet." } }, 400);
     }
+    console.error("[friends] close upsert failed:", error.message);
     return c.json({ error: { message: "Failed to update close friend" } }, 500);
   }
   return c.json({ data: { isCloseFriend: true } });
@@ -383,18 +1041,12 @@ friendsRouter.post("/close/:userId", async (c) => {
 
 // DELETE /api/friends/close/:userId — remove the private star.
 friendsRouter.delete("/close/:userId", async (c) => {
-  const user = c.get("user");
   const userId = c.get("userId");
   const token = c.get("accessToken");
-  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+  if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
-  const { userId: targetId } = c.req.param();
-  const userClient = createUserClient(token);
-  await userClient
-    .from("close_friends")
-    .delete()
-    .eq("owner_id", userId)
-    .eq("friend_id", targetId);
+  const targetId = c.req.param("userId");
+  await deleteCloseFriend(supabaseAdmin, userId, targetId);
   return c.json({ data: { isCloseFriend: false } });
 });
 

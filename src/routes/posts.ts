@@ -168,14 +168,23 @@ postsRouter.get("/", async (c) => {
 
   // Latest preview comment per moment in one batched query (before formatPost).
   await attachCommentPreviews(ordered, userId ?? undefined, blockedIds);
-  if (userId) {
-    const visCtx = await loadMomentVisibilityContext(userId);
-    scrubInvisibleOriginals(ordered, userId, visCtx);
+  if (userId && ordered.some((p) => p?.original)) {
+    // Reuse the friends / close-friends / blocks / deletion sets already loaded above
+    // instead of re-querying all four (identical data, same request).
+    scrubInvisibleOriginals(ordered, userId, {
+      friendIds: friendIdSet,
+      closeAuthorIds: whoStarredMe,
+      blockedIds: blockedSet,
+      deletionHiddenIds: deletionHidden,
+    });
   }
 
   const formatted = ordered.map((p) => formatPost(p, userId ?? undefined, blockedIds));
-  await refreshFriendshipAvatars(formatted); // always show friends' CURRENT avatars
-  await refreshReactionActors(formatted); // live names + avatars on likes
+  // Independent profile lookups — run together instead of back to back.
+  await Promise.all([
+    refreshFriendshipAvatars(formatted), // always show friends' CURRENT avatars
+    refreshReactionActors(formatted), // live names + avatars on likes
+  ]);
   return c.json({
     data: formatted,
     nextCursor: walked.nextCursor,
