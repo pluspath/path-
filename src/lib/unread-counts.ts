@@ -19,12 +19,13 @@ export async function countUnreadByConversationDirect(
 
   try {
     const rows = await withDirectSql(async (sql) => {
+      // postgres.js: use sql.array() for UUID[] binds (raw JS arrays fail the cast).
       return (await sql`
         SELECT m.conversation_id::text AS conversation_id, COUNT(*)::int AS unread
         FROM conversation_participants cp
         INNER JOIN messages m ON m.conversation_id = cp.conversation_id
         WHERE cp.user_id = ${userId}::uuid
-          AND m.conversation_id = ANY(${convIds}::uuid[])
+          AND m.conversation_id = ANY(${sql.array(convIds)}::uuid[])
           AND m.sender_id <> ${userId}::uuid
           AND (cp.last_read_at IS NULL OR m.created_at > cp.last_read_at)
         GROUP BY m.conversation_id
