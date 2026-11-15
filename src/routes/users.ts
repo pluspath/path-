@@ -1,11 +1,24 @@
 import { Hono } from "hono";
 import { supabase, supabaseAdmin, createUserClient } from "../supabase";
-import { ensureAvatarChangeMoment, ensureCoverChangeMoment, FRIENDSHIP_TYPE, parseFriendshipFriends, refreshFriendshipAvatars } from "../lib/systemMoments";
+import { acceptedProfileImageUpdate, ensureAvatarChangeMoment, ensureCoverChangeMoment, FRIENDSHIP_TYPE, parseFriendshipFriends, refreshFriendshipAvatars } from "../lib/systemMoments";
 import { computeAge, computeZodiac } from "../lib/profileMeta";
 import { decodeImages } from "../lib/images";
 import { getBlockedIds } from "../lib/blocks";
 import { formatDuration } from "../lib/duration";
+import { upsertUserDevice, deactivateUserDevices, getPushTokensForUser, getPushStatusForUser, sendPushNotificationDetailed, getUnreadNotificationBadgeCount } from "../lib/push";
+import { isCustomAvatar, defaultAvatarForGender, ensureGenderDefaultAvatar, resolveAvatarUrl, normalizeGender } from "../lib/avatar";
+import { isDeletionHiddenProfile } from "../lib/account-deletion";
+import { parseLimit, parseCursor } from "../lib/pagination";
+import { fetchNewestMomentBatch } from "../lib/moment-feed";
+import { walkNewestPage } from "../lib/moment-order";
+import { attachOriginals, loadPostsByIds } from "../lib/load-posts";
+import { attachCommentPreviews, formatPreviewComments } from "../lib/comment-previews";
+import { ensureUserHasUsername } from "../lib/username-backfill";
+import { refreshAuthProfileCache } from "../lib/auth-profile-cache";
+import { profilePatchTriesToSetVerification } from "../lib/verification";
 import type { HonoVariables, Profile } from "../types";
+
+const USERNAME_RE = /^[a-z0-9_]{3,30}$/;
 
 const usersRouter = new Hono<{ Variables: HonoVariables }>();
 
@@ -13,35 +26,233 @@ const usersRouter = new Hono<{ Variables: HonoVariables }>();
 // sees their own age/zodiac (plus the raw birthday, needed to drive the
 // toggles). Everyone else sees age/zodiac ONLY when the owner has opted in via
 // show_age / show_zodiac, and never sees the raw birthday.
-function formatProfile(p: any, postCount = 0, friendCount = 0, viewerId?: string) {
+/**
+ * Total likes received on a user's moments from anyone on the app:
+ * reactions + comments + repaths. Service-role only (no viewer filtering).
+ */
+async function countInteractionsReceived(userId: string): Promise<number> {
+  let stored = 0;
+  try {
+    // select('*') so a missing like_count column cannot 400 the whole profile.
+    const { data } = await supabaseAdmin
+      .from("profiles")
+      .select("*")
+      .eq("id", userId)
+      .maybeSingle();
+    const n = Number((data as any)?.like_count ?? 0);
+    if (Number.isFinite(n) && n > 0) stored = n;
+  } catch {
+    /* ignore */
+  }
+
+  let computed = 0;
+  const allPostIds: string[] = [];
+
+  // Walk every post page so totals cover the full timeline (not just the first
+  // PostgREST page of ~1000 rows).
+  try {
+    for (let from = 0; ; from += 500) {
+      const { data: posts, error } = await supabaseAdmin
+        .from("posts")
+        .select("id, comment_count, reactions(count), comments(count)")
+        .eq("user_id", userId)
+        .range(from, from + 499);
+      if (error) {
+        console.warn("[users] nested like count page failed:", error.message);
+        break;
+      }
+      if (!posts?.length) break;
+      for (const p of posts as any[]) {
+        allPostIds.push(String(p.id));
+        const r = Array.isArray(p.reactions) ? Number(p.reactions[0]?.count ?? 0) : 0;
+        const cNested = Array.isArray(p.comments) ? Number(p.comments[0]?.count ?? 0) : 0;
+        const cCol = Number(p.comment_count ?? 0) || 0;
+        computed +=
+          (Number.isFinite(r) ? r : 0) +
+          Math.max(Number.isFinite(cNested) ? cNested : 0, cCol);
+      }
+      if (posts.length < 500) break;
+    }
+    for (let i = 0; i < allPostIds.length; i += 80) {
+      const chunk = allPostIds.slice(i, i + 80);
+      const { count, error: rErr } = await supabaseAdmin
+        .from("posts")
+        .select("*", { count: "exact", head: true })
+        .in("repath_of", chunk);
+      if (!rErr) computed += count ?? 0;
+    }
+  } catch (e) {
+    console.warn("[users] nested like count threw:", e);
+  }
+
+  // Fallback: chunked head counts when nested embeds return nothing.
+  if (computed <= 0) {
+    const postIds =
+      allPostIds.length > 0
+        ? allPostIds
+        : await (async () => {
+            const ids: string[] = [];
+            try {
+              for (let from = 0; ; from += 1000) {
+                const { data, error } = await supabaseAdmin
+                  .from("posts")
+                  .select("id")
+                  .eq("user_id", userId)
+                  .range(from, from + 999);
+                if (error || !data?.length) break;
+                for (const row of data) ids.push(String((row as { id: string }).id));
+                if (data.length < 1000) break;
+              }
+            } catch (e) {
+              console.warn("[users] posts id list threw:", e);
+            }
+            return ids;
+          })();
+
+    for (let i = 0; i < postIds.length; i += 80) {
+      const chunk = postIds.slice(i, i + 80);
+      const [reactions, comments, repaths] = await Promise.all([
+        supabaseAdmin
+          .from("reactions")
+          .select("*", { count: "exact", head: true })
+          .in("post_id", chunk),
+        supabaseAdmin
+          .from("comments")
+          .select("*", { count: "exact", head: true })
+          .in("post_id", chunk),
+        supabaseAdmin
+          .from("posts")
+          .select("*", { count: "exact", head: true })
+          .in("repath_of", chunk),
+      ]);
+      if (!reactions.error) computed += reactions.count ?? 0;
+      if (!comments.error) computed += comments.count ?? 0;
+      if (!repaths.error) computed += repaths.count ?? 0;
+    }
+  }
+
+  // Notifications floor (reaction / sheep / comment / repath from anyone).
+  try {
+    const { count, error } = await supabaseAdmin
+      .from("notifications")
+      .select("*", { count: "exact", head: true })
+      .eq("user_id", userId)
+      .in("type", ["reaction", "sleep", "comment", "repath"]);
+    if (!error && typeof count === "number") computed = Math.max(computed, count);
+  } catch {
+    /* ignore */
+  }
+
+  computed = Math.max(0, computed);
+  const total = Math.max(computed, stored);
+
+  if (computed > 0) {
+    try {
+      await supabaseAdmin.from("profiles").update({ like_count: computed }).eq("id", userId);
+    } catch {
+      /* column may not exist yet — boot migration adds it */
+    }
+  }
+
+  return total;
+}
+
+/** Friend + moment + interaction counts for a profile response. */
+async function loadProfileStatCounts(userId: string): Promise<{
+  postCount: number;
+  friendCount: number;
+  likeCount: number;
+}> {
+  const [postsResult, friendsResult, likeCount] = await Promise.all([
+    supabaseAdmin.from("posts").select("*", { count: "exact", head: true }).eq("user_id", userId),
+    supabaseAdmin
+      .from("friendships")
+      .select("*", { count: "exact", head: true })
+      .eq("status", "accepted")
+      .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
+    countInteractionsReceived(userId),
+  ]);
+
+  return {
+    postCount: postsResult.count ?? 0,
+    friendCount: friendsResult.count ?? 0,
+    likeCount,
+  };
+}
+
+function formatProfile(
+  p: any,
+  postCount = 0,
+  friendCount = 0,
+  viewerId?: string,
+  likeCount = 0
+) {
   const isOwner = !!viewerId && viewerId === p.id;
   const showAge = p.show_age ?? false;
   const showZodiac = p.show_zodiac ?? false;
   const age = computeAge(p.birthday);
   const zodiac = computeZodiac(p.birthday);
+
+  // Profile section privacy (friends list / posts / moments).
+  const privacy = {
+    showFriendsToFriends: p.show_friends_to_friends ?? true,
+    showFriendsToOthers: p.show_friends_to_others ?? false,
+    showPostsToFriends: p.show_posts_to_friends ?? true,
+    showPostsToOthers: p.show_posts_to_others ?? true,
+    showMomentsToFriends: p.show_moments_to_friends ?? true,
+    showMomentsToOthers: p.show_moments_to_others ?? true,
+  };
+
+  // Identity fields are always public — never gated by privacy settings.
+  // Accept both DB snake_case and any already-mapped camelCase aliases so
+  // hydrated / legacy rows still surface name + username + location.
+  const name = String(p.full_name ?? p.name ?? "").trim();
+  const username = String(p.username ?? "").trim();
+  const location = String(p.location ?? "").trim();
+
   return {
     id: p.id,
-    name: p.full_name ?? "",
-    username: p.username ?? "",
+    name,
+    username,
     email: "",
-    avatar: p.avatar_url ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${p.id}`,
+    avatar: resolveAvatarUrl(p.id, p.avatar_url ?? p.avatar, p.gender),
     bio: p.bio ?? "",
-    location: p.location ?? "",
+    location,
     // Raw birthday is private — only ever returned to the profile owner.
     birthday: isOwner ? (p.birthday ?? "") : "",
     gender: p.gender ?? "",
-    coverPhoto: p.cover_url ?? "https://images.unsplash.com/photo-1519638399535-1b036603ac77?w=800",
-    joinDate: p.created_at ?? new Date().toISOString(),
+    coverPhoto: p.cover_url ?? p.coverPhoto ?? "https://images.unsplash.com/photo-1519638399535-1b036603ac77?w=800",
+    joinDate: p.created_at ?? p.joinDate ?? new Date().toISOString(),
     friendCount,
     postCount,
     momentCount: postCount,
+    likeCount, // total likes from anyone — same value for owner and every visitor
     // Computed age/zodiac, gated by visibility for non-owners.
     age: isOwner || showAge ? age : null,
     zodiac: isOwner || showZodiac ? zodiac : null,
     showAge,
     showZodiac,
     usernameChanged: p.username_changed ?? false,
+    pushNotificationsEnabled: p.push_notifications_enabled ?? true,
+    emailNotificationsEnabled: p.email_notifications_enabled ?? false,
+    preferredLanguage: p.preferred_language === "ar" ? "ar" : "en",
+    themePreference:
+      p.theme_preference === "light" || p.theme_preference === "dark" || p.theme_preference === "system"
+        ? p.theme_preference
+        : "light",
+    verified: p.is_verified === true,
+    ...privacy,
   };
+}
+
+function canViewSection(
+  isOwner: boolean,
+  isFriend: boolean,
+  toFriends: boolean,
+  toOthers: boolean
+): boolean {
+  if (isOwner) return true;
+  return isFriend ? toFriends : toOthers;
 }
 
 // ─── Reaction privacy lock ────────────────────────────────────────
@@ -64,17 +275,108 @@ export function lockedReactionType(type: string | null | undefined): string {
 // Map + visibility-filter a raw reactions array for a specific viewer.
 // `ownerId` is the moment owner; locked reactions survive only for the reactor
 // themselves or the owner.
+/** Nested `profiles` from PostgREST may be an object or a one-row array. */
+function nestedReactionProfile(r: any): any | null {
+  const raw = r?.profiles ?? r?.profile ?? null;
+  if (!raw) return null;
+  if (Array.isArray(raw)) return raw[0] ?? null;
+  return raw;
+}
+
 export function formatReactions(rawReactions: any[], viewerId?: string, ownerId?: string, blockedIds: string[] = []) {
   const blockedSet = blockedIds.length > 0 ? new Set(blockedIds) : null;
   return (rawReactions ?? [])
     .filter((r: any) => !blockedSet || !blockedSet.has(r.user_id))
-    .filter((r: any) => !isReactionLocked(r.type) || r.user_id === viewerId || ownerId === viewerId)
-    .map((r: any) => ({
-      userId: r.user_id,
-      type: baseReactionType(r.type),
-      locked: isReactionLocked(r.type),
-      userAvatar: r.profiles?.avatar_url ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${r.user_id}`,
-    }));
+    // Locked reactions: visible to the moment owner and the reactor (for lock UI).
+    // Everyone else never receives locked reactions from the API.
+    .filter((r: any) => !isReactionLocked(r.type) || ownerId === viewerId || r.user_id === viewerId)
+    .map((r: any) => {
+      const profile = nestedReactionProfile(r);
+      const username = String(profile?.username ?? "").trim();
+      const fullName = String(profile?.full_name ?? profile?.name ?? "").trim();
+      const userName = fullName || username || undefined;
+      return {
+        userId: r.user_id,
+        type: baseReactionType(r.type),
+        locked: isReactionLocked(r.type),
+        // Prefer display name; fall back to @username so sheets never look empty.
+        userName,
+        // Alias some clients read as `name`.
+        name: userName,
+        // Always resolve to a raster URL — raw SVG defaults render blank in expo-image.
+        userAvatar: resolveAvatarUrl(
+          r.user_id,
+          profile?.avatar_url,
+          profile?.gender
+        ),
+      };
+    });
+}
+
+/**
+ * Fill missing reactor names and always refresh avatars from live profiles so
+ * interaction sheets never show "a friend" and never keep a stale photo.
+ */
+export async function refreshReactionActors(posts: any[]): Promise<void> {
+  try {
+    const ids = new Set<string>();
+    for (const p of posts ?? []) {
+      for (const r of p?.reactions ?? []) {
+        if (r?.userId) ids.add(String(r.userId));
+      }
+      if (p?.original?.reactions) {
+        for (const r of p.original.reactions) {
+          if (r?.userId) ids.add(String(r.userId));
+        }
+      }
+    }
+    if (ids.size === 0) return;
+
+    const allIds = Array.from(ids);
+    const byId: Record<string, { userName: string; userAvatar: string }> = {};
+    for (let i = 0; i < allIds.length; i += 80) {
+      const chunk = allIds.slice(i, i + 80);
+      // Avoid selecting non-existent `name` — that aborts the whole enrich.
+      const { data: profiles, error } = await supabaseAdmin
+        .from("profiles")
+        .select("id, full_name, username, avatar_url, gender")
+        .in("id", chunk);
+      if (error) {
+        console.warn("[reactions] refreshReactionActors query failed:", error.message);
+        continue;
+      }
+      for (const pr of profiles ?? []) {
+        const username = String(pr.username ?? "").trim();
+        const fullName = String(pr.full_name ?? "").trim();
+        byId[pr.id] = {
+          userName: fullName || username || "Member",
+          userAvatar: resolveAvatarUrl(pr.id, pr.avatar_url, pr.gender),
+        };
+      }
+    }
+
+    const patch = (reactions: any[] | undefined) => {
+      if (!Array.isArray(reactions)) return;
+      for (const r of reactions) {
+        const live = r?.userId ? byId[String(r.userId)] : undefined;
+        if (!live) {
+          // Never leave blank — client falls back to "a friend" when missing.
+          if (!r.userName) r.userName = "Member";
+          continue;
+        }
+        r.userName = live.userName;
+        r.name = live.userName;
+        r.userAvatar = live.userAvatar;
+      }
+    };
+
+    for (const p of posts ?? []) {
+      patch(p?.reactions);
+      if (p?.original) patch(p.original.reactions);
+    }
+  } catch (e) {
+    console.error("[reactions] refreshReactionActors error:", e);
+  }
 }
 
 export function formatPost(p: any, viewerId?: string, blockedIds: string[] = []): any {
@@ -83,18 +385,60 @@ export function formatPost(p: any, viewerId?: string, blockedIds: string[] = [])
   const friends = p.type === FRIENDSHIP_TYPE ? parseFriendshipFriends(p) : undefined;
   // image_url may hold a single URL (legacy) or a JSON array of URLs (multi-image).
   const images = decodeImages(p.image_url);
+
+  // Never leak friendship JSON blobs or friend UUIDs as caption / place name.
+  // Clients must use `friends` for friendship moments (and SystemMomentTitle).
+  let content: string | undefined = p.content == null ? undefined : String(p.content);
+  let locationName: string | undefined =
+    p.location == null || p.location === "" ? undefined : String(p.location);
+
+  if (p.type === FRIENDSHIP_TYPE) {
+    content = undefined;
+    locationName = undefined;
+  } else if (content) {
+    const trimmed = content.trim();
+    if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        const looksLikeFriendPayload =
+          (Array.isArray(parsed) &&
+            parsed.some((x) => x && typeof x === "object" && "id" in x)) ||
+          (parsed && typeof parsed === "object" && !Array.isArray(parsed) && "id" in parsed);
+        if (looksLikeFriendPayload) content = undefined;
+      } catch {
+        /* keep plain text */
+      }
+    }
+  }
+
+  if (
+    locationName &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(locationName.trim())
+  ) {
+    locationName = undefined;
+  }
+
   return {
     id: p.id,
     userId: p.user_id,
-    user: p.profiles ? formatProfile(p.profiles) : null,
+    // Author card only — never embed zeroed profile stats here. Fake likeCount:0
+    // from formatProfile defaults was poisoning friend-profile caches so viewers
+    // only saw their own (visible) reactions instead of the real total.
+    user: p.profiles
+      ? (() => {
+          const u = formatProfile(p.profiles);
+          const { friendCount: _f, postCount: _p, momentCount: _m, likeCount: _l, like_count: _lc, ...author } = u as any;
+          return author;
+        })()
+      : null,
     type: p.type,
-    content: p.content ?? undefined,
+    content,
     friends,
     // `image` stays the FIRST url for full backward compatibility; `images` is
     // the complete list (present whenever there's at least one image).
     image: images[0] ?? undefined,
     images: images.length > 0 ? images : undefined,
-    locationName: p.location ?? undefined,
+    locationName,
     // Coordinates for check-in (location) moments so anyone who can see the
     // moment can open it on a map — same as location messages in chat.
     locationLat: p.location_lat ?? undefined,
@@ -109,8 +453,21 @@ export function formatPost(p: any, viewerId?: string, blockedIds: string[] = [])
     mealName: p.meal_name ?? undefined,
     sleepAction: p.sleep_action ?? undefined,
     sleepDuration: formatDuration(p.sleep_duration),
+    // Raw totals BEFORE privacy filtering — profile Likes for visitors must use
+    // these, not reactions.length (locked likes are stripped for non-owners).
+    reactionCount: Array.isArray(p.reactions) ? p.reactions.length : 0,
     reactions: formatReactions(p.reactions ?? [], viewerId, p.user_id, blockedIds),
-    commentCount: p.comment_count ?? 0,
+    // Prefer stored count; never report 0 when a preview comment is attached.
+    commentCount: Math.max(
+      Number(p.comment_count ?? 0) || 0,
+      Array.isArray(p.preview_comments)
+        ? p.preview_comments.length
+        : Array.isArray(p.previewComments)
+          ? p.previewComments.length
+          : 0,
+    ),
+    // Selected preview comment for feed cards (viewer-priority on the server).
+    previewComments: formatPreviewComments(p),
     createdAt: p.created_at,
     // Reshare ("Repath"): `repath_of` is the original moment id (absent until the
     // column exists). `original` is the nested original row, attached by the
@@ -127,28 +484,50 @@ export function formatPost(p: any, viewerId?: string, blockedIds: string[] = [])
 }
 
 // GET /api/search?q=...
+// Global people discovery (friends + non-friends).
+//   "@ali"  → username prefix search
+//   "ali"   → full_name contains search
 usersRouter.get("/search", async (c) => {
   const user = c.get("user");
   const userId = c.get("userId");
   const token = c.get("accessToken");
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
-  // Strip a leading "@" so "@ali" and "ali" search the same. PREFIX match
-  // (starts-with) on username OR full_name — one letter already lists everyone
-  // matching that prefix. This is GLOBAL discovery: it searches ALL users, not
-  // just the viewer's friends. (Privacy still governs what moments they can see
-  // once a profile is opened — this only finds the person.)
-  const q = (c.req.query("q") ?? "").replace(/^@+/, "").trim();
+  const rawQ = c.req.query("q") ?? "";
+  const usernameMode = /^\s*@/.test(rawQ);
+  // Strip leading @ and PostgREST / ilike metacharacters that break filters.
+  const q = rawQ
+    .replace(/^@+/, "")
+    .trim()
+    .replace(/[%_,.()\"'\\]/g, "")
+    .trim();
   if (q.length < 1) return c.json({ data: [] });
 
-  const userClient = createUserClient(token);
-  const { data: profiles } = await userClient
+  const limit = parseLimit(c.req.query("limit"), 20, 50);
+  const offset = Math.max(0, Number.parseInt(String(c.req.query("offset") ?? "0"), 10) || 0);
+
+  // Use service role so RLS never blanks discovery (same as /friends/discover).
+  // Fetch limit+1 to detect hasMore (after block/deletion filters we may drop some).
+  // Never include the authenticated user in people search.
+  let profileQuery = supabaseAdmin
     .from("profiles")
     .select("*")
-    .or(`full_name.ilike.${q}%,username.ilike.${q}%`)
-    .limit(30);
+    .neq("id", userId)
+    .range(offset, offset + limit);
+  if (usernameMode) {
+    profileQuery = profileQuery.ilike("username", `${q}%`);
+  } else {
+    // Name search: match anywhere in the display name.
+    profileQuery = profileQuery.ilike("full_name", `%${q}%`);
+  }
 
-  // Fetch all friendships involving the current user
+  const { data: profiles, error: profileError } = await profileQuery;
+  if (profileError) {
+    console.error("[search] profiles query failed:", profileError.message);
+    return c.json({ error: { message: "Search failed" } }, 500);
+  }
+
+  const userClient = createUserClient(token);
   const { data: myFriendships } = await userClient
     .from("friendships")
     .select("id, requester_id, receiver_id, status")
@@ -160,27 +539,28 @@ usersRouter.get("/search", async (c) => {
     friendshipByUser[otherId] = { id: f.id, status: f.status, isSender: f.requester_id === userId };
   }
 
-  // Hide users blocked in either direction from discovery results.
   const blockedSet = new Set(await getBlockedIds(userId));
 
   const results = (profiles ?? [])
-    .filter((p: any) => !blockedSet.has(p.id))
+    .filter((p: any) => !blockedSet.has(p.id) && !isDeletionHiddenProfile(p) && p.id !== userId)
     .map((p: any) => {
-    const fs = friendshipByUser[p.id];
-    let friendshipStatus: 'none' | 'pending_sent' | 'pending_received' | 'friends' = 'none';
-    let friendshipId: string | undefined;
-    if (fs) {
-      friendshipId = fs.id;
-      if (fs.status === 'accepted') {
-        friendshipStatus = 'friends';
-      } else if (fs.status === 'pending') {
-        friendshipStatus = fs.isSender ? 'pending_sent' : 'pending_received';
+      const fs = friendshipByUser[p.id];
+      let friendshipStatus: "none" | "pending_sent" | "pending_received" | "friends" = "none";
+      let friendshipId: string | undefined;
+      if (fs) {
+        friendshipId = fs.id;
+        if (fs.status === "accepted") {
+          friendshipStatus = "friends";
+        } else if (fs.status === "pending") {
+          friendshipStatus = fs.isSender ? "pending_sent" : "pending_received";
+        }
       }
-    }
-    return { ...formatProfile(p), friendshipStatus, friendshipId };
-  });
+      return { ...formatProfile(p, 0, 0, userId), friendshipStatus, friendshipId };
+    });
 
-  return c.json({ data: results });
+  const hasMore = (profiles ?? []).length > limit;
+  const page = hasMore ? results.slice(0, limit) : results;
+  return c.json({ data: page, hasMore, limit, offset, nextOffset: hasMore ? offset + limit : null });
 });
 
 // GET /api/by-username/:username
@@ -226,6 +606,10 @@ usersRouter.get("/by-username/:username", async (c) => {
   }
 
   if (!match) return c.json({ data: null });
+  // Deletion grace: profile inaccessible, but username stays reserved (check endpoint still taken).
+  if (match.id !== userId && isDeletionHiddenProfile(match)) {
+    return c.json({ data: null });
+  }
   return c.json({ data: formatProfile(match, 0, 0, userId ?? undefined) });
 });
 
@@ -240,7 +624,15 @@ usersRouter.get("/username-check/:username", async (c) => {
     return c.json({ data: { available: false, reason: "Only letters, numbers, and underscores allowed" } });
   }
   const { data } = await supabase.from("profiles").select("id").eq("username", trimmed).maybeSingle();
-  return c.json({ data: { available: !data } });
+  if (data) {
+    return c.json({ data: { available: false, reason: "Username already taken" } });
+  }
+  const { data: pending } = await supabaseAdmin
+    .from("pending_registrations")
+    .select("id")
+    .ilike("username", trimmed)
+    .maybeSingle();
+  return c.json({ data: { available: !pending } });
 });
 
 // POST /api/setup-profile
@@ -289,6 +681,11 @@ usersRouter.post("/setup-profile", async (c) => {
     return c.json({ error: { message: "Failed to create profile", supabaseError: error.message } }, 500);
   }
 
+  if (!isCustomAvatar(profile.avatar_url)) {
+    const assigned = await ensureGenderDefaultAvatar(userId, profile.gender, profile.avatar_url);
+    if (assigned) profile.avatar_url = assigned;
+  }
+
   return c.json({ data: formatProfile(profile) }, 201);
 });
 
@@ -299,19 +696,40 @@ usersRouter.get("/me", async (c) => {
   const token = c.get("accessToken");
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
-  const userClient = createUserClient(token);
+  // Always read the profile row so username/avatar stay in sync with the DB.
+  let { data: profileRow } = await supabaseAdmin
+    .from("profiles")
+    .select("*")
+    .eq("id", userId)
+    .maybeSingle();
 
-  const [postsResult, friendsResult] = await Promise.all([
-    userClient.from("posts").select("id", { count: "exact", head: true }).eq("user_id", userId),
-    supabaseAdmin.from("friendships").select("id", { count: "exact", head: true }).eq("status", "accepted").or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
-  ]);
+  // Heal legacy rows missing username (also runs on boot; this covers mid-session).
+  const haveUsername = USERNAME_RE.test(
+    String(profileRow?.username ?? "")
+      .trim()
+      .toLowerCase()
+  );
+  if (profileRow && !haveUsername) {
+    await ensureUserHasUsername(userId);
+    const refreshed = await supabaseAdmin.from("profiles").select("*").eq("id", userId).maybeSingle();
+    profileRow = refreshed.data ?? profileRow;
+  }
 
-  return c.json({ data: formatProfile(user, postsResult.count ?? 0, friendsResult.count ?? 0, userId) });
+  // Persist a default avatar for accounts that never uploaded a photo.
+  if (profileRow && !isCustomAvatar(profileRow.avatar_url)) {
+    const assigned = await ensureGenderDefaultAvatar(userId, profileRow.gender, profileRow.avatar_url);
+    if (assigned) profileRow.avatar_url = assigned;
+  }
+
+  const profile = profileRow ?? user;
+  const counts = await loadProfileStatCounts(userId);
+  return c.json({
+    data: formatProfile(profile, counts.postCount, counts.friendCount, userId, counts.likeCount),
+  });
 });
 
-// POST /api/set-gender — one-time gender selection for users who signed up
-// before gender was mandatory. Refuses to overwrite an existing gender so it
-// can never be edited once set.
+// POST /api/set-gender — optional gender selection (Apple 5.1.1(v)).
+// Also repairs a mismatched default avatar when gender is already set.
 usersRouter.post("/set-gender", async (c) => {
   const user = c.get("user");
   const userId = c.get("userId");
@@ -319,24 +737,38 @@ usersRouter.post("/set-gender", async (c) => {
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const body = await c.req.json().catch(() => ({}));
-  const gender = body?.gender;
-  if (gender !== "Male" && gender !== "Female") {
+  const gender = normalizeGender(body?.gender);
+  if (!gender) {
     return c.json({ error: { message: "Gender must be Male or Female" } }, 400);
   }
-  if ((user as any).gender) {
+
+  const existingGender = normalizeGender((user as any).gender);
+  if (existingGender && existingGender !== gender) {
     return c.json({ error: { message: "Gender already set" } }, 409);
   }
 
-  const userClient = createUserClient(token);
-  const { data: updated, error } = await userClient
+  const updatePayload: Record<string, unknown> = { gender };
+  const currentAvatar = (user as any).avatar_url ?? null;
+  if (!isCustomAvatar(currentAvatar)) {
+    updatePayload.avatar_url = defaultAvatarForGender(userId, gender);
+  }
+
+  const { data: updated, error } = await supabaseAdmin
     .from("profiles")
-    .update({ gender })
+    .update(updatePayload)
     .eq("id", userId)
     .select()
     .single();
 
-  if (error) return c.json({ error: { message: "Failed to set gender" } }, 500);
-  return c.json({ data: formatProfile(updated, 0, 0, userId) });
+  if (error) {
+    console.error("[users] set-gender failed:", error.message);
+    return c.json({ error: { message: "Failed to set gender" } }, 500);
+  }
+  refreshAuthProfileCache(token, updated);
+  const counts = await loadProfileStatCounts(userId);
+  return c.json({
+    data: formatProfile(updated, counts.postCount, counts.friendCount, userId, counts.likeCount),
+  });
 });
 
 // PUT /api/me
@@ -347,9 +779,23 @@ usersRouter.put("/me", async (c) => {
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const body = await c.req.json();
+  if (profilePatchTriesToSetVerification(body)) {
+    return c.json({ error: { message: "Verification status cannot be changed from a profile update" } }, 403);
+  }
+
+  if (body.themePreference === "light" || body.themePreference === "dark" || body.themePreference === "system") {
+    const { ensureThemePreferenceColumn } = await import("../lib/schema");
+    await ensureThemePreferenceColumn();
+  }
 
   if (body.username) {
-    const trimmedUsername = body.username.toLowerCase().trim();
+    const trimmedUsername = body.username.toLowerCase().trim().replace(/^@+/, "");
+    if (!USERNAME_RE.test(trimmedUsername)) {
+      return c.json(
+        { error: { message: "Username must be 3–30 characters: letters, numbers, underscore." } },
+        400
+      );
+    }
     const { data: existing } = await supabase
       .from("profiles")
       .select("id")
@@ -360,69 +806,628 @@ usersRouter.put("/me", async (c) => {
     body.username = trimmedUsername;
   }
 
-  const userClient = createUserClient(token);
   const updateData: Record<string, unknown> = {};
   if (body.name !== undefined) updateData.full_name = body.name;
   if (body.username !== undefined) updateData.username = body.username;
   if (body.bio !== undefined) updateData.bio = body.bio;
   if (body.location !== undefined) updateData.location = body.location;
-  // birthday and gender are intentionally NOT editable here — they are fixed at
-  // signup. Only the age/zodiac visibility toggles can be changed.
+  // birthday and gender are optional profile fields; once set they are not
+  // changed here. Age/zodiac visibility toggles can still be updated.
   if (body.showAge !== undefined) updateData.show_age = !!body.showAge;
   if (body.showZodiac !== undefined) updateData.show_zodiac = !!body.showZodiac;
-  if (body.coverPhoto !== undefined) updateData.cover_url = body.coverPhoto;
-  if (body.avatar !== undefined) updateData.avatar_url = body.avatar;
-  if (body.push_token !== undefined) updateData.push_token = body.push_token;
+  const deviceId =
+    typeof body.device_id === "string" && body.device_id.trim()
+      ? body.device_id.trim()
+      : typeof body.deviceId === "string" && body.deviceId.trim()
+        ? body.deviceId.trim()
+        : null;
+  const platform =
+    typeof body.platform === "string" && body.platform.trim()
+      ? body.platform.trim().toLowerCase()
+      : "unknown";
 
-  const { data: updated, error } = await userClient
+  if (body.push_token !== undefined) updateData.push_token = body.push_token;
+  if (body.pushNotificationsEnabled !== undefined) {
+    updateData.push_notifications_enabled = Boolean(body.pushNotificationsEnabled);
+    if (body.pushNotificationsEnabled === false) {
+      updateData.push_token = null;
+      await deactivateUserDevices(supabaseAdmin, userId);
+    }
+  }
+  if (body.emailNotificationsEnabled !== undefined) {
+    updateData.email_notifications_enabled = Boolean(body.emailNotificationsEnabled);
+  }
+  if (body.preferredLanguage !== undefined) {
+    updateData.preferred_language = body.preferredLanguage === "ar" ? "ar" : "en";
+  }
+  if (body.themePreference === "light" || body.themePreference === "dark" || body.themePreference === "system") {
+    updateData.theme_preference = body.themePreference;
+  }
+  if (body.showFriendsToFriends !== undefined) updateData.show_friends_to_friends = !!body.showFriendsToFriends;
+  if (body.showFriendsToOthers !== undefined) updateData.show_friends_to_others = !!body.showFriendsToOthers;
+  if (body.showPostsToFriends !== undefined) updateData.show_posts_to_friends = !!body.showPostsToFriends;
+  if (body.showPostsToOthers !== undefined) updateData.show_posts_to_others = !!body.showPostsToOthers;
+  if (body.showMomentsToFriends !== undefined) updateData.show_moments_to_friends = !!body.showMomentsToFriends;
+  if (body.showMomentsToOthers !== undefined) updateData.show_moments_to_others = !!body.showMomentsToOthers;
+
+  // Read CURRENT avatar/cover from DB — never from the short-lived auth cache.
+  // Clients often resend both images on every save. The displayed cover is a
+  // placeholder when cover_url is null, so comparing that echo to the database
+  // used to create a cover moment whenever the profile picture changed.
+  const { data: beforeRow } = await supabaseAdmin
+    .from("profiles")
+    .select("avatar_url, cover_url")
+    .eq("id", userId)
+    .maybeSingle();
+  const oldAvatar = beforeRow?.avatar_url ?? (user as any).avatar_url ?? null;
+  const oldCover = beforeRow?.cover_url ?? (user as any).cover_url ?? null;
+  const nextAvatar = acceptedProfileImageUpdate(oldAvatar, body.avatar, "avatar");
+  const nextCover = acceptedProfileImageUpdate(oldCover, body.coverPhoto, "cover");
+  if (nextAvatar) {
+    // Cache-bust so notifications / feed / chat never keep a stale photo.
+    const base = String(nextAvatar).replace(/([?&])v=\d+/g, "").replace(/[?&]$/, "");
+    updateData.avatar_url = `${base}${base.includes("?") ? "&" : "?"}v=${Date.now()}`;
+  }
+  if (nextCover) updateData.cover_url = nextCover;
+
+  if (Object.keys(updateData).length === 0) {
+    return c.json({ error: { message: "No fields to update" } }, 400);
+  }
+
+  // Use service role for profile writes so missing/strict UPDATE policies (and
+  // newly-added columns like show_age / show_zodiac) cannot silently block the
+  // age & zodiac visibility toggles after the caller is already authenticated.
+  const { data: updated, error } = await supabaseAdmin
     .from("profiles")
     .update(updateData)
     .eq("id", userId)
     .select()
     .single();
 
-  if (error) return c.json({ error: { message: "Update failed" } }, 500);
-
-  // Auto-create system moments when the avatar / cover photo ACTUALLY changes.
-  // We compare against the values the profile had before this update.
-  const oldAvatar = (user as any).avatar_url ?? null;
-  const oldCover = (user as any).cover_url ?? null;
-  if (body.avatar !== undefined && body.avatar && body.avatar !== oldAvatar) {
-    await ensureAvatarChangeMoment(userId, body.avatar);
-  }
-  if (body.coverPhoto !== undefined && body.coverPhoto && body.coverPhoto !== oldCover) {
-    await ensureCoverChangeMoment(userId, body.coverPhoto);
+  if (error) {
+    console.error("[users] PUT /me failed:", error.message, error.code);
+    return c.json({ error: { message: "Update failed" } }, 500);
   }
 
-  const [postsResult, friendsResult] = await Promise.all([
-    userClient.from("posts").select("id", { count: "exact", head: true }).eq("user_id", userId),
-    supabaseAdmin.from("friendships").select("id", { count: "exact", head: true }).eq("status", "accepted").or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
-  ]);
+  // Keep the auth middleware cache in sync so the next request sees new cover/avatar.
+  refreshAuthProfileCache(token, updated);
 
-  return c.json({ data: formatProfile(updated, postsResult.count ?? 0, friendsResult.count ?? 0, userId) });
+  // Register push token in user_devices when the client sends token + device id.
+  if (
+    typeof body.push_token === "string" &&
+    body.push_token.startsWith("ExponentPushToken") &&
+    deviceId
+  ) {
+    await upsertUserDevice(supabaseAdmin, userId, {
+      pushToken: body.push_token,
+      platform,
+      deviceId,
+    });
+  }
+
+  // One moment per image that actually changed — never both for a single photo.
+  if (nextAvatar) await ensureAvatarChangeMoment(userId, nextAvatar);
+  if (nextCover) await ensureCoverChangeMoment(userId, nextCover);
+
+  const counts = await loadProfileStatCounts(userId);
+  return c.json({
+    data: formatProfile(updated, counts.postCount, counts.friendCount, userId, counts.likeCount),
+  });
+});
+
+// POST /api/me/push-deactivate — deactivate this device's push token (logout).
+usersRouter.post("/me/push-deactivate", async (c) => {
+  const userId = c.get("userId");
+  if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const body = await c.req.json().catch(() => ({}));
+  const deviceId =
+    typeof body.device_id === "string" && body.device_id.trim()
+      ? body.device_id.trim()
+      : typeof body.deviceId === "string" && body.deviceId.trim()
+        ? body.deviceId.trim()
+        : null;
+
+  await deactivateUserDevices(supabaseAdmin, userId, deviceId);
+  return c.body(null, 204);
+});
+
+// POST /api/me/push-register — save Expo push token for this device (idempotent).
+usersRouter.post("/me/push-register", async (c) => {
+  const userId = c.get("userId");
+  if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const body = await c.req.json().catch(() => ({}));
+  const pushToken =
+    typeof body.push_token === "string"
+      ? body.push_token.trim()
+      : typeof body.pushToken === "string"
+        ? body.pushToken.trim()
+        : "";
+  const deviceId =
+    typeof body.device_id === "string" && body.device_id.trim()
+      ? body.device_id.trim()
+      : typeof body.deviceId === "string" && body.deviceId.trim()
+        ? body.deviceId.trim()
+        : null;
+  const platform =
+    typeof body.platform === "string" && body.platform.trim()
+      ? body.platform.trim().toLowerCase()
+      : "unknown";
+
+  if (!pushToken.startsWith("ExponentPushToken") || !deviceId) {
+    return c.json(
+      {
+        error: {
+          message:
+            "push_token (ExponentPushToken…) and device_id are required",
+        },
+      },
+      400
+    );
+  }
+
+  await upsertUserDevice(supabaseAdmin, userId, {
+    pushToken,
+    platform,
+    deviceId,
+  });
+
+  const status = await getPushStatusForUser(supabaseAdmin, userId);
+  return c.json({
+    data: {
+      ok: true,
+      message: "Push token registered",
+      ...status,
+    },
+  });
+});
+
+// GET /api/me/push-status — diagnostic summary (no secrets, no full tokens).
+usersRouter.get("/me/push-status", async (c) => {
+  const userId = c.get("userId");
+  if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const status = await getPushStatusForUser(supabaseAdmin, userId);
+  return c.json({
+    data: {
+      ...status,
+      architecture: "expo_push",
+      expoPushApi: "https://exp.host/--/api/v2/push/send",
+      bundleIdentifier: "com.mazyd.pathplus",
+      easProjectId: "a6adef19-c35b-4fc7-b4b9-6bc4af060d39",
+    },
+  });
+});
+
+// POST /api/me/push-test — send a test notification to the authenticated user's devices.
+usersRouter.post("/me/push-test", async (c) => {
+  const userId = c.get("userId");
+  if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const status = await getPushStatusForUser(supabaseAdmin, userId);
+
+  if (!status.pushEnabledGlobally) {
+    return c.json({
+      data: {
+        ok: false,
+        step: "push_disabled_globally",
+        message: "Push notifications are disabled in Admin → External Services.",
+        ...status,
+      },
+    });
+  }
+
+  if (!status.pushEnabledForUser) {
+    return c.json({
+      data: {
+        ok: false,
+        step: "push_disabled_user",
+        message: "Push notifications are turned off in your account settings.",
+        ...status,
+      },
+    });
+  }
+
+  const tokens = await getPushTokensForUser(supabaseAdmin, userId);
+  if (tokens.length === 0) {
+    return c.json({
+      data: {
+        ok: false,
+        step: "no_tokens",
+        message:
+          "No active push token found. Use a physical iOS device (not simulator), grant notification permission, and open the app while signed in.",
+        activeDeviceCount: 0,
+        ...status,
+      },
+    });
+  }
+
+  console.log(`[push-test] User ${userId.slice(0, 8)}… requesting test push (${tokens.length} device(s))`);
+
+  const results = await Promise.all(
+    tokens.map(async (token) => {
+      const badge = await getUnreadNotificationBadgeCount(supabaseAdmin, userId);
+      return sendPushNotificationDetailed(
+        token,
+        "Path+ Test Notification",
+        "Push Notifications are working correctly.",
+        { type: "test" },
+        supabaseAdmin,
+        { waitForReceipt: true, badge, userId }
+      );
+    })
+  );
+
+  const ok = results.some((r) => r.ok);
+  return c.json({
+    data: {
+      ok,
+      step: ok ? "delivered" : "delivery_failed",
+      message: ok
+        ? "Test notification sent successfully."
+        : results[0]?.message ?? "Push delivery failed — check backend logs for Expo ticket/receipt errors.",
+      activeDeviceCount: tokens.length,
+      results,
+      ...status,
+    },
+  });
+});
+
+import {
+  suspendAccountForDeletion,
+  permanentlyDeleteUser,
+  DELETION_SUSPEND_REASON,
+} from "../lib/account-deletion";
+
+// POST /api/me/deletion-request — immediately suspend account for 30-day deletion window.
+usersRouter.post("/me/deletion-request", async (c) => {
+  const userId = c.get("userId");
+  if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const body = await c.req.json().catch(() => ({}));
+  const reason = body?.reason ? String(body.reason).trim().slice(0, 1000) : null;
+
+  const result = await suspendAccountForDeletion(userId, reason);
+  if (!result.ok) {
+    return c.json({ error: { message: result.message } }, 500);
+  }
+
+  const now = new Date().toISOString();
+  return c.json({
+    data: {
+      status: "suspended",
+      suspendedAt: now,
+      message:
+        "Your account is suspended for 30 days. Content is hidden and your username stays reserved. Sign in within 30 days to reactivate. On day 29 you will get a reminder; after 30 days everything is permanently deleted.",
+    },
+  });
+});
+
+usersRouter.get("/me/deletion-request", async (c) => {
+  const userId = c.get("userId");
+  if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const { data: profile } = await supabaseAdmin
+    .from("profiles")
+    .select("status, suspended_at, suspended_reason")
+    .eq("id", userId)
+    .maybeSingle();
+
+  if (
+    profile?.status === "suspended" &&
+    profile.suspended_reason === DELETION_SUSPEND_REASON
+  ) {
+    return c.json({
+      data: {
+        status: "suspended",
+        suspendedAt: profile.suspended_at,
+      },
+    });
+  }
+
+  return c.json({ data: null });
+});
+
+// DELETE /api/me — permanently delete (service / cron only; users use deletion-request).
+usersRouter.delete("/me", async (c) => {
+  const userId = c.get("userId");
+  if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const result = await permanentlyDeleteUser(userId);
+  if (!result.ok) {
+    console.error("[users] DELETE /me failed:", result.error);
+    return c.json({ error: { message: "Failed to delete account" } }, 500);
+  }
+
+  return c.body(null, 204);
+});
+
+// GET /api/profile-stats/:id — unambiguous public counters (friend or not).
+// Prefer this over /:id/stats so proxies / older routers cannot miss it.
+usersRouter.get("/profile-stats/:id", async (c) => {
+  const userId = c.get("userId");
+  const token = c.get("accessToken");
+  if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const { id } = c.req.param();
+  if (!id) return c.json({ error: { message: "User not found" } }, 404);
+
+  if (id !== userId) {
+    const blocked = await getBlockedIds(userId);
+    if (blocked.includes(id)) {
+      return c.json({ error: { message: "User not found" } }, 404);
+    }
+  }
+
+  const { data: targetProfile, error: profileErr } = await supabaseAdmin
+    .from("profiles")
+    .select("*")
+    .eq("id", id)
+    .maybeSingle();
+  if (profileErr) {
+    console.warn("[users] profile-stats profile error:", profileErr.message);
+  }
+  if (!targetProfile) return c.json({ error: { message: "User not found" } }, 404);
+  if (id !== userId && isDeletionHiddenProfile(targetProfile)) {
+    return c.json({ error: { message: "User not found" } }, 404);
+  }
+
+  const counts = await loadProfileStatCounts(id);
+  const likeCount = Math.max(
+    counts.likeCount,
+    Number((targetProfile as any).like_count ?? 0) || 0
+  );
+  return c.json({
+    data: {
+      likeCount,
+      friendCount: counts.friendCount,
+      postCount: counts.postCount,
+      momentCount: counts.postCount,
+    },
+  });
+});
+
+// GET /api/:id/stats — public profile counters for any visitor (friend or not).
+// Kept as its own route so clients can refresh likes without re-fetching the
+// whole profile, and so list-cache stubs cannot hide the real total.
+usersRouter.get("/:id/stats", async (c) => {
+  const userId = c.get("userId");
+  const token = c.get("accessToken");
+  if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const { id } = c.req.param();
+  if (!id) return c.json({ error: { message: "User not found" } }, 404);
+
+  if (id !== userId) {
+    const blocked = await getBlockedIds(userId);
+    if (blocked.includes(id)) {
+      return c.json({ error: { message: "User not found" } }, 404);
+    }
+  }
+
+  const { data: targetProfile, error: profileErr } = await supabaseAdmin
+    .from("profiles")
+    .select("*")
+    .eq("id", id)
+    .maybeSingle();
+  if (profileErr) {
+    console.warn("[users] /:id/stats profile error:", profileErr.message);
+  }
+  if (!targetProfile) return c.json({ error: { message: "User not found" } }, 404);
+  if (id !== userId && isDeletionHiddenProfile(targetProfile)) {
+    return c.json({ error: { message: "User not found" } }, 404);
+  }
+
+  const counts = await loadProfileStatCounts(id);
+  const likeCount = Math.max(
+    counts.likeCount,
+    Number((targetProfile as any).like_count ?? 0) || 0
+  );
+  return c.json({
+    data: {
+      likeCount,
+      friendCount: counts.friendCount,
+      postCount: counts.postCount,
+      momentCount: counts.postCount,
+    },
+  });
 });
 
 // GET /api/:id
 usersRouter.get("/:id", async (c) => {
-  const user = c.get("user");
   const userId = c.get("userId");
   const token = c.get("accessToken");
-  if (!user || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+  if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const { id } = c.req.param();
-  const userClient = createUserClient(token);
-  const { data: targetProfile } = await userClient.from("profiles").select("*").eq("id", id).single();
+
+  // Hide profiles that are blocked in either direction.
+  if (userId && id !== userId) {
+    const blocked = await getBlockedIds(userId);
+    if (blocked.includes(id)) {
+      return c.json({ error: { message: "User not found" } }, 404);
+    }
+  }
+
+  // Service role — same as GET /me. User-JWT + half-broken profiles RLS can
+  // return incomplete or empty rows for some accounts (missing name/username).
+  const { data: targetProfile, error: profileErr } = await supabaseAdmin
+    .from("profiles")
+    .select("*")
+    .eq("id", id)
+    .maybeSingle();
+
+  if (profileErr) {
+    console.warn("[users] GET /:id profile error:", profileErr.message);
+  }
   if (!targetProfile) return c.json({ error: { message: "User not found" } }, 404);
 
+  // During the 30-day deletion grace window, content/profile are inaccessible to others.
+  // Username remains reserved on the profile row until permanent purge.
+  if (id !== userId && isDeletionHiddenProfile(targetProfile)) {
+    return c.json({ error: { message: "User not found" } }, 404);
+  }
+
+  // Persist a username when the profile row is missing one (legacy accounts).
+  let enriched = targetProfile;
+  const needsUsername = !USERNAME_RE.test(
+    String(targetProfile.username ?? "")
+      .trim()
+      .toLowerCase()
+  );
+  if (needsUsername || !String(targetProfile.full_name ?? "").trim()) {
+    if (needsUsername) {
+      await ensureUserHasUsername(id);
+    }
+    try {
+      const { data: authData } = await supabaseAdmin.auth.admin.getUserById(id);
+      const meta = authData?.user?.user_metadata ?? {};
+      const { data: fresh } = await supabaseAdmin.from("profiles").select("*").eq("id", id).maybeSingle();
+      const row = fresh ?? targetProfile;
+      enriched = {
+        ...row,
+        full_name:
+          String(row.full_name ?? "").trim() ||
+          String(meta.full_name ?? meta.name ?? "").trim() ||
+          row.full_name,
+        username: String(row.username ?? "").trim() || String(meta.username ?? "").trim() || row.username,
+      };
+    } catch (e) {
+      console.warn("[users] GET /:id identity heal failed:", e);
+    }
+  }
+
+  // Fast path for profile chrome: head counts only. Do NOT await
+  // countInteractionsReceived here — that walks every post and made GET /:id
+  // feel like a 2–3s blank screen. Accurate likes come from /profile-stats.
   const [postsResult, friendsResult] = await Promise.all([
-    userClient.from("posts").select("id", { count: "exact", head: true }).eq("user_id", id),
-    // True total friend count — uses the admin client so RLS doesn't restrict the
-    // count to only the friendships the *viewer* is part of (which made the count
-    // differ per viewer). Same number for everyone now.
-    supabaseAdmin.from("friendships").select("id", { count: "exact", head: true }).eq("status", "accepted").or(`requester_id.eq.${id},receiver_id.eq.${id}`),
+    supabaseAdmin.from("posts").select("*", { count: "exact", head: true }).eq("user_id", id),
+    supabaseAdmin
+      .from("friendships")
+      .select("*", { count: "exact", head: true })
+      .eq("status", "accepted")
+      .or(`requester_id.eq.${id},receiver_id.eq.${id}`),
+  ]);
+  const postCount = postsResult.count ?? 0;
+  const friendCount = friendsResult.count ?? 0;
+  const likeCount =
+    typeof enriched.like_count === "number" && Number.isFinite(enriched.like_count)
+      ? enriched.like_count
+      : 0;
+
+  const profile = formatProfile(
+    enriched,
+    postCount,
+    friendCount,
+    userId ?? undefined,
+    likeCount
+  );
+
+  // Always expose the global like total to every visitor (friend or not).
+  return c.json({
+    data: {
+      ...profile,
+      likeCount,
+      momentCount: postCount,
+      postCount,
+      friendCount,
+    },
+  });
+});
+
+async function areFriends(a: string, b: string): Promise<boolean> {
+  const { data } = await supabaseAdmin
+    .from("friendships")
+    .select("id")
+    .eq("status", "accepted")
+    .or(`and(requester_id.eq.${a},receiver_id.eq.${b}),and(requester_id.eq.${b},receiver_id.eq.${a})`)
+    .maybeSingle();
+  return !!data;
+}
+
+// GET /api/:id/friends — list this user's friends (gated by privacy settings).
+usersRouter.get("/:id/friends", async (c) => {
+  const userId = c.get("userId");
+  const token = c.get("accessToken");
+  if (!userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const { id } = c.req.param();
+  if (await getBlockedIds(userId).then((ids) => ids.includes(id))) {
+    return c.json({ error: { message: "User not found" } }, 404);
+  }
+
+  const { data: profile } = await supabaseAdmin.from("profiles").select("*").eq("id", id).single();
+  if (!profile) return c.json({ error: { message: "User not found" } }, 404);
+
+  const isOwner = userId === id;
+  const isFriend = isOwner ? true : await areFriends(userId, id);
+  // Friends (and owner) can always open the list. Non-friends need
+  // Friends List Visibility (show_friends_to_others) ON.
+  const allowed = isOwner || isFriend || !!(profile.show_friends_to_others ?? false);
+  if (!allowed) {
+    return c.json({ error: { message: "This friends list is private" } }, 403);
+  }
+
+  // Friendships + block list in parallel; lean profile columns for a fast sheet.
+  const [{ data: friendships }, blockedIds] = await Promise.all([
+    supabaseAdmin
+      .from("friendships")
+      .select("requester_id, receiver_id")
+      .eq("status", "accepted")
+      .or(`requester_id.eq.${id},receiver_id.eq.${id}`),
+    getBlockedIds(userId),
   ]);
 
-  return c.json({ data: formatProfile(targetProfile, postsResult.count ?? 0, friendsResult.count ?? 0, userId ?? undefined) });
+  const friendIds = (friendships ?? []).map((f: any) =>
+    f.requester_id === id ? f.receiver_id : f.requester_id
+  );
+
+  if (friendIds.length === 0) return c.json({ data: [] });
+
+  const blocked = new Set(blockedIds);
+  const visibleIds = friendIds.filter((fid: string) => !blocked.has(fid));
+  if (visibleIds.length === 0) return c.json({ data: [] });
+
+  const { data: profiles } = await supabaseAdmin
+    .from("profiles")
+    .select(
+      "id, full_name, username, avatar_url, gender, bio, location, cover_url, created_at, status, suspended_reason"
+    )
+    .in("id", visibleIds);
+
+  // Hide accounts in the deletion grace window, and never return blank names.
+  const visible = (profiles ?? []).filter((p: any) => !isDeletionHiddenProfile(p));
+  const needIdentity = visible.filter((p: any) => {
+    const name = String(p?.full_name ?? p?.name ?? "").trim();
+    const username = String(p?.username ?? "").trim();
+    return !name || !username;
+  });
+  await Promise.all(
+    needIdentity.map(async (p: any) => {
+      try {
+        const { data: authData } = await supabaseAdmin.auth.admin.getUserById(p.id);
+        const meta = authData?.user?.user_metadata ?? {};
+        const metaName = String(meta.full_name ?? meta.name ?? "").trim();
+        const metaUsername = String(meta.username ?? "").trim();
+        if (!String(p.full_name ?? "").trim() && metaName) p.full_name = metaName;
+        if (!String(p.username ?? "").trim() && metaUsername) p.username = metaUsername;
+      } catch {
+        /* best-effort */
+      }
+    })
+  );
+
+  return c.json({
+    data: visible.map((p: any) => {
+      const formatted = formatProfile(p, 0, 0, userId);
+      // Mirror friends-list formatting: never ship an empty name label.
+      if (!String(formatted.name ?? "").trim() && formatted.username) {
+        formatted.name = formatted.username;
+      }
+      return formatted;
+    }),
+  });
 });
 
 // GET /api/:id/posts
@@ -433,63 +1438,112 @@ usersRouter.get("/:id/posts", async (c) => {
   if (!user || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const { id } = c.req.param();
+  const section = (c.req.query("section") ?? "moments").toLowerCase(); // posts | moments
+  const wantAll =
+    c.req.query("all") === "1" ||
+    c.req.query("all") === "true" ||
+    String(c.req.query("limit") ?? "").toLowerCase() === "all";
 
   // If this profile is blocked (either direction), don't expose their moments.
   const blockedIds = userId ? await getBlockedIds(userId) : [];
   if (blockedIds.includes(id)) return c.json({ data: [] });
 
-  const userClient = createUserClient(token);
-  const { data: posts } = await userClient
-    .from("posts")
-    .select("*, profiles(*), reactions(user_id, type, profiles:user_id(avatar_url))")
-    .eq("user_id", id)
-    .order("created_at", { ascending: false });
+  const { data: ownerProfile } = await supabaseAdmin.from("profiles").select("*").eq("id", id).single();
+  if (!ownerProfile) return c.json({ data: [] });
 
-  const all = posts ?? [];
+  const isOwner = !!userId && userId === id;
 
-  // Per-post audience enforcement when someone views ANOTHER user's profile.
-  // The owner viewing their own profile sees everything (no filtering).
-  //   public  → visible to everyone, including non-friends
-  //   friends → only accepted friends
-  //   close   → only friends the owner has starred as close friends
-  //   private → owner only
-  // (A missing `audience` column behaves as 'friends'.)
-  let visible = all;
-  if (userId && userId !== id) {
-    // Accepted friendship between the viewer and the profile owner? Use the
-    // admin client so RLS doesn't hide the relationship row.
-    const { data: friendship } = await supabaseAdmin
-      .from("friendships")
-      .select("id")
-      .eq("status", "accepted")
-      .or(`and(requester_id.eq.${userId},receiver_id.eq.${id}),and(requester_id.eq.${id},receiver_id.eq.${userId})`)
-      .maybeSingle();
-    const isFriend = !!friendship;
-
-    // Has the owner privately starred the viewer as a close friend?
-    let isClose = false;
-    if (isFriend) {
-      const { data: star } = await supabaseAdmin
-        .from("close_friends")
-        .select("owner_id")
-        .eq("owner_id", id)
-        .eq("friend_id", userId)
-        .maybeSingle();
-      isClose = !!star;
-    }
-
-    visible = all.filter((p: any) => {
-      const audience = p.audience ?? "friends";
-      if (audience === "public") return true;
-      if (audience === "private") return false;
-      if (audience === "close") return isClose;
-      return isFriend; // 'friends' | unknown
-    });
+  // Deletion grace window: moments/posts are inaccessible to everyone else.
+  if (!isOwner && isDeletionHiddenProfile(ownerProfile)) {
+    return c.json({ data: [] });
   }
 
-  const formatted = visible.map((p) => formatPost(p, userId ?? undefined, blockedIds));
-  await refreshFriendshipAvatars(formatted); // always show friends' CURRENT avatars
-  return c.json({ data: formatted });
+  const isFriend = isOwner ? true : userId ? await areFriends(userId, id) : false;
+
+  // Non-friends may still see PUBLIC moments on this profile (even when the
+  // profile/friends list is private). Friends-only / close / private moments
+  // stay gated by passesAudience below — do not hard-403 the whole timeline.
+
+  const limit = wantAll ? 500 : parseLimit(c.req.query("limit"), 20, 100);
+  const cursor = parseCursor(c.req.query("cursor"));
+
+  let isClose = false;
+  if (userId && userId !== id && isFriend) {
+    let { data: star } = await supabaseAdmin
+      .from("close_friends")
+      .select("friend_id")
+      .eq("user_id", id)
+      .eq("friend_id", userId)
+      .maybeSingle();
+    if (!star) {
+      ({ data: star } = await supabaseAdmin
+        .from("close_friends")
+        .select("friend_id")
+        .eq("owner_id", id)
+        .eq("friend_id", userId)
+        .maybeSingle());
+    }
+    isClose = !!star;
+  }
+
+  const passesAudience = (p: any): boolean => {
+    if (isOwner) return true;
+    const audience = p.audience ?? "friends";
+    if (audience === "public") return true;
+    if (audience === "private") return false;
+    if (audience === "close") return isClose;
+    return isFriend;
+  };
+
+  const passesSection = (p: any): boolean => {
+    if (section !== "posts") return true;
+    return !!(p.content || p.image_url || p.location || p.type === "location");
+  };
+
+  // Order by created_at (then id) before paging. Do not embed reactions here:
+  // that join made the database limit cut joined rows, so the profile could
+  // come back oldest-first or in a different order on each refresh.
+  const pageLimit = wantAll ? 500 : limit;
+  const batchSize = Math.min(100, Math.max(40, Math.min(pageLimit, 80)));
+  let walked;
+  try {
+    walked = await walkNewestPage({
+      cursor,
+      limit: pageLimit,
+      batchSize,
+      fetchFriends: (pageCursor, size) =>
+        fetchNewestMomentBatch((q) => q.eq("user_id", id), pageCursor, size),
+      accept: (p) => passesAudience(p) && passesSection(p),
+    });
+  } catch (e) {
+    console.error("[users/posts] query failed:", e instanceof Error ? e.message : e);
+    return c.json({ error: { message: "Failed to load moments" } }, 500);
+  }
+
+  let ordered: any[] = [];
+  try {
+    ordered = await loadPostsByIds(walked.page.map((p) => p.id), {
+      hydrateReactions: false,
+    });
+    await attachOriginals(null, ordered);
+  } catch (e) {
+    console.error("[users/posts] hydrate failed:", e instanceof Error ? e.message : e);
+    return c.json({ error: { message: "Failed to load moments" } }, 500);
+  }
+
+  await attachCommentPreviews(ordered, userId ?? undefined, blockedIds);
+
+  const formatted = ordered.map((p) => formatPost(p, userId ?? undefined, blockedIds));
+  await refreshFriendshipAvatars(formatted);
+  await refreshReactionActors(formatted);
+
+  return c.json({
+    data: formatted,
+    nextCursor: walked.nextCursor,
+    hasMore: walked.hasMore,
+    limit: wantAll ? formatted.length : limit,
+    totalVisible: cursor || walked.hasMore ? undefined : formatted.length,
+  });
 });
 
 export { usersRouter };

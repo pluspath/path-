@@ -1,28 +1,116 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
-import { supabase, supabaseAdmin, createUserClient } from "./supabase";
+import { supabase, supabaseAdmin, createUserClient, isSupabaseAbortError } from "./supabase";
 import { postsRouter } from "./routes/posts";
 import { usersRouter } from "./routes/users";
 import { friendsRouter } from "./routes/friends";
 import { notificationsRouter } from "./routes/notifications";
 import { conversationsRouter } from "./routes/conversations";
 import { placesRouter } from "./routes/places";
-import { uploadRouter } from "./routes/upload";
+import { uploadRouter, ensurePostsBucketForChat } from "./routes/upload";
 import { moderationRouter } from "./routes/moderation";
 import { authRouter } from "./routes/auth";
 import { configRouter } from "./routes/config";
 import { socialRouter } from "./routes/social";
-import { contentRouter, legalPagesRouter, seedLegalContent } from "./routes/content";
+import {
+  contentRouter,
+  registerMarketingPages,
+  seedLegalContent,
+} from "./routes/content";
 import { adminRouter } from "./admin/routes";
 import { bootstrapAdminSystem } from "./admin/bootstrap";
-import { apiLimiter } from "./lib/rate-limit";
+import { apiLimiter, authLimiter } from "./lib/rate-limit";
 import { secureHeadersMiddleware } from "./admin/middlewares/secure-headers";
 import { backfillJoinedPosts } from "./lib/joined";
+import { backfillGenderAvatars } from "./lib/avatar";
+import { backfillMissingUsernames } from "./lib/username-backfill";
 import { env, supabaseProjectRef } from "./env";
+import {
+  isSchemaCacheError,
+  isTransientSupabaseError,
+  probeSupabase,
+  waitForSupabaseReady,
+} from "./lib/supabase-health";
+import {
+  isSupabaseCircuitOpen,
+  noteSupabaseFailure,
+  supabaseCircuitRetryAfterSec,
+} from "./lib/supabase-circuit";
+import {
+  loadProfileDirect,
+  parseSupabaseAccessToken,
+} from "./lib/local-jwt-auth";
+import {
+  purgeExpiredDeletionAccounts,
+  sendPendingDeletionReminders,
+  reactivateDeletionSuspendedAccount,
+  DELETION_SUSPEND_REASON,
+  isDeletionGracePeriod,
+  shouldPurgeDeletionAccount,
+} from "./lib/account-deletion";
 import type { HonoVariables } from "./types";
+import { existsSync, readFileSync } from "fs";
+import { join, resolve } from "path";
+import { generateDefaultAvatarPng } from "./lib/default-avatar-gen";
+import {
+  authProfileCache,
+  getAuthProfileCache,
+  setAuthProfileCache,
+} from "./lib/auth-profile-cache";
 
 const app = new Hono<{ Variables: HonoVariables }>();
+
+app.onError((err, c) => {
+  console.error("[api] unhandled:", err instanceof Error ? err.message : err);
+  return c.json(
+    { error: { message: "Something went wrong. Please try again." } },
+    500
+  );
+});
+
+// Seed-generated stylized defaults (creative / varied — same idea as DiceBear).
+// GET /static/default-avatars/gen/:seed.png
+app.get("/static/default-avatars/gen/:seed", (c) => {
+  let seed = c.req.param("seed") ?? "user";
+  if (/\.png$/i.test(seed)) seed = seed.replace(/\.png$/i, "");
+  try {
+    seed = decodeURIComponent(seed);
+  } catch {
+    /* keep raw */
+  }
+  seed = seed.slice(0, 128) || "user";
+  const png = generateDefaultAvatarPng(seed);
+  return new Response(png, {
+    headers: {
+      "Content-Type": "image/png",
+      "Cache-Control": "public, max-age=86400",
+    },
+  });
+});
+
+// Legacy fixed crops (kept for any already-persisted URLs during transition).
+const DEFAULT_AVATARS_DIR = resolve(import.meta.dir, "../public/default-avatars");
+app.get("/static/default-avatars/:name", (c) => {
+  const name = c.req.param("name") ?? "";
+  if (!/^\d{2}\.(jpe?g)$/i.test(name)) return c.notFound();
+  const normalized = name.replace(/\.jpeg$/i, ".jpg").toLowerCase();
+  const diskPath = join(DEFAULT_AVATARS_DIR, normalized);
+  if (!existsSync(diskPath)) return c.notFound();
+  const bytes = readFileSync(diskPath);
+  return new Response(bytes, {
+    headers: {
+      "Content-Type": "image/jpeg",
+      "Cache-Control": "public, max-age=31536000, immutable",
+    },
+  });
+});
+
+// Register public HTML pages immediately (before middleware) so they cannot be missed.
+registerMarketingPages(app);
+app.get("/__marketing", (c) =>
+  c.json({ ok: true, service: "pathplus-api", pages: ["/", "/support", "/privacy", "/terms"] })
+);
 
 // Attempt to add profile columns + ensure core RLS policies (graceful if exec_sql missing)
 (async () => {
@@ -30,6 +118,22 @@ const app = new Hono<{ Variables: HonoVariables }>();
     const serviceKey = env.SUPABASE_SERVICE_ROLE_KEY;
     const supabaseUrl = env.SUPABASE_URL;
     if (serviceKey && supabaseUrl) {
+      // After billing pause/restore, PostgREST schema cache can be unavailable.
+      // Wait briefly; skip heavy DDL if the API is still recovering.
+      const ready = await waitForSupabaseReady({
+        maxAttempts: 8,
+        baseDelayMs: 800,
+        maxDelayMs: 10_000,
+        label: "boot-supabase",
+      });
+      let skipBootDdl = !ready.ok;
+      if (skipBootDdl) {
+        console.warn(
+          `[migration] Skipping boot DDL — Supabase not ready (${ready.message ?? "unknown"}). ` +
+            "Will continue serving; retry on next restart once PostgREST recovers."
+        );
+      }
+
       const statements = [
         "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS push_token TEXT;",
         "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS birthday TEXT;",
@@ -42,24 +146,203 @@ const app = new Hono<{ Variables: HonoVariables }>();
         "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS email_notifications_enabled BOOLEAN NOT NULL DEFAULT FALSE;",
         "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS location_lat DOUBLE PRECISION;",
         "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS location_lng DOUBLE PRECISION;",
+        "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS repath_of UUID REFERENCES public.posts(id) ON DELETE SET NULL;",
+        `CREATE TABLE IF NOT EXISTS public.post_views (
+          post_id UUID NOT NULL REFERENCES public.posts(id) ON DELETE CASCADE,
+          user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+          viewed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (post_id, user_id)
+        );`,
+        "CREATE INDEX IF NOT EXISTS idx_post_views_post ON public.post_views (post_id, viewed_at DESC);",
+        "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS audience TEXT DEFAULT 'friends';",
+        "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS comments_disabled BOOLEAN DEFAULT FALSE;",
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active';",
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS suspended_at TIMESTAMPTZ;",
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS suspended_reason TEXT;",
+        // Liked Moments queries / reaction toggles — optional timestamp (older DBs lacked it)
+        "ALTER TABLE public.reactions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();",
         // Messages: align API fields (content/image_url/type) with legacy text/image schema
         "ALTER TABLE public.messages ADD COLUMN IF NOT EXISTS content TEXT;",
         "ALTER TABLE public.messages ADD COLUMN IF NOT EXISTS image_url TEXT;",
         "ALTER TABLE public.messages ADD COLUMN IF NOT EXISTS type TEXT DEFAULT 'text';",
+        "ALTER TABLE public.messages ADD COLUMN IF NOT EXISTS reply_to UUID;",
         "UPDATE public.messages SET content = text WHERE content IS NULL AND text IS NOT NULL;",
         "UPDATE public.messages SET image_url = image WHERE image_url IS NULL AND image IS NOT NULL;",
         "UPDATE public.messages SET text = content WHERE (text IS NULL OR text = '') AND content IS NOT NULL;",
         "UPDATE public.messages SET image = image_url WHERE image IS NULL AND image_url IS NOT NULL;",
+        // Read receipts / unread counts
+        "ALTER TABLE public.conversation_participants ADD COLUMN IF NOT EXISTS last_read_at TIMESTAMPTZ;",
+        // Per-user inbox controls (pin / delete-for-me)
+        "ALTER TABLE public.conversation_participants ADD COLUMN IF NOT EXISTS pinned_at TIMESTAMPTZ;",
+        "ALTER TABLE public.conversation_participants ADD COLUMN IF NOT EXISTS hidden_at TIMESTAMPTZ;",
+        "CREATE INDEX IF NOT EXISTS idx_conversation_participants_user_hidden ON public.conversation_participants (user_id, hidden_at);",
+        // Close friends — match mobile schema (user_id). Also add owner_id alias for older code.
+        `CREATE TABLE IF NOT EXISTS public.close_friends (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+          friend_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE (user_id, friend_id),
+          CHECK (user_id <> friend_id)
+        );`,
+        "ALTER TABLE public.close_friends ADD COLUMN IF NOT EXISTS owner_id UUID;",
+        "UPDATE public.close_friends SET owner_id = user_id WHERE owner_id IS NULL AND user_id IS NOT NULL;",
+        "UPDATE public.close_friends SET user_id = owner_id WHERE (user_id IS NULL) AND owner_id IS NOT NULL;",
+        "CREATE INDEX IF NOT EXISTS idx_close_friends_user ON public.close_friends (user_id);",
+        "ALTER TABLE public.close_friends ENABLE ROW LEVEL SECURITY;",
+        'DROP POLICY IF EXISTS "Users view own close friends" ON public.close_friends;',
+        'DROP POLICY IF EXISTS "Users add close friends" ON public.close_friends;',
+        'DROP POLICY IF EXISTS "Users remove close friends" ON public.close_friends;',
+        `CREATE POLICY "Users view own close friends" ON public.close_friends FOR SELECT TO authenticated USING (auth.uid() = user_id OR auth.uid() = owner_id);`,
+        `CREATE POLICY "Users add close friends" ON public.close_friends FOR INSERT TO authenticated WITH CHECK (auth.uid() = user_id OR auth.uid() = owner_id);`,
+        `CREATE POLICY "Users remove close friends" ON public.close_friends FOR DELETE TO authenticated USING (auth.uid() = user_id OR auth.uid() = owner_id);`,
+        // User blocks table (block/report features)
+        `CREATE TABLE IF NOT EXISTS public.user_blocks (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          blocker_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+          blocked_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE (blocker_id, blocked_id),
+          CHECK (blocker_id <> blocked_id)
+        );`,
+        "CREATE INDEX IF NOT EXISTS idx_user_blocks_blocker ON public.user_blocks (blocker_id);",
+        "CREATE INDEX IF NOT EXISTS idx_user_blocks_blocked ON public.user_blocks (blocked_id);",
+        "ALTER TABLE public.user_blocks ENABLE ROW LEVEL SECURITY;",
+        'DROP POLICY IF EXISTS "Users can view own blocks" ON public.user_blocks;',
+        `CREATE POLICY "Users can view own blocks" ON public.user_blocks FOR SELECT TO authenticated USING (auth.uid() = blocker_id);`,
+        'DROP POLICY IF EXISTS "Users can create own blocks" ON public.user_blocks;',
+        `CREATE POLICY "Users can create own blocks" ON public.user_blocks FOR INSERT TO authenticated WITH CHECK (auth.uid() = blocker_id);`,
+        'DROP POLICY IF EXISTS "Users can delete own blocks" ON public.user_blocks;',
+        `CREATE POLICY "Users can delete own blocks" ON public.user_blocks FOR DELETE TO authenticated USING (auth.uid() = blocker_id);`,
+        // Service-role inserts already bypass RLS; also allow SELECT of blocks involving me (either side)
+        'DROP POLICY IF EXISTS "Users can view blocks involving them" ON public.user_blocks;',
+        `CREATE POLICY "Users can view blocks involving them" ON public.user_blocks FOR SELECT TO authenticated USING (auth.uid() = blocker_id OR auth.uid() = blocked_id);`,
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS preferred_language TEXT DEFAULT 'en';",
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS show_friends_to_friends BOOLEAN DEFAULT TRUE;",
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS show_friends_to_others BOOLEAN DEFAULT FALSE;",
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS show_posts_to_friends BOOLEAN DEFAULT TRUE;",
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS show_posts_to_others BOOLEAN DEFAULT TRUE;",
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS show_moments_to_friends BOOLEAN DEFAULT TRUE;",
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS show_moments_to_others BOOLEAN DEFAULT TRUE;",
+        // Denormalized total likes (reactions+comments+repaths) for public profile stats.
+        "ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS like_count INTEGER NOT NULL DEFAULT 0;",
+        `CREATE TABLE IF NOT EXISTS public.account_deletion_requests (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+          reason TEXT,
+          status TEXT NOT NULL DEFAULT 'pending',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          processed_at TIMESTAMPTZ,
+          processed_by UUID,
+          admin_note TEXT
+        );`,
+        "CREATE INDEX IF NOT EXISTS idx_account_deletion_status ON public.account_deletion_requests (status, created_at DESC);",
+        "ALTER TABLE public.account_deletion_requests ADD COLUMN IF NOT EXISTS reminder_sent_at TIMESTAMPTZ;",
+        // Allow self-serve deletion status "suspended" (older CHECK only had pending/approved/…).
+        `DO $$ BEGIN
+          ALTER TABLE public.account_deletion_requests DROP CONSTRAINT IF EXISTS account_deletion_requests_status_check;
+        EXCEPTION WHEN undefined_object THEN NULL;
+        END $$;`,
+        `DO $$ BEGIN
+          ALTER TABLE public.account_deletion_requests
+            ADD CONSTRAINT account_deletion_requests_status_check
+            CHECK (status IN ('pending', 'approved', 'rejected', 'done', 'cancelled', 'suspended'));
+        EXCEPTION WHEN duplicate_object THEN NULL;
+        END $$;`,
+        // Hot-path indexes for messaging performance
+        "CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON public.messages (conversation_id, created_at DESC);",
+        // Speeds unread aggregates: conversation + sender filter + created_at.
+        "CREATE INDEX IF NOT EXISTS idx_messages_conv_sender_created ON public.messages (conversation_id, sender_id, created_at DESC);",
+        "CREATE INDEX IF NOT EXISTS idx_conversation_participants_user ON public.conversation_participants (user_id);",
+        "ALTER TABLE public.notifications ADD COLUMN IF NOT EXISTS conversation_id UUID;",
+        "ALTER TABLE public.notifications ADD COLUMN IF NOT EXISTS comment_id UUID;",
+        "CREATE INDEX IF NOT EXISTS idx_notifications_user_created ON public.notifications (user_id, created_at DESC);",
+        // Multi-device push token registry (APNs via Expo Push)
+        `CREATE TABLE IF NOT EXISTS public.user_devices (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+          push_token TEXT NOT NULL,
+          platform TEXT NOT NULL DEFAULT 'unknown',
+          device_id TEXT NOT NULL,
+          is_active BOOLEAN NOT NULL DEFAULT TRUE,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE (user_id, device_id),
+          UNIQUE (push_token)
+        );`,
+        "CREATE INDEX IF NOT EXISTS idx_user_devices_user_active ON public.user_devices (user_id) WHERE is_active = TRUE;",
+        "CREATE INDEX IF NOT EXISTS idx_user_devices_push_token ON public.user_devices (push_token);",
+        "ALTER TABLE public.user_devices ENABLE ROW LEVEL SECURITY;",
+        'DROP POLICY IF EXISTS "Users view own devices" ON public.user_devices;',
+        `CREATE POLICY "Users view own devices" ON public.user_devices FOR SELECT TO authenticated USING (auth.uid() = user_id);`,
+        'DROP POLICY IF EXISTS "Users manage own devices" ON public.user_devices;',
+        `CREATE POLICY "Users manage own devices" ON public.user_devices FOR ALL TO authenticated USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);`,
+        // Fix participants RLS without recursion (SECURITY DEFINER helper)
+        `CREATE OR REPLACE FUNCTION public.is_conversation_participant(conv_id uuid)
+          RETURNS boolean
+          LANGUAGE sql
+          SECURITY DEFINER
+          SET search_path = public
+          STABLE
+          AS $$ SELECT EXISTS (
+            SELECT 1 FROM public.conversation_participants
+            WHERE conversation_id = conv_id AND user_id = auth.uid()
+          ); $$;`,
+        'DROP POLICY IF EXISTS "Participants can view participants" ON public.conversation_participants;',
+        `CREATE POLICY "Participants can view participants" ON public.conversation_participants FOR SELECT TO authenticated USING (public.is_conversation_participant(conversation_id));`,
+        'DROP POLICY IF EXISTS "Participants can update own row" ON public.conversation_participants;',
+        `CREATE POLICY "Participants can update own row" ON public.conversation_participants FOR UPDATE TO authenticated USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);`,
+        // Messages SELECT without recursive RLS (required for Realtime delivery)
+        'DROP POLICY IF EXISTS "Participants can view messages" ON public.messages;',
+        `CREATE POLICY "Participants can view messages" ON public.messages FOR SELECT TO authenticated USING (public.is_conversation_participant(conversation_id));`,
+        // Ensure chat tables are in the realtime publication (ignore if already added)
+        `DO $$ BEGIN
+          ALTER PUBLICATION supabase_realtime ADD TABLE public.messages;
+        EXCEPTION WHEN duplicate_object THEN NULL; END $$;`,
+        `DO $$ BEGIN
+          ALTER PUBLICATION supabase_realtime ADD TABLE public.conversation_participants;
+        EXCEPTION WHEN duplicate_object THEN NULL; END $$;`,
+        `DO $$ BEGIN
+          ALTER PUBLICATION supabase_realtime ADD TABLE public.notifications;
+        EXCEPTION WHEN duplicate_object THEN NULL; END $$;`,
+        `DO $$ BEGIN
+          ALTER PUBLICATION supabase_realtime ADD TABLE public.friendships;
+        EXCEPTION WHEN duplicate_object THEN NULL; END $$;`,
+        // Posts bucket: images + video + chat audio (voice/music DMs)
+        `UPDATE storage.buckets SET file_size_limit = 52428800, allowed_mime_types = ARRAY['image/jpeg','image/jpg','image/png','image/webp','image/gif','video/mp4','video/quicktime','video/webm','audio/mpeg','audio/mp3','audio/mp4','audio/m4a','audio/aac','audio/wav','audio/webm','audio/x-m4a','audio/x-wav','audio/3gpp','audio/amr','audio/ogg'] WHERE id = 'Posts' OR name = 'Posts';`,
         // Critical posts RLS — fixes 42501 on POST /api/posts when policies were never applied
         "ALTER TABLE public.posts ENABLE ROW LEVEL SECURITY;",
         'DROP POLICY IF EXISTS "Anyone can view posts" ON public.posts;',
+        'DROP POLICY IF EXISTS "Authenticated users can view posts" ON public.posts;',
         'DROP POLICY IF EXISTS "Users can create posts" ON public.posts;',
         'DROP POLICY IF EXISTS "Users can update own posts" ON public.posts;',
         'DROP POLICY IF EXISTS "Users can delete own posts" ON public.posts;',
-        'CREATE POLICY "Anyone can view posts" ON public.posts FOR SELECT USING (true);',
+        // Authenticated-only SELECT — anon key must not read all moments via PostgREST.
+        // API feed routes use the service role and enforce audience/friends themselves.
+        'CREATE POLICY "Authenticated users can view posts" ON public.posts FOR SELECT TO authenticated USING (true);',
         `CREATE POLICY "Users can create posts" ON public.posts FOR INSERT TO authenticated WITH CHECK (auth.uid() = user_id);`,
         `CREATE POLICY "Users can update own posts" ON public.posts FOR UPDATE TO authenticated USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);`,
         `CREATE POLICY "Users can delete own posts" ON public.posts FOR DELETE TO authenticated USING (auth.uid() = user_id);`,
+        // Dashboard post moderation columns (list/hide/publish)
+        "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS is_hidden BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS is_published BOOLEAN NOT NULL DEFAULT TRUE",
+        // Hot-path indexes for feed / likes / close friends
+        "CREATE INDEX IF NOT EXISTS idx_posts_user_created ON public.posts (user_id, created_at DESC);",
+        "CREATE INDEX IF NOT EXISTS idx_posts_audience_created ON public.posts (audience, created_at DESC);",
+        "CREATE INDEX IF NOT EXISTS idx_posts_repath_of ON public.posts (repath_of) WHERE repath_of IS NOT NULL;",
+        "CREATE INDEX IF NOT EXISTS idx_reactions_user ON public.reactions (user_id);",
+        "CREATE INDEX IF NOT EXISTS idx_reactions_post ON public.reactions (post_id);",
+        "CREATE INDEX IF NOT EXISTS idx_reactions_user_created ON public.reactions (user_id, created_at DESC);",
+        "CREATE INDEX IF NOT EXISTS idx_comments_user ON public.comments (user_id);",
+        "CREATE INDEX IF NOT EXISTS idx_comments_post ON public.comments (post_id);",
+        "CREATE INDEX IF NOT EXISTS idx_comments_user_created ON public.comments (user_id, created_at DESC);",
+        "CREATE INDEX IF NOT EXISTS idx_comments_post_created ON public.comments (post_id, created_at ASC);",
+        "CREATE INDEX IF NOT EXISTS idx_notifications_user_unread ON public.notifications (user_id) WHERE read = false;",
+        "CREATE INDEX IF NOT EXISTS idx_friendships_receiver_status ON public.friendships (receiver_id, status);",
+        "CREATE INDEX IF NOT EXISTS idx_friendships_requester_status ON public.friendships (requester_id, status);",
+        "CREATE INDEX IF NOT EXISTS idx_close_friends_friend ON public.close_friends (friend_id);",
+        // Refresh PostgREST schema cache after column/policy changes
+        "NOTIFY pgrst, 'reload schema';",
         // Saved posts (minimal bootstrap if 006 not applied yet)
         `CREATE TABLE IF NOT EXISTS public.saved_posts (
           id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -78,14 +361,101 @@ const app = new Hono<{ Variables: HonoVariables }>();
         `CREATE POLICY "Users can unsave posts" ON public.saved_posts FOR DELETE TO authenticated USING (auth.uid() = user_id);`,
         'DROP POLICY IF EXISTS "Users can update own saved posts" ON public.saved_posts;',
         `CREATE POLICY "Users can update own saved posts" ON public.saved_posts FOR UPDATE TO authenticated USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);`,
+        // Pending email-verified registrations (no account until OTP verified)
+        `CREATE TABLE IF NOT EXISTS public.pending_registrations (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          email TEXT NOT NULL UNIQUE,
+          password_encrypted TEXT NOT NULL,
+          username TEXT NOT NULL,
+          full_name TEXT NOT NULL,
+          gender TEXT,
+          birthday TEXT,
+          otp_hash TEXT NOT NULL,
+          otp_expires_at TIMESTAMPTZ NOT NULL,
+          attempts INT NOT NULL DEFAULT 0,
+          last_sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          expires_at TIMESTAMPTZ NOT NULL
+        );`,
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_registrations_username_lower ON public.pending_registrations (LOWER(username));",
+        "CREATE INDEX IF NOT EXISTS idx_pending_registrations_expires ON public.pending_registrations (expires_at);",
+        "ALTER TABLE public.pending_registrations ENABLE ROW LEVEL SECURITY;",
+        `CREATE TABLE IF NOT EXISTS public.password_reset_otps (
+          email TEXT PRIMARY KEY,
+          user_id UUID NOT NULL,
+          otp_hash TEXT NOT NULL,
+          otp_expires_at TIMESTAMPTZ NOT NULL,
+          attempts INT NOT NULL DEFAULT 0,
+          last_sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          verified BOOLEAN NOT NULL DEFAULT FALSE
+        );`,
+        "CREATE INDEX IF NOT EXISTS idx_password_reset_otps_expires ON public.password_reset_otps (otp_expires_at);",
+        "ALTER TABLE public.password_reset_otps ENABLE ROW LEVEL SECURITY;",
+        `CREATE OR REPLACE FUNCTION public.auth_user_id_by_email(target_email text)
+RETURNS uuid
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = auth, public
+AS $$ SELECT id FROM auth.users WHERE lower(email) = lower(target_email) LIMIT 1 $$`,
+        "REVOKE ALL ON FUNCTION public.auth_user_id_by_email(text) FROM PUBLIC",
+        "REVOKE ALL ON FUNCTION public.auth_user_id_by_email(text) FROM anon",
+        "REVOKE ALL ON FUNCTION public.auth_user_id_by_email(text) FROM authenticated",
+        // Phase 4: never allow self-friendships / self-requests.
+        "DELETE FROM public.friendships WHERE requester_id IS NOT NULL AND receiver_id IS NOT NULL AND requester_id = receiver_id",
+        `DO $$ BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = 'friendships_no_self'
+              AND conrelid = 'public.friendships'::regclass
+          ) THEN
+            ALTER TABLE public.friendships
+              ADD CONSTRAINT friendships_no_self
+              CHECK (requester_id <> receiver_id);
+          END IF;
+        END $$`,
+        // Keep denormalized comment_count aligned with live comments (preview reliability).
+        `UPDATE public.posts AS p
+SET comment_count = sub.cnt
+FROM (
+  SELECT post_id, COUNT(*)::int AS cnt
+  FROM public.comments
+  GROUP BY post_id
+) AS sub
+WHERE p.id = sub.post_id
+  AND COALESCE(p.comment_count, 0) <> sub.cnt`,
+        `UPDATE public.posts AS p
+SET comment_count = 0
+WHERE COALESCE(p.comment_count, 0) > 0
+  AND NOT EXISTS (SELECT 1 FROM public.comments c WHERE c.post_id = p.id)`,
+        "CREATE INDEX IF NOT EXISTS idx_comments_post_id_created_at_desc ON public.comments (post_id, created_at DESC)",
       ];
-      for (const sql of statements) {
-        const { error } = await supabaseAdmin.rpc("exec_sql", { sql });
-        if (error) {
-          console.warn(`[migration] exec_sql failed: ${error.message}`);
+      if (!skipBootDdl) {
+        let schemaCacheBlocked = false;
+        for (const sql of statements) {
+          const { error } = await supabaseAdmin.rpc("exec_sql", { sql });
+          if (error) {
+            console.warn(`[migration] exec_sql failed: ${error.message}`);
+            if (isSchemaCacheError(error.message)) {
+              schemaCacheBlocked = true;
+              console.warn(
+                "[migration] PostgREST schema cache unavailable — aborting remaining boot DDL to avoid hammering the database"
+              );
+              break;
+            }
+          }
+        }
+        if (!schemaCacheBlocked) {
+          const { ensureRepathColumn, ensureThemePreferenceColumn, ensureVerifiedColumn } = await import("./lib/schema");
+          await ensureRepathColumn();
+          await ensureThemePreferenceColumn();
+          await ensureVerifiedColumn();
+          const { ensureInboxColumns } = await import("./lib/inbox-columns");
+          await ensureInboxColumns();
+          await ensurePostsBucketForChat();
+          console.log("[migration] column + posts RLS + social bootstrap finished");
         }
       }
-      console.log("[migration] column + posts RLS + social bootstrap finished");
     }
   } catch {
     console.log(
@@ -93,29 +463,120 @@ const app = new Hono<{ Variables: HonoVariables }>();
     );
   }
 
+  // Always widen Posts bucket MIME list for chat audio (safe if migration block failed).
+  try {
+    await ensurePostsBucketForChat();
+  } catch (e) {
+    console.warn("[boot] Posts bucket ensure failed:", e instanceof Error ? e.message : e);
+  }
+
   // One-time idempotent backfill: ensure every existing user has a "Joined
   // Path+" moment as the oldest item on their timeline.
   await backfillJoinedPosts();
+
+  // Apply stylized default avatars for users who never uploaded a custom photo.
+  // Safe: skips every custom Supabase/upload URL; only empty + DiceBear + old defaults.
+  await backfillGenderAvatars();
+
+  // Legacy accounts (pre-mandatory username / partial upserts) may have NULL
+  // profiles.username even when auth metadata has a handle. Fill uniquely;
+  // never overwrite an existing valid username.
+  await backfillMissingUsernames();
+
+  // Purge accounts past the deletion grace window + send day-29 reminders, then every 6 hours.
+  const runDeletionJobs = async () => {
+    try {
+      const reminded = await sendPendingDeletionReminders();
+      if (reminded > 0) console.log(`[account-deletion] Sent ${reminded} day-29 reminder(s)`);
+    } catch (e) {
+      console.warn("[account-deletion] Reminder cron error:", e instanceof Error ? e.message : e);
+    }
+    try {
+      const n = await purgeExpiredDeletionAccounts();
+      if (n > 0) console.log(`[account-deletion] Cron purged ${n} account(s)`);
+    } catch (e) {
+      console.warn("[account-deletion] Cron purge error:", e instanceof Error ? e.message : e);
+    }
+  };
+  await runDeletionJobs();
+  setInterval(runDeletionJobs, 6 * 60 * 60 * 1000);
+
+  const runAuthCleanup = async () => {
+    try {
+      const { purgeExpiredPendingRegistrations, purgeExpiredPasswordResetOtps } = await import(
+        "./routes/auth"
+      );
+      const pending = await purgeExpiredPendingRegistrations();
+      const resets = await purgeExpiredPasswordResetOtps();
+      if (pending > 0 || resets > 0) {
+        console.log(`[auth-cleanup] Purged ${pending} pending registration(s), ${resets} reset OTP(s)`);
+      }
+    } catch (e) {
+      console.warn("[auth-cleanup] error:", e instanceof Error ? e.message : e);
+    }
+  };
+  await runAuthCleanup();
+  setInterval(runAuthCleanup, 60 * 60 * 1000);
 })();
 
 // Surface Supabase connectivity problems immediately in logs (no secrets).
 (async () => {
-  const project = supabaseProjectRef(env.SUPABASE_URL);
-  try {
-    const { error } = await supabaseAdmin
-      .from("profiles")
-      .select("id", { count: "exact", head: true });
-    if (error) {
-      console.error(`[supabase] Startup check failed for project "${project}": ${error.message}`);
-    } else {
-      console.log(`[supabase] Connected to project "${project}"`);
-    }
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+  const probe = await waitForSupabaseReady({
+    maxAttempts: 6,
+    baseDelayMs: 500,
+    maxDelayMs: 8_000,
+    label: "supabase",
+  });
+  const project = probe.project || supabaseProjectRef(env.SUPABASE_URL);
+  if (!probe.ok) {
     console.error(
-      `[supabase] Unreachable project "${project}" (${message}). ` +
-        "Update SUPABASE_URL / keys in backend .env to your active project, then restart."
+      `[supabase] Startup check failed for project "${project}": ${probe.message ?? "unknown"}. ` +
+        (probe.schemaCacheIssue
+          ? "PostgREST schema cache is recovering (common after plan renewals) — traffic may fail until it reloads."
+          : "Update SUPABASE_URL / keys in backend .env to your active project, then restart.")
     );
+  } else {
+    console.log(`[supabase] Connected to project "${project}" (${probe.latencyMs}ms)`);
+  }
+
+  try {
+    const { getEmailConfig } = await import("./lib/external-config");
+    const { testEmailProviderConnection } = await import("./lib/email-service");
+    const emailCfg = await getEmailConfig();
+    console.log(
+      `[email] Resend configured via ${emailCfg.apiKeySource} (enabled=${emailCfg.enabled}) from=${emailCfg.fromEmail.replace(/@.+/, "@***")}`
+    );
+    if (emailCfg.apiKeySource === "none") {
+      console.error("[email] CRITICAL: No Resend API key — password reset/signup emails will fail");
+    } else {
+      const test = await testEmailProviderConnection();
+      if (!test.ok) {
+        console.error(`[email] CRITICAL: Resend check failed — ${test.message}`);
+        console.error(
+          "[email] Create a new key at https://resend.com/api-keys, verify pathplus.store, update RESEND_API_KEY in backend/.env, restart."
+        );
+      } else {
+        console.log(`[email] Resend check: ${test.message}`);
+      }
+    }
+  } catch (e) {
+    console.warn("[email] config check failed:", e instanceof Error ? e.message : e);
+  }
+
+  try {
+    const { isPushEnabled } = await import("./lib/external-config");
+    const pushEnabled = await isPushEnabled();
+    console.log(
+      `[push] Expo Push Service ${pushEnabled ? "enabled" : "DISABLED"} — ` +
+        "architecture: Backend → exp.host → APNs/FCM (ExponentPushToken required)"
+    );
+    if (!pushEnabled) {
+      console.error(
+        "[push] CRITICAL: Push is disabled in Admin → External Services. All notifications will be skipped."
+      );
+    }
+  } catch (e) {
+    console.warn("[push] config check failed:", e instanceof Error ? e.message : e);
   }
 })();
 
@@ -169,6 +630,7 @@ bootstrapAdminSystem()
 app.use("*", logger());
 app.use("/api/admin/*", secureHeadersMiddleware);
 app.use("/api/*", apiLimiter);
+app.use("/api/auth/*", authLimiter);
 
 app.use("*", async (c, next) => {
   c.set("user", null);
@@ -179,28 +641,171 @@ app.use("*", async (c, next) => {
   if (authHeader?.startsWith("Bearer ")) {
     const token = authHeader.slice(7);
     try {
-      const { data: { user: authUser }, error } = await supabase.auth.getUser(token);
+      const cached = getAuthProfileCache(token);
+      if (cached) {
+        // Never keep a suspended/deleted account live from a stale cache hit.
+        if (cached.profile?.status === "suspended") {
+          authProfileCache.delete(token);
+        } else {
+          c.set("userId", cached.userId);
+          c.set("accessToken", token);
+          c.set("user", cached.profile);
+          await next();
+          return;
+        }
+      }
 
-      if (authUser && !error) {
+      // While Disk I/O circuit is open, skip Auth API getUser (it aborts and
+      // amplifies load). Validate JWT locally + session/profile via direct SQL.
+      const preferLocal = isSupabaseCircuitOpen();
+      let authUser: {
+        id: string;
+        user_metadata?: Record<string, unknown>;
+      } | null = null;
+      let authError: { message: string } | null = null;
+
+      if (preferLocal) {
+        authUser = await parseSupabaseAccessToken(token);
+        if (!authUser) authError = { message: "local jwt rejected while circuit open" };
+      } else {
+        const result = await supabase.auth.getUser(token);
+        authUser = result.data.user;
+        authError = result.error;
+        if (
+          (!authUser || authError) &&
+          (isSupabaseAbortError(authError) ||
+            (authError && isTransientSupabaseError(authError.message)))
+        ) {
+          noteSupabaseFailure(authError);
+          console.warn(
+            `[auth] Supabase auth check overloaded, falling back to local JWT: ${authError?.message ?? "abort"}`
+          );
+          authUser = await parseSupabaseAccessToken(token);
+          authError = authUser ? null : authError;
+        }
+      }
+
+      if (authUser && !authError) {
         c.set("userId", authUser.id);
         c.set("accessToken", token);
 
         const userClient = createUserClient(token);
-        const { data: profile } = await userClient
-          .from("profiles")
-          .select("*")
-          .eq("id", authUser.id)
-          .single();
+        // Lean profile fetch — full `*` was slowing every authenticated request.
+        // Prefer admin so a half-broken profiles RLS never blanks the session user.
+        let profile: any = null;
+        let profileErr: { message: string } | null = null;
 
-        c.set("user", profile ?? null);
-      } else if (error) {
-        console.warn(`[auth] Token rejected: ${error.message}`);
+        if (preferLocal || isSupabaseCircuitOpen()) {
+          profile = await loadProfileDirect(authUser.id);
+        } else {
+          const res = await supabaseAdmin
+            .from("profiles")
+            .select(
+              "id, full_name, username, avatar_url, bio, location, birthday, gender, cover_url, created_at, show_age, show_zodiac, username_changed, push_notifications_enabled, email_notifications_enabled, post_visibility, status, suspended_at, suspended_reason"
+            )
+            .eq("id", authUser.id)
+            .maybeSingle();
+          profile = res.data;
+          profileErr = res.error;
+        }
+
+        if (profileErr) {
+          // Transient I/O/timeouts must not wipe a valid JWT into a logout storm.
+          if (isTransientSupabaseError(profileErr.message) || isSupabaseAbortError(profileErr)) {
+            console.warn("[auth] profile fetch transient failure:", profileErr.message);
+            const direct = await loadProfileDirect(authUser.id);
+            if (direct) {
+              profile = direct;
+            } else {
+              const sessionUser = {
+                id: authUser.id,
+                full_name:
+                  (authUser.user_metadata?.full_name as string | undefined) ?? "Someone",
+              };
+              c.set("user", sessionUser);
+              setAuthProfileCache(token, authUser.id, sessionUser);
+              await next();
+              return;
+            }
+          } else {
+            console.warn("[auth] profile fetch failed, retrying lean:", profileErr.message);
+            ({ data: profile } = await userClient
+              .from("profiles")
+              .select("id, full_name, username, avatar_url")
+              .eq("id", authUser.id)
+              .maybeSingle());
+          }
+        }
+
+        if (profile?.status === "suspended") {
+          const reason = profile.suspended_reason ?? "";
+          const suspendedAt = profile.suspended_at as string | null;
+
+          if (reason === DELETION_SUSPEND_REASON && suspendedAt) {
+            if (shouldPurgeDeletionAccount(suspendedAt)) {
+              // Cron should have removed this; block until purge completes.
+              return c.json({ error: { message: "Account no longer available" } }, 403);
+            }
+            if (isDeletionGracePeriod(suspendedAt)) {
+              // User signed in within 30 days — reactivate automatically.
+              await reactivateDeletionSuspendedAccount(authUser.id);
+              profile.status = "active";
+              profile.suspended_at = null;
+              profile.suspended_reason = null;
+              authProfileCache.delete(token);
+            } else {
+              return c.json({ error: { message: "Account no longer available" } }, 403);
+            }
+          } else {
+            return c.json({ error: { message: "Account suspended. Contact support@pathplus.store" } }, 403);
+          }
+        }
+
+        const sessionUser =
+          profile ?? {
+            id: authUser.id,
+            full_name:
+              (authUser.user_metadata?.full_name as string | undefined) ?? "Someone",
+          };
+        c.set("user", sessionUser);
+        setAuthProfileCache(token, authUser.id, sessionUser);
+      } else if (authError) {
+        if (isTransientSupabaseError(authError.message) || isSupabaseAbortError(authError)) {
+          noteSupabaseFailure(authError);
+          console.warn(`[auth] Auth unavailable after local fallback: ${authError.message}`);
+          // Do not 503 — continue unauthenticated so clients stop Auth retry storms.
+        } else {
+          console.warn(`[auth] Token rejected: ${authError.message}`);
+        }
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(
         `[auth] Supabase unreachable (${supabaseProjectRef(env.SUPABASE_URL)}): ${message}`
       );
+      if (isSupabaseAbortError(err) || isTransientSupabaseError(message)) {
+        noteSupabaseFailure(err);
+        try {
+          const localUser = await parseSupabaseAccessToken(token);
+          if (localUser) {
+            c.set("userId", localUser.id);
+            c.set("accessToken", token);
+            const profile =
+              (await loadProfileDirect(localUser.id)) ?? {
+                id: localUser.id,
+                full_name:
+                  (localUser.user_metadata?.full_name as string | undefined) ?? "Someone",
+              };
+            c.set("user", profile);
+            setAuthProfileCache(token, localUser.id, profile);
+          }
+        } catch (localErr) {
+          console.warn(
+            "[auth] local JWT fallback failed:",
+            localErr instanceof Error ? localErr.message : localErr
+          );
+        }
+      }
     }
   }
 
@@ -244,7 +849,7 @@ app.get("/health", async (c) => {
     });
   }
 
-  return c.json({ status: "ok" });
+  return c.json({ status: "ok", service: "pathplus-api", marketing: true });
 });
 
 app.get("/admin-ready", async (c) => {
@@ -256,28 +861,25 @@ app.get("/admin-ready", async (c) => {
 });
 
 app.get("/health/supabase", async (c) => {
-  const project = supabaseProjectRef(env.SUPABASE_URL);
-  try {
-    const { error } = await supabaseAdmin
-      .from("profiles")
-      .select("id", { count: "exact", head: true });
-
-    if (error) {
-      return c.json({
+  const probe = await probeSupabase();
+  if (!probe.ok) {
+    return c.json(
+      {
         status: "error",
-        project,
-        message: error.message,
-      }, 503);
-    }
-
-    return c.json({ status: "ok", project });
-  } catch (err) {
-    return c.json({
-      status: "error",
-      project,
-      message: err instanceof Error ? err.message : "Connection failed",
-    }, 503);
+        project: probe.project,
+        message: probe.message ?? "Connection failed",
+        latencyMs: probe.latencyMs,
+        schemaCacheIssue: probe.schemaCacheIssue === true,
+        transient: probe.transient === true,
+      },
+      503
+    );
   }
+  return c.json({
+    status: "ok",
+    project: probe.project,
+    latencyMs: probe.latencyMs,
+  });
 });
 
 app.get("/api/admin/auth/ready", async (c) => {
@@ -287,7 +889,6 @@ app.get("/api/admin/auth/ready", async (c) => {
   return app.fetch(new Request(url.toString(), c.req.raw));
 });
 
-app.route("/", legalPagesRouter);
 app.route("/api/content", contentRouter);
 app.route("/api/config", configRouter);
 app.route("/api/auth", authRouter);
@@ -306,10 +907,23 @@ app.route("/api", usersRouter);
 
 const port = Number(process.env.PORT) || 3000;
 
-console.log(`[boot] Path+ API on :${port} | admin diagnostics: GET /health?ready=1`);
+let server: ReturnType<typeof Bun.serve>;
+try {
+  server = Bun.serve({
+    port,
+    hostname: "0.0.0.0",
+    fetch: (req) => app.fetch(req),
+  });
+} catch (err) {
+  const message = err instanceof Error ? err.message : String(err);
+  console.error(`[boot] FATAL: cannot bind :${port} — ${message}`);
+  console.error("[boot] Another process is probably still holding the port. Run: bash deploy/restart-api-clean.sh");
+  process.exit(1);
+}
 
-export default {
-  port,
-  hostname: "0.0.0.0",
-  fetch: app.fetch,
-};
+console.log(
+  `[boot] Path+ API listening on http://${server.hostname}:${server.port} (pid ${process.pid}) | GET /__marketing`
+);
+
+// Named export only — do NOT `export default app` (Bun would try to serve it again).
+export { app, server };

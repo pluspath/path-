@@ -1,46 +1,828 @@
-// Sends an Expo push notification to a specific Expo push token
-// Uses Expo's free push notification service
+// Centralized push notification service for Path+.
+// Architecture: Backend → Expo Push Service → APNs/FCM → device
+// Uses ExponentPushToken[...] tokens from expo-notifications (NOT raw APNs tokens).
+// Failures are logged; main app actions never depend on push delivery.
+import { env } from "../env";
+import { isPushEnabled } from "./external-config";
+import { getBlockedIds } from "./blocks";
+import {
+  isMessageRequestFor,
+  loadConversationsWithIncoming,
+  loadFriendshipStates,
+  loadPeerByConversation,
+} from "./message-requests";
+import { countUnreadByConversationDirect } from "./unread-counts";
+
+const EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send";
+const EXPO_PUSH_RECEIPTS_URL = "https://exp.host/--/api/v2/push/getReceipts";
+
+/**
+ * Expo receipt/ticket errors that mean THIS DEVICE TOKEN is dead.
+ * Do NOT include credential/config errors (InvalidCredentials, InvalidProviderToken,
+ * MismatchSenderId) — those are EAS/APNs setup problems; wiping tokens hides the
+ * real issue and permanently breaks push until the user reopens the app.
+ * Previous working Path+ never deactivated tokens on send failure.
+ */
+const DEAD_TOKEN_ERRORS = new Set(["DeviceNotRegistered"]);
+
+export type PushDeliveryResult = {
+  ok: boolean;
+  tokenSuffix: string;
+  ticketId?: string;
+  ticketStatus?: string;
+  ticketError?: string;
+  receiptStatus?: string;
+  receiptError?: string;
+  message: string;
+};
+
+function isExpoPushToken(token: string | null | undefined): token is string {
+  return typeof token === "string" && token.startsWith("ExponentPushToken");
+}
+
+function tokenSuffix(token: string): string {
+  return token.length > 12 ? `…${token.slice(-8)}` : "…";
+}
+
+function pushHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+    "Accept-Encoding": "gzip, deflate",
+    "Content-Type": "application/json",
+  };
+  const accessToken = env.EXPO_ACCESS_TOKEN?.trim();
+  if (accessToken) {
+    headers.Authorization = `Bearer ${accessToken}`;
+  }
+  return headers;
+}
+
+/** Coerce payload values to strings (Expo requirement for reliable deep links). */
+export function stringifyPushData(data?: Record<string, unknown>): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!data) return out;
+  for (const [key, value] of Object.entries(data)) {
+    if (value === undefined || value === null) continue;
+    out[key] = typeof value === "string" ? value : String(value);
+  }
+  return out;
+}
+
+/**
+ * Build a user-visible Expo Push message.
+ *
+ * Critical for iOS Lock Screen / banners:
+ * - Always send non-empty title + body (alert payload, not data-only)
+ * - interruptionLevel: "active" (NOT "passive" — passive = Notification Center only)
+ * - Never set contentAvailable for normal alerts (that makes background/silent pushes)
+ * - Ping uses a distinct category + custom sound (bundled as nudge.wav in the app)
+ * - badge must be the recipient's real unread total (APNs replaces the icon badge)
+ */
+export function buildExpoPushMessage(
+  pushToken: string,
+  title: string,
+  body: string,
+  data?: Record<string, unknown>,
+  opts?: { badge?: number }
+): Record<string, unknown> {
+  const safeTitle = (title || "").trim() || "Path+";
+  const safeBody = (body || "").trim() || "You have a new notification";
+  const type = typeof data?.type === "string" ? data.type : "";
+  const isPing = type === "ping";
+  const badge =
+    typeof opts?.badge === "number" && Number.isFinite(opts.badge)
+      ? Math.max(0, Math.min(99, Math.floor(opts.badge)))
+      : 1;
+
+  const stringData = stringifyPushData({
+    ...data,
+    type: type || (isPing ? "ping" : "default"),
+    categoryId: isPing ? "PING" : "DEFAULT",
+    title: safeTitle,
+    body: safeBody,
+  });
+
+  return {
+    to: pushToken,
+    title: safeTitle,
+    body: safeBody,
+    data: stringData,
+    // iOS: lights screen + can play sound. "passive" = NC-only (no banner/Lock Screen).
+    interruptionLevel: "active",
+    priority: "high",
+    badge,
+    // Do NOT set contentAvailable — that yields background/silent delivery.
+    sound: isPing ? "nudge.wav" : "default",
+    categoryId: isPing ? "PING" : "DEFAULT",
+    // Android channels registered in use-push-notifications.
+    channelId: isPing ? "ping" : "default",
+    ...(isPing ? { relevanceScore: 1 } : {}),
+  };
+}
+
+async function countUnreadNotifications(client: any, userId: string): Promise<number> {
+  try {
+    // Exact COUNT — never derive from a paginated list (that undercounts).
+    // Prefer chained .neq over not.in — PostgREST text `not.in` quoting is fragile
+    // across versions and was returning 0 for valid unread rows.
+    const filtered = await client
+      .from("notifications")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", userId)
+      .eq("read", false)
+      .neq("type", "ping")
+      .neq("type", "message");
+
+    if (!filtered.error && typeof filtered.count === "number") {
+      return Math.max(0, filtered.count);
+    }
+    if (filtered.error) {
+      console.warn("[push] filtered unread count error:", filtered.error.message);
+    }
+
+    // Fallback 1: all unread rows (includes legacy ping/message — better than showing 0).
+    const all = await client
+      .from("notifications")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", userId)
+      .eq("read", false);
+
+    if (!all.error && typeof all.count === "number") {
+      return Math.max(0, all.count);
+    }
+
+    // Fallback 2: page through unread ids.
+    let total = 0;
+    let cursor: string | null = null;
+    for (let page = 0; page < 100; page++) {
+      let q = client
+        .from("notifications")
+        .select("id, created_at, type")
+        .eq("user_id", userId)
+        .eq("read", false)
+        .order("created_at", { ascending: false })
+        .limit(200);
+      if (cursor) q = q.lt("created_at", cursor);
+      const { data, error: pageErr } = await q;
+      if (pageErr) {
+        console.warn("[push] unread notification page failed:", pageErr.message);
+        break;
+      }
+      const rows = (data ?? []).filter(
+        (n: { type?: string }) => n.type !== "ping" && n.type !== "message"
+      );
+      // If filter empties the page but raw rows exist, count raw (legacy data).
+      total += rows.length > 0 ? rows.length : (data ?? []).length;
+      if ((data ?? []).length < 200) break;
+      cursor = data![data!.length - 1]?.created_at ?? null;
+      if (!cursor) break;
+    }
+    return total;
+  } catch (e) {
+    console.warn("[push] unread notification count failed:", e);
+    return 0;
+  }
+}
+
+
+/** Unread DMs — one SQL aggregate when possible (avoids PostgREST N+1 COUNTs). */
+async function countUnreadDirectMessages(
+  client: any,
+  userId: string
+): Promise<{ total: number; requests: number }> {
+  try {
+    const { data: participations } = await client
+      .from("conversation_participants")
+      .select("conversation_id, last_read_at")
+      .eq("user_id", userId);
+    const parts = participations ?? [];
+    if (parts.length === 0) return { total: 0, requests: 0 };
+
+    const perConv: Record<string, number> = {};
+    const direct = await countUnreadByConversationDirect(
+      userId,
+      parts.map((p: any) => p.conversation_id)
+    );
+    if (direct) {
+      for (const p of parts) {
+        perConv[p.conversation_id] = direct[p.conversation_id] ?? 0;
+      }
+    } else {
+      const chunkSize = 25;
+      for (let i = 0; i < parts.length; i += chunkSize) {
+        const chunk = parts.slice(i, i + chunkSize);
+        const counts = await Promise.all(
+          chunk.map(async (p: any) => {
+            let q = client
+              .from("messages")
+              .select("id", { count: "exact", head: true })
+              .eq("conversation_id", p.conversation_id)
+              .neq("sender_id", userId);
+            if (p.last_read_at) q = q.gt("created_at", p.last_read_at);
+            const { count, error } = await q;
+            if (error) {
+              console.warn("[push] unread DM count failed:", error.message);
+              return 0;
+            }
+            return count ?? 0;
+          })
+        );
+        chunk.forEach((p: any, idx: number) => {
+          perConv[p.conversation_id] = counts[idx] ?? 0;
+        });
+      }
+    }
+
+    // Split unread DMs into friend threads vs Message Requests (non-friends).
+    // Threads with blocked users are dropped — they are hidden from the inbox,
+    // so their unreads must never keep a badge alive.
+    const unreadConvIds = Object.keys(perConv).filter((id) => (perConv[id] ?? 0) > 0);
+    let total = 0;
+    let requests = 0;
+    if (unreadConvIds.length === 0) return { total: 0, requests: 0 };
+    try {
+      const [peerByConv, blockedIds, incomingByConv] = await Promise.all([
+        loadPeerByConversation(userId, unreadConvIds, client),
+        getBlockedIds(userId, client),
+        loadConversationsWithIncoming(userId, unreadConvIds, client),
+      ]);
+      const blocked = new Set(blockedIds);
+      const peerIds = Object.values(peerByConv);
+      const states = await loadFriendshipStates(userId, peerIds, client);
+      for (const convId of unreadConvIds) {
+        const peerId = peerByConv[convId];
+        if (peerId && blocked.has(peerId)) continue;
+        const n = perConv[convId] ?? 0;
+        total += n;
+        if (isMessageRequestFor(peerId ? states[peerId] : undefined, incomingByConv.has(convId))) {
+          requests += n;
+        }
+      }
+    } catch (e) {
+      console.warn("[push] unread DM request split failed:", e);
+      total = unreadConvIds.reduce((sum, id) => sum + (perConv[id] ?? 0), 0);
+      requests = 0;
+    }
+    return { total, requests };
+  } catch (e) {
+    console.warn("[push] unread DM count failed:", e);
+    return { total: 0, requests: 0 };
+  }
+}
+
+export type BadgeBreakdown = {
+  notifications: number;
+  messages: number;
+  total: number;
+  /** Unread DMs from non-friends (Message Requests). Subset of `messages`. */
+  requestMessages: number;
+  /** Unread DMs from friends. `messages - requestMessages`. */
+  friendMessages: number;
+};
+
+/** Exact unread notification count (bell) — excludes ping/message rows. */
+export async function countUnreadNotificationsForUser(
+  client: any,
+  userId: string
+): Promise<number> {
+  return countUnreadNotifications(client, userId);
+}
+
+/** Short in-memory badge cache — /api/notifications/badge is polled heavily. */
+const BADGE_CACHE_TTL_MS = 15_000;
+const badgeCache = new Map<string, { expires: number; value: BadgeBreakdown }>();
+
+/** Exact badge totals for the OS icon + in-app indicators.
+ * App-icon badge = unread social notifications (bell) + unread DMs (messages).
+ */
+export async function getBadgeBreakdown(client: any, userId: string): Promise<BadgeBreakdown> {
+  const cached = badgeCache.get(userId);
+  if (cached && cached.expires > Date.now()) return cached.value;
+
+  const [notifications, dms] = await Promise.all([
+    countUnreadNotifications(client, userId),
+    countUnreadDirectMessages(client, userId),
+  ]);
+  const safeNotifications = Math.max(0, notifications);
+  const safeMessages = Math.max(0, dms.total);
+  const safeRequests = Math.min(safeMessages, Math.max(0, dms.requests));
+  // Uncapped raw sum for clients; OS APIs still clamp to 99 when applying.
+  const rawTotal = safeNotifications + safeMessages;
+  const total = Math.max(0, Math.min(99, rawTotal));
+  const value: BadgeBreakdown = {
+    notifications: safeNotifications,
+    messages: safeMessages,
+    total,
+    requestMessages: safeRequests,
+    friendMessages: safeMessages - safeRequests,
+  };
+  badgeCache.set(userId, { expires: Date.now() + BADGE_CACHE_TTL_MS, value });
+  if (badgeCache.size > 5_000) {
+    const first = badgeCache.keys().next().value;
+    if (first) badgeCache.delete(first);
+  }
+  return value;
+}
+
+/**
+ * App-icon badge on outbound push = unread notifications + unread DMs.
+ * Exact total (0–99). Callers that deliver a user-visible alert may bump to
+ * at least 1 so the icon never stays blank for a brand-new unread event.
+ */
+export async function getUnreadNotificationBadgeCount(
+  client: any,
+  userId: string
+): Promise<number> {
+  const { total } = await getBadgeBreakdown(client, userId);
+  return Math.max(0, Math.min(99, total));
+}
+
+export async function getAppIconBadgeCount(
+  client: any,
+  userId: string
+): Promise<number> {
+  return getUnreadNotificationBadgeCount(client, userId);
+}
+
+async function deactivatePushToken(client: any, pushToken: string): Promise<void> {
+  if (!pushToken) return;
+  try {
+    await client
+      .from("user_devices")
+      .update({ is_active: false, updated_at: new Date().toISOString() })
+      .eq("push_token", pushToken);
+
+    await client.from("profiles").update({ push_token: null }).eq("push_token", pushToken);
+    console.log(`[push] Deactivated invalid token ${tokenSuffix(pushToken)}`);
+  } catch (e) {
+    console.error("[push] deactivate token error:", e);
+  }
+}
+
+async function maybeDeactivateDeadToken(
+  client: any | undefined,
+  pushToken: string,
+  errCode: string
+): Promise<void> {
+  if (client && DEAD_TOKEN_ERRORS.has(errCode)) {
+    await deactivatePushToken(client, pushToken);
+    return;
+  }
+  if (errCode === "InvalidCredentials" || errCode === "InvalidProviderToken") {
+    console.error(
+      "[push] CRITICAL: Expo/APNs credentials invalid on EAS project — " +
+        "upload the APNs Auth Key (.p8) for com.mazyd.pathplus in Expo credentials. " +
+        "Device tokens were NOT deactivated."
+    );
+  }
+}
+
+async function fetchPushReceipts(ticketIds: string[]): Promise<Record<string, any>> {
+  if (ticketIds.length === 0) return {};
+  try {
+    const res = await fetch(EXPO_PUSH_RECEIPTS_URL, {
+      method: "POST",
+      headers: pushHeaders(),
+      body: JSON.stringify({ ids: ticketIds }),
+    });
+    const json: any = await res.json().catch(() => null);
+    return json?.data ?? {};
+  } catch (e) {
+    console.error("[push] fetch receipts failed:", e);
+    return {};
+  }
+}
+
+async function waitForReceipt(ticketId: string, attempts = 4, delayMs = 1000): Promise<any> {
+  // Keep this short: Settings → Test Push waits on the HTTP response, and
+  // reverse proxies often time out around 5–10s.
+  for (let i = 0; i < attempts; i++) {
+    await new Promise((r) => setTimeout(r, delayMs));
+    const receipts = await fetchPushReceipts([ticketId]);
+    if (receipts[ticketId]) return receipts[ticketId];
+  }
+  return null;
+}
+
+function scheduleReceiptCheck(
+  ticketId: string,
+  pushToken: string,
+  client?: any
+): void {
+  void (async () => {
+    const receipt = await waitForReceipt(ticketId, 4, 2000);
+    if (!receipt) return;
+
+    if (receipt.status === "error") {
+      const errCode = receipt.details?.error ?? receipt.message ?? "unknown";
+      console.error(`[push] Receipt error for ${tokenSuffix(pushToken)}:`, errCode, receipt.details);
+      await maybeDeactivateDeadToken(client, pushToken, errCode);
+    } else {
+      console.log(`[push] Receipt OK for ${tokenSuffix(pushToken)} (ticket ${ticketId.slice(0, 8)}…)`);
+    }
+  })();
+}
+
+/**
+ * Register or refresh a device push token for the authenticated user.
+ * Supports multiple devices per user; dedupes by (user_id, device_id) and push_token.
+ */
+export async function upsertUserDevice(
+  client: any,
+  userId: string,
+  opts: { pushToken: string; platform: string; deviceId: string }
+): Promise<void> {
+  const { pushToken, platform, deviceId } = opts;
+  if (!isExpoPushToken(pushToken) || !deviceId) return;
+
+  const now = new Date().toISOString();
+
+  // UNIQUE(push_token): remove any other row holding this token so upsert cannot fail.
+  await client
+    .from("user_devices")
+    .delete()
+    .eq("push_token", pushToken)
+    .or(`user_id.neq.${userId},device_id.neq.${deviceId}`);
+
+  const { error } = await client.from("user_devices").upsert(
+    {
+      user_id: userId,
+      push_token: pushToken,
+      platform: platform || "unknown",
+      device_id: deviceId,
+      is_active: true,
+      updated_at: now,
+    },
+    { onConflict: "user_id,device_id" }
+  );
+
+  if (error) {
+    console.warn("[push] user_devices upsert failed (using profiles.push_token):", error.message);
+  } else {
+    console.log(
+      `[push] Token saved user=${userId.slice(0, 8)}… platform=${platform} device=${deviceId.slice(0, 8)}…`
+    );
+  }
+
+  await client
+    .from("profiles")
+    .update({ push_token: pushToken, push_notifications_enabled: true })
+    .eq("id", userId);
+}
+
+/** Deactivate one device or all devices for a user (logout / opt-out). */
+export async function deactivateUserDevices(
+  client: any,
+  userId: string,
+  deviceId?: string | null
+): Promise<void> {
+  const now = new Date().toISOString();
+  let deactivatedToken: string | null = null;
+  try {
+    if (deviceId) {
+      const { data: row } = await client
+        .from("user_devices")
+        .select("push_token")
+        .eq("user_id", userId)
+        .eq("device_id", deviceId)
+        .maybeSingle();
+      if (isExpoPushToken(row?.push_token)) deactivatedToken = row.push_token;
+    }
+
+    let query = client
+      .from("user_devices")
+      .update({ is_active: false, updated_at: now })
+      .eq("user_id", userId);
+    if (deviceId) query = query.eq("device_id", deviceId);
+    await query;
+  } catch (e) {
+    console.warn("[push] deactivateUserDevices:", e);
+  }
+
+  if (!deviceId) {
+    await client
+      .from("profiles")
+      .update({ push_token: null, push_notifications_enabled: false })
+      .eq("id", userId);
+    return;
+  }
+
+  // Clear legacy profiles.push_token when it matched this device, or when no
+  // active devices remain (avoids ghost tokens after single-device logout).
+  try {
+    const { data: stillActive } = await client
+      .from("user_devices")
+      .select("push_token")
+      .eq("user_id", userId)
+      .eq("is_active", true)
+      .limit(1);
+    if (!stillActive?.length) {
+      await client.from("profiles").update({ push_token: null }).eq("id", userId);
+      return;
+    }
+    if (deactivatedToken) {
+      await client
+        .from("profiles")
+        .update({ push_token: null })
+        .eq("id", userId)
+        .eq("push_token", deactivatedToken);
+    }
+  } catch (e) {
+    console.warn("[push] clear legacy profile token:", e);
+  }
+}
+
+async function isUserPushEnabled(client: any, userId: string): Promise<boolean> {
+  try {
+    const { data } = await client
+      .from("profiles")
+      .select("push_notifications_enabled")
+      .eq("id", userId)
+      .maybeSingle();
+    return data?.push_notifications_enabled !== false;
+  } catch {
+    return true;
+  }
+}
+
+/** All active Expo push tokens for a user (multi-device + legacy profiles.push_token). */
+export async function getPushTokensForUser(client: any, userId: string): Promise<string[]> {
+  if (!(await isUserPushEnabled(client, userId))) return [];
+
+  const tokens = new Set<string>();
+
+  try {
+    const { data: devices } = await client
+      .from("user_devices")
+      .select("push_token")
+      .eq("user_id", userId)
+      .eq("is_active", true);
+    for (const row of devices ?? []) {
+      if (isExpoPushToken(row.push_token)) tokens.add(row.push_token);
+    }
+  } catch {
+    /* user_devices table may not exist yet */
+  }
+
+  // Always merge legacy profiles.push_token (previous working Path+ stored only here).
+  // Do not skip it when user_devices has stale active rows.
+  try {
+    const { data } = await client
+      .from("profiles")
+      .select("push_token")
+      .eq("id", userId)
+      .maybeSingle();
+    if (isExpoPushToken(data?.push_token)) tokens.add(data.push_token);
+  } catch {
+    /* ignore */
+  }
+
+  return [...tokens];
+}
+
+export type PushDeviceSummary = {
+  pushEnabledGlobally: boolean;
+  pushEnabledForUser: boolean;
+  activeDeviceCount: number;
+  legacyProfileToken: boolean;
+  platforms: string[];
+};
+
+/** Diagnostic summary for a user's push registration (no full tokens exposed). */
+export async function getPushStatusForUser(
+  client: any,
+  userId: string
+): Promise<PushDeviceSummary> {
+  const pushEnabledGlobally = await isPushEnabled();
+  const pushEnabledForUser = await isUserPushEnabled(client, userId);
+
+  const platforms: string[] = [];
+  let activeDeviceCount = 0;
+
+  try {
+    const { data: devices } = await client
+      .from("user_devices")
+      .select("platform")
+      .eq("user_id", userId)
+      .eq("is_active", true);
+    for (const row of devices ?? []) {
+      activeDeviceCount++;
+      if (row.platform) platforms.push(row.platform);
+    }
+  } catch {
+    /* ignore */
+  }
+
+  let legacyProfileToken = false;
+  try {
+    const { data } = await client
+      .from("profiles")
+      .select("push_token")
+      .eq("id", userId)
+      .maybeSingle();
+    legacyProfileToken = isExpoPushToken(data?.push_token);
+  } catch {
+    /* ignore */
+  }
+
+  if (activeDeviceCount === 0 && legacyProfileToken) {
+    activeDeviceCount = 1;
+  }
+
+  return {
+    pushEnabledGlobally,
+    pushEnabledForUser,
+    activeDeviceCount,
+    legacyProfileToken,
+    platforms,
+  };
+}
+
+/** Backward-compatible helper — returns the first active token or null. */
+export async function getPushToken(client: any, userId: string): Promise<string | null> {
+  const tokens = await getPushTokensForUser(client, userId);
+  return tokens[0] ?? null;
+}
+
+/** Send a push notification and optionally wait for the Expo receipt. Never throws. */
+export async function sendPushNotificationDetailed(
+  pushToken: string | null | undefined,
+  title: string,
+  body: string,
+  data?: Record<string, unknown>,
+  client?: any,
+  opts?: { waitForReceipt?: boolean; badge?: number; userId?: string }
+): Promise<PushDeliveryResult> {
+  const suffix = pushToken ? tokenSuffix(pushToken) : "none";
+
+  if (!isExpoPushToken(pushToken)) {
+    return { ok: false, tokenSuffix: suffix, message: "Invalid or missing Expo push token" };
+  }
+
+  if (!(await isPushEnabled())) {
+    console.warn("[push] Push disabled in Admin settings — notification skipped");
+    return { ok: false, tokenSuffix: suffix, message: "Push notifications disabled in Admin settings" };
+  }
+
+  let badge = opts?.badge;
+  if (
+    (typeof badge !== "number" || !Number.isFinite(badge)) &&
+    client &&
+    typeof opts?.userId === "string" &&
+    opts.userId.length > 0
+  ) {
+    badge = await getUnreadNotificationBadgeCount(client, opts.userId);
+  }
+
+  const message = buildExpoPushMessage(pushToken, title, body, data, { badge });
+  const notifType = typeof data?.type === "string" ? data.type : "default";
+  console.log(
+    `[push] Sending type=${notifType} sound=${String(message.sound)} category=${String(message.categoryId)} badge=${String(message.badge)} to ${suffix}`
+  );
+
+  try {
+    const res = await fetch(EXPO_PUSH_URL, {
+      method: "POST",
+      headers: pushHeaders(),
+      body: JSON.stringify(message),
+    });
+
+    const json: any = await res.json().catch(() => null);
+    const ticket = Array.isArray(json?.data) ? json.data[0] : json?.data;
+
+    if (!res.ok) {
+      const msg = json?.errors?.[0]?.message ?? `HTTP ${res.status}`;
+      const code = json?.errors?.[0]?.code ?? json?.errors?.[0]?.error ?? "";
+      console.error(`[push] Expo HTTP error for ${suffix}:`, msg, code);
+      if (
+        String(code).includes("UNAUTHORIZED") ||
+        String(msg).toLowerCase().includes("unauthorized")
+      ) {
+        console.error(
+          "[push] CRITICAL: Expo rejected the request — set EXPO_ACCESS_TOKEN on the server " +
+            "(required when Enhanced Push Security is enabled on the EAS project)."
+        );
+      }
+      return { ok: false, tokenSuffix: suffix, message: msg };
+    }
+
+    if (ticket?.status === "error") {
+      const errCode = ticket.details?.error ?? ticket.message ?? "unknown";
+      console.error(`[push] Expo ticket error for ${suffix}:`, errCode, ticket.details);
+      await maybeDeactivateDeadToken(client, pushToken, errCode);
+      return {
+        ok: false,
+        tokenSuffix: suffix,
+        ticketStatus: "error",
+        ticketError: errCode,
+        message: `Expo ticket error: ${errCode}`,
+      };
+    }
+
+    const ticketId = ticket?.id as string | undefined;
+    console.log(`[push] Ticket OK for ${suffix}${ticketId ? ` id=${ticketId.slice(0, 8)}…` : ""}`);
+
+    if (!ticketId) {
+      return { ok: true, tokenSuffix: suffix, ticketStatus: "ok", message: "Push ticket accepted (no id)" };
+    }
+
+    if (opts?.waitForReceipt) {
+      const receipt = await waitForReceipt(ticketId);
+      if (!receipt) {
+        return {
+          ok: true,
+          tokenSuffix: suffix,
+          ticketId,
+          ticketStatus: "ok",
+          message: "Push ticket accepted; receipt not yet available",
+        };
+      }
+      if (receipt.status === "error") {
+        const errCode = receipt.details?.error ?? receipt.message ?? "unknown";
+        console.error(`[push] Receipt error for ${suffix}:`, errCode, receipt.details);
+        await maybeDeactivateDeadToken(client, pushToken, errCode);
+        return {
+          ok: false,
+          tokenSuffix: suffix,
+          ticketId,
+          ticketStatus: "ok",
+          receiptStatus: "error",
+          receiptError: errCode,
+          message: `Expo receipt error: ${errCode}`,
+        };
+      }
+      return {
+        ok: true,
+        tokenSuffix: suffix,
+        ticketId,
+        ticketStatus: "ok",
+        receiptStatus: "ok",
+        message: "Push delivered (receipt OK)",
+      };
+    }
+
+    scheduleReceiptCheck(ticketId, pushToken, client);
+    return {
+      ok: true,
+      tokenSuffix: suffix,
+      ticketId,
+      ticketStatus: "ok",
+      message: "Push ticket accepted",
+    };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "unknown";
+    console.error(`[push] Failed to send to ${suffix}:`, msg);
+    return { ok: false, tokenSuffix: suffix, message: msg };
+  }
+}
+
+/** Send a push notification to a single Expo push token. Never throws. */
 export async function sendPushNotification(
   pushToken: string | null | undefined,
   title: string,
   body: string,
-  data?: Record<string, any>
+  data?: Record<string, unknown>,
+  client?: any,
+  opts?: { badge?: number; userId?: string }
 ): Promise<void> {
-  if (!pushToken || !pushToken.startsWith('ExponentPushToken')) return;
-
-  try {
-    await fetch('https://exp.host/--/api/v2/push/send', {
-      method: 'POST',
-      headers: {
-        'Accept': 'application/json',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        to: pushToken,
-        title,
-        body,
-        data: data ?? {},
-        sound: 'default',
-        priority: 'high',
-      }),
-    });
-  } catch (e) {
-    // Non-critical: log but don't crash
-    console.error('[push] Failed to send notification:', e);
-  }
+  await sendPushNotificationDetailed(pushToken, title, body, data, client, {
+    badge: opts?.badge,
+    userId: opts?.userId,
+  });
 }
 
-// Lookup push token for a user by their userId
-// Uses supabaseAdmin to bypass RLS
-export async function getPushToken(supabaseAdmin: any, userId: string): Promise<string | null> {
+/** Send a push to every active device belonging to a user. Never throws. */
+export async function sendPushToUser(
+  client: any,
+  userId: string,
+  title: string,
+  body: string,
+  data?: Record<string, unknown>,
+  opts?: { badge?: number }
+): Promise<void> {
   try {
-    const { data } = await supabaseAdmin
-      .from('profiles')
-      .select('push_token')
-      .eq('id', userId)
-      .single();
-    return data?.push_token ?? null;
-  } catch {
-    return null;
+    const tokens = await getPushTokensForUser(client, userId);
+    if (tokens.length === 0) {
+      console.log(`[push] No active tokens for user ${userId.slice(0, 8)}… — skipped`);
+      return;
+    }
+    // Optional badge override skips the unread COUNT round-trip.
+    // Alert pushes use at least 1 so APNs always paints the icon when a new
+    // unread event is delivered (exact total after the notification insert).
+    let badge =
+      typeof opts?.badge === "number" && Number.isFinite(opts.badge)
+        ? Math.max(0, Math.min(99, Math.floor(opts.badge)))
+        : await getUnreadNotificationBadgeCount(client, userId);
+    if (badge < 1) badge = 1;
+    console.log(
+      `[push] Sending "${title}" to user ${userId.slice(0, 8)}… (${tokens.length} device(s), badge=${badge})`
+    );
+    await Promise.all(
+      tokens.map((token) =>
+        sendPushNotification(token, title, body, data, client, { badge, userId })
+      )
+    );
+  } catch (e) {
+    console.error("[push] sendPushToUser error:", e);
   }
 }

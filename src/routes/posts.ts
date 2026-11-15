@@ -1,21 +1,44 @@
 import { Hono } from "hono";
 import { createUserClient, supabaseAdmin } from "../supabase";
-import { formatPost, formatReactions, isReactionLocked, baseReactionType, lockedReactionType } from "./users";
-import { sendPushNotification, getPushToken } from "../lib/push";
+import {
+  formatPost,
+  formatReactions,
+  refreshReactionActors,
+  isReactionLocked,
+  baseReactionType,
+  lockedReactionType,
+} from "./users";
+import { sendPushToUser } from "../lib/push";
 import { SYSTEM_MOMENT_TYPES, refreshFriendshipAvatars } from "../lib/systemMoments";
 import { ensureBirthdayMoments } from "../lib/birthday";
 import { notifyMentions } from "../lib/mentions";
 import { encodeImages } from "../lib/images";
 import { getBlockedIds } from "../lib/blocks";
 import { parseDurationToMinutes } from "../lib/duration";
+import { POST_SELECT, loadPosts, attachOriginals, loadPostsByIds } from "../lib/load-posts";
+import { resolveAvatarUrl } from "../lib/avatar";
+import { attachCommentPreviews, formatCommentUser } from "../lib/comment-previews";
+import { halfLineSnippet } from "../lib/moment-preview";
+import { getDeletionHiddenUserIds } from "../lib/account-deletion";
+import { fetchNewestMomentBatch } from "../lib/moment-feed";
+import { walkNewestPage } from "../lib/moment-order";
+import {
+  parseLimit,
+  parseCursor,
+  encodeCursor,
+  isOlderThanCursor,
+} from "../lib/pagination";
+import {
+  canViewerSeeMoment,
+  loadMomentVisibilityContext,
+  scrubInvisibleOriginals,
+  viewerCanAccessMoment,
+} from "../lib/moment-visibility";
+import { viewLimiter } from "../lib/rate-limit";
+import { isSupabaseCircuitOpen } from "../lib/supabase-circuit";
 import type { HonoVariables } from "../types";
 
 const postsRouter = new Hono<{ Variables: HonoVariables }>();
-
-// Standard post select: the row + author profile + reactions (with reactor
-// avatars). `*` returns whatever columns exist, so `repath_of` is included
-// automatically once the column is added and simply absent before then.
-const POST_SELECT = "*, profiles(*), reactions(user_id, type, profiles:user_id(avatar_url))";
 
 // The set of authors who have privately starred `viewerId` as a close friend.
 // Read with the admin client because RLS restricts `close_friends` rows to their
@@ -23,54 +46,58 @@ const POST_SELECT = "*, profiles(*), reactions(user_id, type, profiles:user_id(a
 // close friends. Returns an empty set if the table isn't set up yet (graceful).
 async function getWhoStarredMe(viewerId: string): Promise<Set<string>> {
   try {
-    const { data, error } = await supabaseAdmin
+    // Support both schema variants: user_id (common) and owner_id (older).
+    let { data, error } = await supabaseAdmin
       .from("close_friends")
-      .select("owner_id")
+      .select("user_id")
       .eq("friend_id", viewerId);
-    if (error || !data) return new Set();
-    return new Set(data.map((r: any) => r.owner_id));
+
+    if (error || !data) {
+      ({ data, error } = await supabaseAdmin
+        .from("close_friends")
+        .select("owner_id")
+        .eq("friend_id", viewerId));
+      if (error || !data) return new Set();
+      return new Set(data.map((r: any) => r.owner_id).filter(Boolean));
+    }
+    return new Set(data.map((r: any) => r.user_id).filter(Boolean));
   } catch {
     return new Set();
   }
-}
-
-// Attach the nested `original` moment to any repath posts. Uses the RLS-scoped
-// userClient so feed privacy is preserved — originals the viewer isn't allowed
-// to see come back as null. No-ops when nothing references an original (e.g.
-// before the `repath_of` column exists), so it's safe with or without the SQL.
-async function attachOriginals(userClient: any, posts: any[]) {
-  const originalIds = Array.from(
-    new Set((posts ?? []).map((p) => p?.repath_of).filter(Boolean))
-  );
-  if (originalIds.length === 0) return posts;
-  const { data: originals } = await userClient
-    .from("posts")
-    .select(POST_SELECT)
-    .in("id", originalIds);
-  const byId = new Map((originals ?? []).map((o: any) => [o.id, o]));
-  for (const p of posts) {
-    if (p?.repath_of) p.original = byId.get(p.repath_of) ?? null;
-  }
-  return posts;
 }
 
 postsRouter.get("/", async (c) => {
   const user = c.get("user");
   const userId = c.get("userId");
   const token = c.get("accessToken");
-  if (!user || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const userClient = createUserClient(token);
+  const limit = parseLimit(c.req.query("limit"), 20, 50);
+  const cursor = parseCursor(c.req.query("cursor"));
+  // Batch is larger than the page so audience filters still fill one page.
+  // The database orders each batch before this limit is applied.
+  const batchSize = Math.min(Math.max(limit * 3, limit + 10), 80);
 
-  // Privacy: the home timeline shows ONLY the current user's own moments plus
-  // moments from ACCEPTED (mutual) friends. Pending/requested relationships
-  // must never expose any moments — for every moment type, including the
-  // "Joined Path+" auto-moments.
-  const { data: acceptedFriendships } = await userClient
-    .from("friendships")
-    .select("requester_id, receiver_id")
-    .eq("status", "accepted")
-    .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`);
+  // Privacy: own moments, moments from accepted friends, and public moments.
+  // Pending friendships never expose moments. Private moments stay with the
+  // author. Close-friends moments stay with people that author starred.
+  // Parallelize the hot-path lookups that used to run as a waterfall.
+  const [friendshipsResult, blockedIds, whoStarredMe, deletionHidden] = await Promise.all([
+    supabaseAdmin
+      .from("friendships")
+      .select("requester_id, receiver_id")
+      .eq("status", "accepted")
+      .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
+    getBlockedIds(userId),
+    getWhoStarredMe(userId),
+    getDeletionHiddenUserIds(),
+  ]);
+
+  const { data: acceptedFriendships, error: friendsErr } = friendshipsResult;
+  if (friendsErr) {
+    console.error("[posts] friendships query failed:", friendsErr.message);
+  }
 
   const friendIds = (acceptedFriendships ?? []).map((f: any) =>
     f.requester_id === userId ? f.receiver_id : f.requester_id
@@ -78,42 +105,83 @@ postsRouter.get("/", async (c) => {
 
   // Self + accepted friends. (Always include self even with no friends yet.)
   // Then remove anyone blocked in either direction (self is never blocked).
-  const blockedIds = await getBlockedIds(userId!);
   const blockedSet = new Set(blockedIds);
   const allowedUserIds = Array.from(new Set([userId, ...friendIds])).filter(
-    (id) => id === userId || !blockedSet.has(id as string)
+    (id): id is string => typeof id === "string" && id.length > 0 && (id === userId || !blockedSet.has(id))
   );
 
-  // Lazily detect birthdays (the viewer's + their friends') and create the
-  // birthday moment + friend notifications before loading the feed, so a fresh
-  // birthday moment shows up in this same response. Idempotent (once per year).
-  await ensureBirthdayMoments(userId!, friendIds);
-
-  const { data: posts } = await userClient
-    .from("posts")
-    .select(POST_SELECT)
-    .in("user_id", allowedUserIds)
-    .order("created_at", { ascending: false })
-    .limit(50);
-
-  // Per-post audience enforcement. `whoStarredMe` = the set of authors who have
-  // privately starred ME as a close friend (read with the admin client because
-  // RLS hides other users' close_friends rows). A post with audience='close' is
-  // delivered only to the author's starred close friends; 'private' is author-
-  // only; everything else (incl. a missing `audience` column) behaves as today.
-  const whoStarredMe = await getWhoStarredMe(userId!);
-  const visible = (posts ?? []).filter((p: any) => {
-    if (p.user_id === userId) return true; // my own moments always show
-    const audience = p.audience ?? "friends";
-    if (audience === "private") return false;
-    if (audience === "close") return whoStarredMe.has(p.user_id);
-    return true; // 'public' | 'friends' | unknown
+  // Birthday ensure is idempotent but can add latency — run in background so
+  // the feed response isn't blocked. Next refresh will pick up new moments.
+  void ensureBirthdayMoments(userId, friendIds).catch((e) => {
+    console.warn("[posts] birthday ensure failed:", e instanceof Error ? e.message : e);
   });
 
-  await attachOriginals(userClient, visible);
-  const formatted = visible.map((p) => formatPost(p, userId ?? undefined, blockedIds));
+  const friendIdSet = new Set(friendIds);
+
+  // Page after ordering. Friend moments and public moments are separate
+  // streams so a limited public window cannot push a newer friend moment
+  // off the first page, and a refresh without new rows returns the same page.
+  let walked;
+  try {
+    walked = await walkNewestPage({
+      cursor,
+      limit,
+      batchSize,
+      fetchFriends: (pageCursor, size) =>
+        fetchNewestMomentBatch((q) => q.in("user_id", allowedUserIds), pageCursor, size),
+      fetchPublic: async (pageCursor, size) => {
+        try {
+          return await fetchNewestMomentBatch((q) => q.eq("audience", "public"), pageCursor, size);
+        } catch (e) {
+          console.warn("[posts] public moment window failed:", e instanceof Error ? e.message : e);
+          return [];
+        }
+      },
+      accept: (p: any) => {
+        if (!p?.id) return false;
+        if (p.user_id !== userId && blockedSet.has(p.user_id)) return false;
+        if (p.user_id !== userId && deletionHidden.has(p.user_id)) return false;
+        if (p.user_id === userId) return true;
+        const audience = p.audience ?? "friends";
+        if (audience === "private") return false;
+        if (audience === "close") return whoStarredMe.has(p.user_id);
+        if (audience === "public") return true;
+        return friendIdSet.has(p.user_id);
+      },
+    });
+  } catch (e) {
+    console.error("[posts] feed query failed:", e instanceof Error ? e.message : e);
+    return c.json({ error: { message: "Failed to load moments" } }, 500);
+  }
+
+  let ordered: any[] = [];
+  try {
+    // Skip hydrateReactionProfiles — refreshReactionActors runs after formatPost.
+    ordered = await loadPostsByIds(walked.page.map((p) => p.id), {
+      hydrateReactions: false,
+    });
+    await attachOriginals(userClient, ordered);
+  } catch (e) {
+    console.error("[posts] feed hydrate failed:", e instanceof Error ? e.message : e);
+    return c.json({ error: { message: "Failed to load moments" } }, 500);
+  }
+
+  // Latest preview comment per moment in one batched query (before formatPost).
+  await attachCommentPreviews(ordered, userId ?? undefined, blockedIds);
+  if (userId) {
+    const visCtx = await loadMomentVisibilityContext(userId);
+    scrubInvisibleOriginals(ordered, userId, visCtx);
+  }
+
+  const formatted = ordered.map((p) => formatPost(p, userId ?? undefined, blockedIds));
   await refreshFriendshipAvatars(formatted); // always show friends' CURRENT avatars
-  return c.json({ data: formatted });
+  await refreshReactionActors(formatted); // live names + avatars on likes
+  return c.json({
+    data: formatted,
+    nextCursor: walked.nextCursor,
+    hasMore: walked.hasMore,
+    limit,
+  });
 });
 
 // Matches #hashtag tokens: latin + accented + Arabic letters, digits, underscore.
@@ -134,8 +202,8 @@ function extractHashtags(content: string | null | undefined): string[] {
 
 // Compute the viewer's allowed authors: themselves + accepted (mutual) friends.
 // This is the SAME privacy boundary the home feed uses.
-async function getAllowedAuthorIds(userClient: any, userId: string): Promise<string[]> {
-  const { data: acceptedFriendships } = await userClient
+async function getAllowedAuthorIds(_userClient: any, userId: string): Promise<string[]> {
+  const { data: acceptedFriendships } = await supabaseAdmin
     .from("friendships")
     .select("requester_id, receiver_id")
     .eq("status", "accepted")
@@ -157,13 +225,28 @@ postsRouter.get("/hashtags", async (c) => {
 
   const prefix = (c.req.query("q") ?? "").replace(/^#+/, "").trim().toLowerCase();
 
-  // Pull recent posts that actually contain a hashtag and tally distinct tags.
+  // Prefer the hashtags table (maintained on post create) — avoids scanning 1000 posts.
+  let query = supabaseAdmin
+    .from("hashtags")
+    .select("tag, post_count")
+    .order("post_count", { ascending: false })
+    .limit(10);
+  if (prefix) query = query.ilike("tag", `${prefix}%`);
+
+  const { data: tags, error } = await query;
+  if (!error && tags && tags.length > 0) {
+    return c.json({
+      data: tags.map((t: { tag: string }) => String(t.tag ?? "").replace(/^#/, "").toLowerCase()).filter(Boolean),
+    });
+  }
+
+  // Fallback for environments without hashtags table / empty table.
   const { data: rows } = await supabaseAdmin
     .from("posts")
     .select("content")
     .ilike("content", "%#%")
     .order("created_at", { ascending: false })
-    .limit(1000);
+    .limit(200);
 
   const counts = new Map<string, number>();
   for (const r of rows ?? []) {
@@ -192,7 +275,10 @@ postsRouter.get("/hashtag/:tag", async (c) => {
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const normalized = (c.req.param("tag") ?? "").replace(/^#+/, "").trim().toLowerCase();
-  if (!normalized) return c.json({ data: [] });
+  if (!normalized) return c.json({ data: [], nextCursor: null, hasMore: false, limit: 20 });
+
+  const limit = parseLimit(c.req.query("limit"), 20, 50);
+  const cursor = parseCursor(c.req.query("cursor"));
 
   const userClient = createUserClient(token);
   const blockedIds = await getBlockedIds(userId);
@@ -201,77 +287,215 @@ postsRouter.get("/hashtag/:tag", async (c) => {
     (id) => id === userId || !blockedSet.has(id)
   );
 
-  // Candidate fetch: same privacy boundary + a cheap content prefilter. The
-  // exact token match happens in JS so "#foo" never matches "#foobar".
-  const { data: posts } = await userClient
-    .from("posts")
-    .select(POST_SELECT)
-    .in("user_id", allowedUserIds)
-    .ilike("content", `%#${normalized}%`)
-    .order("created_at", { ascending: false })
-    .limit(200);
+  // Over-fetch candidates — exact token match + cursor filter happen in JS.
+  const fetchLimit = Math.min(Math.max(limit * 4, 40), 200);
 
-  const matching = (posts ?? []).filter((p: any) =>
-    extractHashtags(p.content).includes(normalized)
-  );
-  await attachOriginals(userClient, matching);
+  const { data: posts } = await loadPosts((select) => {
+    let q = supabaseAdmin
+      .from("posts")
+      .select(select)
+      .in("user_id", allowedUserIds)
+      .ilike("content", `%#${normalized}%`)
+      .order("created_at", { ascending: false })
+      .limit(fetchLimit);
+    if (cursor?.createdAt) q = q.lt("created_at", cursor.createdAt);
+    return q;
+  });
 
-  return c.json({ data: matching.map((p) => formatPost(p, userId ?? undefined, blockedIds)) });
+  const matching = (posts ?? []).filter((p: any) => {
+    if (!extractHashtags(p.content).includes(normalized)) return false;
+    if (!cursor) return true;
+    return isOlderThanCursor(String(p.created_at), String(p.id), cursor);
+  });
+
+  const hasMore = matching.length > limit;
+  const page = hasMore ? matching.slice(0, limit) : matching;
+  await attachOriginals(userClient, page);
+
+  const last = page[page.length - 1];
+  const nextCursor =
+    hasMore && last?.created_at && last?.id
+      ? encodeCursor(String(last.created_at), String(last.id))
+      : null;
+
+  await attachCommentPreviews(page, userId ?? undefined, blockedIds);
+
+  const formatted = page.map((p) => formatPost(p, userId ?? undefined, blockedIds));
+  await refreshReactionActors(formatted);
+  return c.json({
+    data: formatted,
+    nextCursor,
+    hasMore,
+    limit,
+  });
 });
 
-// GET /api/posts/reacted — moments the CURRENT user has reacted to (any
-// reaction they themselves gave), newest-reaction-first. Respects the SAME
-// privacy boundary as the home feed: only moments the viewer can still access
-// (their own + accepted friends'). Declared before "/:id" so it isn't captured
-// as an id.
-postsRouter.get("/reacted", async (c) => {
+// Collect post ids the user has interacted with: reactions, comments, and
+// repaths (of someone else's moment). Order is insertion order (first touch).
+async function collectInteractedPostIds(userId: string): Promise<string[]> {
+  const ordered: string[] = [];
+  const seen = new Set<string>();
+  const add = (pid: string | null | undefined) => {
+    if (pid && !seen.has(pid)) {
+      seen.add(pid);
+      ordered.push(pid);
+    }
+  };
+
+  const [reactionsResult, commentsResult, repathsResult] = await Promise.all([
+    supabaseAdmin
+      .from("reactions")
+      .select("post_id")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(200),
+    supabaseAdmin
+      .from("comments")
+      .select("post_id")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(200),
+    supabaseAdmin
+      .from("posts")
+      .select("repath_of")
+      .eq("user_id", userId)
+      .not("repath_of", "is", null)
+      .order("created_at", { ascending: false })
+      .limit(200),
+  ]);
+
+  const { data: myReactions, error: reactionsError } = reactionsResult;
+  if (reactionsError) {
+    console.error("[posts/interacted] reactions query failed:", reactionsError.message);
+  } else {
+    for (const r of myReactions ?? []) add((r as any).post_id);
+  }
+
+  const { data: myComments, error: commentsError } = commentsResult;
+  if (commentsError) {
+    console.warn("[posts/interacted] comments query failed:", commentsError.message);
+  } else {
+    for (const row of myComments ?? []) add((row as any).post_id);
+  }
+
+  const { data: myRepaths, error: repathError } = repathsResult;
+  if (repathError) {
+    if (!/repath_of|column/i.test(repathError.message ?? "")) {
+      console.warn("[posts/interacted] repaths query failed:", repathError.message);
+    }
+  } else {
+    for (const row of myRepaths ?? []) add((row as any).repath_of);
+  }
+
+  return ordered;
+}
+
+// Shared handler for /reacted and /interacted.
+async function handleInteractedMoments(c: any) {
   const user = c.get("user");
   const userId = c.get("userId");
   const token = c.get("accessToken");
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const userClient = createUserClient(token);
+  const offset = Math.max(0, Number.parseInt(String(c.req.query("offset") ?? "0"), 10) || 0);
+  const limitParam = c.req.query("limit");
+  const paged = limitParam != null;
+  const limit = paged
+    ? Math.min(60, Math.max(1, Number.parseInt(String(limitParam), 10) || 10))
+    : 60;
 
-  // Every post this user reacted to, most-recent reaction first.
-  const { data: myReactions } = await supabaseAdmin
-    .from("reactions")
-    .select("post_id, created_at")
-    .eq("user_id", userId)
-    .order("created_at", { ascending: false });
-
-  // Distinct post ids, preserving reaction-recency order.
-  const orderedPostIds: string[] = [];
-  const seen = new Set<string>();
-  for (const r of myReactions ?? []) {
-    const pid = (r as any).post_id;
-    if (pid && !seen.has(pid)) {
-      seen.add(pid);
-      orderedPostIds.push(pid);
+  const orderedPostIds = (await collectInteractedPostIds(userId)).slice(0, 60);
+  if (orderedPostIds.length === 0) {
+    if (paged) {
+      return c.json({ data: { posts: [], offset, limit, hasMore: false, total: 0 } });
     }
+    return c.json({ data: [] });
   }
-  if (orderedPostIds.length === 0) return c.json({ data: [] });
 
-  // Same privacy boundary as the feed (self + accepted friends), minus blocked.
-  const blockedIds = await getBlockedIds(userId);
+  const [blockedIds, allowedAuthors] = await Promise.all([
+    getBlockedIds(userId),
+    getAllowedAuthorIds(userClient, userId),
+  ]);
   const blockedSet = new Set(blockedIds);
-  const allowedUserIds = (await getAllowedAuthorIds(userClient, userId)).filter(
-    (id) => id === userId || !blockedSet.has(id)
+  const allowedUserIds = new Set(
+    allowedAuthors.filter((id) => id === userId || !blockedSet.has(id))
   );
 
-  const { data: posts } = await userClient
+  // Lightweight pass: only id/user/created_at so we can sort + page before
+  // hydrating full post payloads (reactions, profiles, originals).
+  const { data: metaRows, error: metaError } = await supabaseAdmin
     .from("posts")
-    .select(POST_SELECT)
-    .in("id", orderedPostIds)
-    .in("user_id", allowedUserIds);
+    .select("id, user_id, created_at")
+    .in("id", orderedPostIds);
 
-  await attachOriginals(userClient, posts ?? []);
+  if (metaError) {
+    console.error("[posts/reacted] meta query failed:", metaError.message);
+    return c.json({ error: { message: "Failed to load liked moments" } }, 500);
+  }
 
-  // Re-order the fetched posts to match reaction recency.
+  const deletionHidden = await getDeletionHiddenUserIds();
+  // Own posts still show even if the author is in the deletion-hidden set.
+  const metaFinal = (metaRows ?? []).filter((p: any) => {
+    if (!allowedUserIds.has(p.user_id)) return false;
+    if (p.user_id === userId) return true;
+    return !deletionHidden.has(p.user_id);
+  });
+
+  metaFinal.sort(
+    (a: any, b: any) =>
+      new Date(b.created_at ?? 0).getTime() - new Date(a.created_at ?? 0).getTime()
+  );
+
+  const total = metaFinal.length;
+  const pageMeta = metaFinal.slice(offset, offset + limit);
+  const pageIds = pageMeta.map((p: any) => p.id);
+
+  if (pageIds.length === 0) {
+    if (paged) {
+      return c.json({ data: { posts: [], offset, limit, hasMore: false, total } });
+    }
+    return c.json({ data: [] });
+  }
+
+  const { data: posts, error: postsError } = await loadPosts((select) =>
+    supabaseAdmin.from("posts").select(select).in("id", pageIds)
+  );
+
+  if (postsError) {
+    console.error("[posts/reacted] posts query failed:", postsError.message);
+    return c.json({ error: { message: "Failed to load liked moments" } }, 500);
+  }
+
+  // Preserve newest-first order from metaFinal.
   const byId = new Map((posts ?? []).map((p: any) => [p.id, p]));
-  const ordered = orderedPostIds.map((id) => byId.get(id)).filter(Boolean);
+  const orderedPosts = pageIds.map((id) => byId.get(id)).filter(Boolean);
+  await attachOriginals(userClient, orderedPosts);
 
-  return c.json({ data: ordered.map((p) => formatPost(p, userId, blockedIds)) });
-});
+  await attachCommentPreviews(orderedPosts, userId, blockedIds);
+
+  const formatted = orderedPosts.map((p: any) => formatPost(p, userId, blockedIds));
+  await refreshReactionActors(formatted);
+  if (paged) {
+    return c.json({
+      data: {
+        posts: formatted,
+        offset,
+        limit,
+        hasMore: offset + limit < total,
+        total,
+      },
+    });
+  }
+  return c.json({ data: formatted });
+}
+
+// GET /api/posts/reacted — moments the CURRENT user has interacted with
+// (reacted, commented, or repathed). Same privacy boundary as the home feed.
+postsRouter.get("/reacted", handleInteractedMoments);
+
+// Alias for clarity on the client.
+postsRouter.get("/interacted", handleInteractedMoments);
 
 postsRouter.get("/:id", async (c) => {
   const user = c.get("user");
@@ -281,11 +505,10 @@ postsRouter.get("/:id", async (c) => {
 
   const { id } = c.req.param();
   const userClient = createUserClient(token);
-  const { data: post } = await userClient
-    .from("posts")
-    .select(POST_SELECT)
-    .eq("id", id)
-    .maybeSingle();
+  const { data: rows } = await loadPosts((select) =>
+    supabaseAdmin.from("posts").select(select).eq("id", id).limit(1)
+  );
+  const post = rows[0];
 
   if (!post) return c.json({ error: { message: "Post not found" } }, 404);
 
@@ -297,7 +520,26 @@ postsRouter.get("/:id", async (c) => {
     return c.json({ error: { message: "Post not found" } }, 404);
   }
 
-  return c.json({ data: formatPost(post, userId ?? undefined, blockedIds) });
+  // Deletion grace window: author's content is inaccessible to others.
+  if (post.user_id !== userId) {
+    const hidden = await getDeletionHiddenUserIds();
+    if (hidden.has(post.user_id)) {
+      return c.json({ error: { message: "Post not found" } }, 404);
+    }
+  }
+
+  // Moment audience gate — independent of profile privacy.
+  const visCtx = userId ? await loadMomentVisibilityContext(userId) : null;
+  if (!userId || !visCtx || !canViewerSeeMoment(userId, post, visCtx)) {
+    return c.json({ error: { message: "Post not found" } }, 404);
+  }
+
+  // Same preview selection as the feed (viewer-priority).
+  await attachCommentPreviews([post], userId, blockedIds);
+  scrubInvisibleOriginals([post], userId, visCtx);
+  const formatted = formatPost(post, userId, blockedIds);
+  await refreshReactionActors([formatted]);
+  return c.json({ data: formatted });
 });
 
 postsRouter.post("/", async (c) => {
@@ -308,6 +550,137 @@ postsRouter.post("/", async (c) => {
 
   const body = await c.req.json();
   const userClient = createUserClient(token);
+
+  // Reshare ("Repath"): only set `repath_of` when this is actually a repath.
+  if (body.repathOf) {
+    const originalId = String(body.repathOf).trim();
+    if (!originalId) {
+      return c.json({ error: { message: "Invalid repath target" } }, 400);
+    }
+
+    const { ensureRepathColumn } = await import("../lib/schema");
+    const ready = await ensureRepathColumn();
+    if (!ready) {
+      return c.json({ error: { message: "Repath is temporarily unavailable. Please try again shortly." } }, 503);
+    }
+
+    const { data: target } = await supabaseAdmin
+      .from("posts")
+      .select("id, user_id, repath_of")
+      .eq("id", originalId)
+      .maybeSingle();
+    if (!target) {
+      return c.json({ error: { message: "Original moment not found" } }, 404);
+    }
+
+    // Always repath the root moment (one level deep) and notify its owner.
+    let rootId = originalId;
+    let originalOwnerId = target.user_id as string;
+    if (target.repath_of) {
+      rootId = target.repath_of as string;
+      const { data: root } = await supabaseAdmin
+        .from("posts")
+        .select("id, user_id")
+        .eq("id", rootId)
+        .maybeSingle();
+      if (!root) {
+        return c.json({ error: { message: "Original moment not found" } }, 404);
+      }
+      originalOwnerId = root.user_id as string;
+    }
+
+    if (originalOwnerId === userId) {
+      return c.json({ error: { message: "You cannot repath your own moment" } }, 400);
+    }
+
+    const repathInsert = {
+      user_id: userId,
+      type: body.type,
+      content: body.content || null,
+      repath_of: rootId,
+    };
+
+    let { data: post, error } = await supabaseAdmin
+      .from("posts")
+      .insert(repathInsert)
+      .select(POST_SELECT)
+      .single();
+
+    if (error && /repath_of|column/i.test(error.message ?? "")) {
+      await ensureRepathColumn();
+      ({ data: post, error } = await supabaseAdmin
+        .from("posts")
+        .insert(repathInsert)
+        .select(POST_SELECT)
+        .single());
+    }
+
+    if (error) {
+      console.error("[posts] repath create error:", error.message);
+      return c.json({ error: { message: "Failed to repath moment" } }, 500);
+    }
+
+    // Reload via loadPosts so nested profile embeds never leave original blank.
+    if (post?.id) {
+      const { data: rows } = await loadPosts((select) =>
+        supabaseAdmin.from("posts").select(select).eq("id", post.id).limit(1)
+      );
+      if (rows[0]) post = rows[0];
+    }
+    if (post?.repath_of) await attachOriginals(userClient, [post]);
+
+    // Notify the original moment owner (activity feed + push). post_id is the
+    // new repath so tapping opens User B's repath of the moment, not the feed.
+    try {
+      if (post?.id && originalOwnerId !== userId) {
+        const { data: existingNotif } = await supabaseAdmin
+          .from("notifications")
+          .select("id")
+          .eq("user_id", originalOwnerId)
+          .eq("from_user_id", userId)
+          .eq("type", "repath")
+          .eq("post_id", post.id)
+          .maybeSingle();
+
+        let notificationId = existingNotif?.id as string | undefined;
+        if (!notificationId) {
+          const { data: inserted } = await supabaseAdmin.from("notifications").insert({
+            user_id: originalOwnerId,
+            from_user_id: userId,
+            type: "repath",
+            message: "repathed your moment",
+            post_id: post.id,
+            read: false,
+          }).select("id").single();
+          notificationId = inserted?.id;
+        }
+
+        void sendPushToUser(
+          supabaseAdmin,
+          originalOwnerId,
+          "New Repath",
+          `${user.full_name} repathed your moment`,
+          {
+            postId: post.id,
+            type: "repath",
+            fromUserId: userId,
+            notificationId,
+          }
+        );
+      }
+    } catch (e) {
+      console.error("[notifications] repath insert error:", e);
+    }
+
+    const formatted = formatPost(post, userId);
+    await refreshFriendshipAvatars([formatted]);
+    await refreshReactionActors([formatted]);
+    if (formatted.original) {
+      await refreshFriendshipAvatars([formatted.original]);
+      await refreshReactionActors([formatted.original]);
+    }
+    return c.json({ data: formatted }, 201);
+  }
 
   const insertData: Record<string, any> = {
     user_id: userId,
@@ -331,18 +704,17 @@ postsRouter.post("/", async (c) => {
     // Parse to minutes here so the Awake moment actually inserts.
     sleep_duration: parseDurationToMinutes(body.sleepDuration),
   };
-  // Reshare ("Repath"): only set `repath_of` when this is actually a repath, so
-  // normal posting is never affected if the column hasn't been added yet.
-  if (body.repathOf) insertData.repath_of = body.repathOf;
   // Audience ("Close Friends" etc.): only set when the client explicitly sends a
   // non-default value, so normal posting still works if the column doesn't exist
   // yet. 'close' delivers only to the author's starred close friends (enforced in
   // the feed query below); 'private' is author-only; 'public'/'friends' behave as
   // today (visible to all accepted friends).
   if (body.audience && body.audience !== "friends") insertData.audience = body.audience;
-  // Disable Comments: only set when explicitly true (default false = omit, which
-  // matches the column default). Lets the insert succeed if the column is absent.
-  if (body.commentsDisabled === true) insertData.comments_disabled = true;
+  // Disable Comments: always persist when the client sends the field (true or
+  // false). Requires `comments_disabled` column — see migration 012.
+  if ("commentsDisabled" in body) {
+    insertData.comments_disabled = body.commentsDisabled === true;
+  }
 
   let { data: post, error } = await userClient
     .from("posts")
@@ -358,6 +730,10 @@ postsRouter.post("/", async (c) => {
     ("audience" in insertData || "comments_disabled" in insertData) &&
     /audience|comments_disabled|column/i.test(error.message ?? "")
   ) {
+    console.error(
+      "[posts] optional column missing on create — run migrations/012_posts_audience_comments_disabled.sql:",
+      error.message
+    );
     const { audience: _a, comments_disabled: _cd, ...withoutOptional } = insertData;
     ({ data: post, error } = await userClient
       .from("posts")
@@ -368,12 +744,27 @@ postsRouter.post("/", async (c) => {
 
   if (error) {
     console.error("Create post error:", error);
-    // Repath attempted before the `repath_of` column exists → tell the client
-    // clearly instead of a generic failure, and never create a junk post.
-    if (body.repathOf && /repath_of|column/i.test(error.message ?? "")) {
-      return c.json({ error: { message: "Repath isn't set up yet. Run the one-line SQL to enable it." } }, 400);
-    }
     return c.json({ error: { message: "Failed to create post" } }, 500);
+  }
+
+  // Service-role safety net: if the client asked to disable comments but the
+  // inserted row doesn't reflect it (RLS/column quirks), force the flag.
+  const wantDisabled = body.commentsDisabled === true;
+  if (wantDisabled && post && !(post as any).comments_disabled) {
+    const { data: patched, error: patchErr } = await supabaseAdmin
+      .from("posts")
+      .update({ comments_disabled: true })
+      .eq("id", post.id)
+      .select(POST_SELECT)
+      .maybeSingle();
+    if (patchErr) {
+      console.error(
+        "[posts] failed to set comments_disabled — run migrations/012_posts_audience_comments_disabled.sql:",
+        patchErr.message
+      );
+    } else if (patched) {
+      post = patched;
+    }
   }
 
   // Resolve the nested original so the new repath renders immediately.
@@ -396,11 +787,22 @@ postsRouter.post("/", async (c) => {
         read: false,
       }));
       await userClient.from("notifications").insert(notifications);
+
+      // Push in background — never block create-post on Expo fan-out.
+      void Promise.allSettled(
+        notifications.map((n: { user_id: string; message: string }) =>
+          sendPushToUser(supabaseAdmin, n.user_id, "Sleep Update", n.message, {
+            type: "sleep",
+            postId: post.id,
+            fromUserId: userId,
+          })
+        )
+      );
     }
   }
 
-  // Notify anyone @mentioned in the moment's text.
-  await notifyMentions({
+  // Mentions can be slow (resolve + push); don't hold the create response.
+  void notifyMentions({
     authorId: userId,
     authorName: user.full_name,
     content: post.content,
@@ -443,7 +845,7 @@ postsRouter.patch("/:id", async (c) => {
   // Disable Comments: persist the boolean when the client sends it.
   if ("commentsDisabled" in body) updateData.comments_disabled = !!body.commentsDisabled;
 
-  const SELECT = "*, profiles(*), reactions(user_id, type, profiles:user_id(avatar_url))";
+  const SELECT = "*, profiles!user_id(*), reactions(user_id, type)";
   let { data: updated, error } = await userClient
     .from("posts")
     .update(updateData)
@@ -459,6 +861,10 @@ postsRouter.patch("/:id", async (c) => {
     ("audience" in updateData || "comments_disabled" in updateData) &&
     /audience|comments_disabled|column/i.test(error.message ?? "")
   ) {
+    console.error(
+      "[posts] optional column missing on update — run migrations/012_posts_audience_comments_disabled.sql:",
+      error.message
+    );
     const { audience: _a, comments_disabled: _cd, ...withoutOptional } = updateData;
     ({ data: updated, error } = await userClient
       .from("posts")
@@ -471,6 +877,28 @@ postsRouter.patch("/:id", async (c) => {
   if (error) {
     console.error("Update post error:", error);
     return c.json({ error: { message: "Failed to update post" } }, 500);
+  }
+
+  // Force comments_disabled via service role when the client asked for it but
+  // the user-scoped update didn't stick (missing column / RLS).
+  if ("commentsDisabled" in body && updated) {
+    const want = !!body.commentsDisabled;
+    if (!!(updated as any).comments_disabled !== want) {
+      const { data: patched, error: patchErr } = await supabaseAdmin
+        .from("posts")
+        .update({ comments_disabled: want })
+        .eq("id", id)
+        .select(SELECT)
+        .maybeSingle();
+      if (patchErr) {
+        console.error(
+          "[posts] failed to patch comments_disabled — run migrations/012_posts_audience_comments_disabled.sql:",
+          patchErr.message
+        );
+      } else if (patched) {
+        updated = patched;
+      }
+    }
   }
 
   return c.json({ data: formatPost(updated, userId) });
@@ -513,16 +941,26 @@ postsRouter.post("/:id/reactions", async (c) => {
   const { id } = c.req.param();
   const { type } = await c.req.json();
   const userClient = createUserClient(token);
+
+  const { data: targetMoment } = await supabaseAdmin
+    .from("posts")
+    .select("id, user_id, audience")
+    .eq("id", id)
+    .maybeSingle();
+  if (!targetMoment || !(await viewerCanAccessMoment(userId, targetMoment))) {
+    return c.json({ error: { message: "Post not found" } }, 404);
+  }
+
   // The client always sends a plain emoji; normalize defensively.
   const incoming = baseReactionType(type);
 
-  // Use admin client to bypass RLS and safely handle any existing duplicates
+  // Use admin client to bypass RLS and safely handle any existing duplicates.
+  // Avoid ordering by created_at — that column is missing on older schemas.
   const { data: existing } = await supabaseAdmin
     .from("reactions")
     .select("id, type")
     .eq("post_id", id)
     .eq("user_id", userId)
-    .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
 
@@ -544,27 +982,69 @@ postsRouter.post("/:id/reactions", async (c) => {
   }
 
   // Notify the post owner (activity feed + push), never about their own action,
-  // and only when a reaction was actually added. The sheep (🐑) sent from a
-  // sleep moment reads as "sent you a sheep"; any other emoji reads as a love.
+  // and only when a reaction was actually added. Removing a like deletes the
+  // prior reaction notification so Moment text never lingers as stale "sensitive"
+  // preview data. The sheep (🐑) from a sleep moment reads as "sent you a sheep".
   try {
-    const { data: postOwner } = await userClient.from("posts").select("user_id").eq("id", id).maybeSingle();
+    const { data: postOwner } = await supabaseAdmin.from("posts").select("user_id, content").eq("id", id).maybeSingle();
+    if (postOwner && postOwner.user_id !== userId) {
+      // Keep denormalized profile like_count in sync for visitors.
+      let delta = 0;
+      if (!existing && didReact) delta = 1;
+      else if (existing && !didReact) delta = -1;
+      if (delta !== 0) {
+        const { data: row } = await supabaseAdmin
+          .from("profiles")
+          .select("like_count")
+          .eq("id", postOwner.user_id)
+          .maybeSingle();
+        const next = Math.max(0, (Number((row as any)?.like_count) || 0) + delta);
+        await supabaseAdmin.from("profiles").update({ like_count: next }).eq("id", postOwner.user_id);
+      }
+
+      // Clear prior like notices for this actor+moment (unlike OR emoji switch).
+      // Keep "X is sleeping" alerts (also type=sleep) — only remove sheep likes.
+      await supabaseAdmin
+        .from("notifications")
+        .delete()
+        .eq("user_id", postOwner.user_id)
+        .eq("from_user_id", userId)
+        .eq("post_id", id)
+        .eq("type", "reaction");
+      await supabaseAdmin
+        .from("notifications")
+        .delete()
+        .eq("user_id", postOwner.user_id)
+        .eq("from_user_id", userId)
+        .eq("post_id", id)
+        .eq("type", "sleep")
+        .ilike("message", "%sheep%");
+    }
     if (didReact && postOwner && postOwner.user_id !== userId) {
       const isSheep = incoming === "🐑";
-      await supabaseAdmin.from("notifications").insert({
+      // Do not embed Moment text in push/body — avoids leaking caption content via notices.
+      const { data: inserted } = await supabaseAdmin.from("notifications").insert({
         user_id: postOwner.user_id,
         from_user_id: userId,
         type: isSheep ? "sleep" : "reaction",
-        message: isSheep ? "sent you a sheep" : "loved your moment",
+        message: isSheep ? "sent you a sheep" : "liked your Moment",
         post_id: id,
         read: false,
-      });
+      }).select("id").single();
 
-      const pushToken = await getPushToken(supabaseAdmin, postOwner.user_id);
-      await sendPushNotification(
-        pushToken,
+      void sendPushToUser(
+        supabaseAdmin,
+        postOwner.user_id,
         isSheep ? "New Sheep" : "New Reaction",
-        isSheep ? `${user.full_name} sent you a sheep` : `${user.full_name} reacted to your moment`,
-        { postId: id, type: isSheep ? "sleep" : "reaction" }
+        isSheep
+          ? `${user.full_name} sent you a sheep`
+          : `${user.full_name} liked your Moment`,
+        {
+          postId: id,
+          type: isSheep ? "sleep" : "reaction",
+          fromUserId: userId,
+          notificationId: inserted?.id,
+        }
       );
     }
   } catch (e) {
@@ -572,9 +1052,33 @@ postsRouter.post("/:id/reactions", async (c) => {
   }
 
   const { data: ownerRow } = await supabaseAdmin.from("posts").select("user_id").eq("id", id).maybeSingle();
-  const { data: reactions } = await supabaseAdmin.from("reactions").select("user_id, type, profiles:user_id(avatar_url)").eq("post_id", id);
-  // Viewer here is the reactor — they always see their own reaction.
-  return c.json({ data: { reactions: formatReactions(reactions ?? [], userId, ownerRow?.user_id) } });
+
+  // A reaction implies the friend saw the moment — persist a read receipt so
+  // removing an open/locked like returns their avatar to the Seen row.
+  if (didReact && ownerRow?.user_id && ownerRow.user_id !== userId) {
+    try {
+      await supabaseAdmin.from("post_views").upsert(
+        { post_id: id, user_id: userId, viewed_at: new Date().toISOString() },
+        { onConflict: "post_id,user_id", ignoreDuplicates: true }
+      );
+    } catch (e) {
+      console.error("[post_views] reaction view upsert error:", e);
+    }
+  }
+
+  const { data: reactions } = await supabaseAdmin
+    .from("reactions")
+    .select("user_id, type")
+    .eq("post_id", id);
+  // Attach live profiles (nested embeds are unreliable for reactor names).
+  const { hydrateReactionProfiles } = await import("../lib/load-posts");
+  const shell = [{ reactions: reactions ?? [] }];
+  await hydrateReactionProfiles(shell);
+  const formatted = {
+    reactions: formatReactions(shell[0].reactions ?? [], userId, ownerRow?.user_id),
+  };
+  await refreshReactionActors([formatted]);
+  return c.json({ data: { reactions: formatted.reactions } });
 });
 
 // Toggle the privacy lock on the current user's reaction for a post.
@@ -587,6 +1091,15 @@ postsRouter.post("/:id/reactions/lock", async (c) => {
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const { id } = c.req.param();
+
+  const { data: lockTarget } = await supabaseAdmin
+    .from("posts")
+    .select("id, user_id, audience")
+    .eq("id", id)
+    .maybeSingle();
+  if (!lockTarget || !(await viewerCanAccessMoment(userId, lockTarget))) {
+    return c.json({ error: { message: "Post not found" } }, 404);
+  }
 
   const { data: existing } = await supabaseAdmin
     .from("reactions")
@@ -604,34 +1117,64 @@ postsRouter.post("/:id/reactions/lock", async (c) => {
   await supabaseAdmin.from("reactions").update({ type: newType }).eq("post_id", id).eq("user_id", userId);
 
   const { data: ownerRow } = await supabaseAdmin.from("posts").select("user_id").eq("id", id).maybeSingle();
-  const { data: reactions } = await supabaseAdmin.from("reactions").select("user_id, type, profiles:user_id(avatar_url)").eq("post_id", id);
-  return c.json({ data: { locked: nextLocked, reactions: formatReactions(reactions ?? [], userId, ownerRow?.user_id) } });
+  const { data: reactions } = await supabaseAdmin
+    .from("reactions")
+    .select("user_id, type")
+    .eq("post_id", id);
+  const { hydrateReactionProfiles } = await import("../lib/load-posts");
+  const shell = [{ reactions: reactions ?? [] }];
+  await hydrateReactionProfiles(shell);
+  const formatted = {
+    reactions: formatReactions(shell[0].reactions ?? [], userId, ownerRow?.user_id),
+  };
+  await refreshReactionActors([formatted]);
+  return c.json({ data: { locked: nextLocked, reactions: formatted.reactions } });
 });
 
 // Record that the current viewer has SEEN this moment (read receipt).
 // Called by the client when a moment becomes actually visible on screen.
 // The unique(post_id, user_id) constraint makes repeat views a no-op, and the
 // owner viewing their OWN moment is never recorded.
-postsRouter.post("/:id/view", async (c) => {
+postsRouter.post("/:id/view", viewLimiter, async (c) => {
   const user = c.get("user");
   const userId = c.get("userId");
   const token = c.get("accessToken");
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
+  // Shed view writes immediately while Disk I/O circuit is open.
+  if (isSupabaseCircuitOpen()) return c.body(null, 204);
+
   const { id } = c.req.param();
 
-  const { data: ownerRow } = await supabaseAdmin.from("posts").select("user_id").eq("id", id).maybeSingle();
+  const { data: ownerRow } = await supabaseAdmin
+    .from("posts")
+    .select("user_id, audience")
+    .eq("id", id)
+    .maybeSingle();
+  if (!ownerRow || !(await viewerCanAccessMoment(userId, ownerRow))) {
+    return c.json({ error: { message: "Post not found" } }, 404);
+  }
   if (!ownerRow) return c.json({ error: { message: "Post not found" } }, 404);
   // The author seeing their own moment is not a "view".
   if (ownerRow.user_id === userId) return c.body(null, 204);
 
   // Upsert; ignoreDuplicates means each viewer is recorded at most once.
-  await supabaseAdmin
+  const { error: viewErr } = await supabaseAdmin
     .from("post_views")
     .upsert(
       { post_id: id, user_id: userId, viewed_at: new Date().toISOString() },
       { onConflict: "post_id,user_id", ignoreDuplicates: true }
     );
+  if (viewErr) {
+    const { ensurePostViewsTable } = await import("../lib/schema");
+    await ensurePostViewsTable();
+    await supabaseAdmin
+      .from("post_views")
+      .upsert(
+        { post_id: id, user_id: userId, viewed_at: new Date().toISOString() },
+        { onConflict: "post_id,user_id", ignoreDuplicates: true }
+      );
+  }
 
   return c.body(null, 204);
 });
@@ -680,20 +1223,54 @@ postsRouter.get("/:id/views", async (c) => {
   if (viewerIds.length > 0) {
     const { data: profs } = await supabaseAdmin
       .from("profiles")
-      .select("id, full_name, avatar_url")
+      .select("id, full_name, username, avatar_url, gender")
       .in("id", viewerIds);
     profilesById = Object.fromEntries((profs ?? []).map((p: any) => [p.id, p]));
   }
 
-  const viewers = (views ?? []).map((v: any) => ({
-    userId: v.user_id,
-    userName: profilesById[v.user_id]?.full_name ?? "",
-    userAvatar:
-      profilesById[v.user_id]?.avatar_url ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${v.user_id}`,
-  }));
+  const viewers = (views ?? []).map((v: any) => {
+    const p = profilesById[v.user_id];
+    const name = String(p?.full_name ?? "").trim();
+    const username = String(p?.username ?? "").trim();
+    return {
+      userId: v.user_id,
+      userName: name || username,
+      username,
+      userAvatar: resolveAvatarUrl(v.user_id, p?.avatar_url, p?.gender),
+    };
+  });
 
   return c.json({ data: { seenCount: viewers.length, friendTotal, viewers } });
 });
+
+async function isAcceptedFriend(viewerId: string, authorId: string): Promise<boolean> {
+  const { data } = await supabaseAdmin
+    .from("friendships")
+    .select("id")
+    .eq("status", "accepted")
+    .or(
+      `and(requester_id.eq.${viewerId},receiver_id.eq.${authorId}),and(requester_id.eq.${authorId},receiver_id.eq.${viewerId})`
+    )
+    .maybeSingle();
+  return !!data;
+}
+
+async function canViewerSeeComment(
+  viewerId: string | undefined,
+  postRow: { user_id: string; audience?: string | null },
+  commentAuthorId: string,
+  whoStarredViewer: Set<string>
+): Promise<boolean> {
+  if (!viewerId) return false;
+  const ownerId = postRow.user_id;
+  if (viewerId === ownerId || viewerId === commentAuthorId) return true;
+
+  const audience = postRow.audience ?? "friends";
+  if (audience === "private") return false;
+  if (audience === "close") return whoStarredViewer.has(ownerId);
+  if (audience === "public") return true;
+  return isAcceptedFriend(viewerId, ownerId);
+}
 
 postsRouter.get("/:id/comments", async (c) => {
   const user = c.get("user");
@@ -701,37 +1278,100 @@ postsRouter.get("/:id/comments", async (c) => {
   if (!user) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const { id } = c.req.param();
+  const limit = parseLimit(c.req.query("limit"), 30, 100);
+  // `before` / `cursor` = load older comments (exclusive). First page = newest.
+  const beforeRaw = c.req.query("before") ?? c.req.query("cursor");
+  const beforeCursor = parseCursor(beforeRaw);
 
-  const { data: comments, error } = await supabaseAdmin
+  const { data: postRow } = await supabaseAdmin
+    .from("posts")
+    .select("user_id, audience")
+    .eq("id", id)
+    .maybeSingle();
+
+  if (!postRow) return c.json({ error: { message: "Post not found" } }, 404);
+  if (!(await viewerCanAccessMoment(userId, postRow))) {
+    return c.json({ error: { message: "Post not found" } }, 404);
+  }
+
+  const whoStarredMe = userId ? await getWhoStarredMe(userId) : new Set<string>();
+
+  // Newest-first fetch (limit+1), then reverse to ascending for display.
+  let commentsQuery = supabaseAdmin
     .from("comments")
-    .select("id, post_id, user_id, content, created_at, profiles:user_id(id, full_name, avatar_url)")
+    .select("id, post_id, user_id, content, created_at, profiles:user_id(id, full_name, username, avatar_url, gender, is_verified)")
     .eq("post_id", id)
-    .order("created_at", { ascending: true });
+    .order("created_at", { ascending: false })
+    .limit(limit + 1);
+  if (beforeCursor?.createdAt) {
+    commentsQuery = commentsQuery.lte("created_at", beforeCursor.createdAt);
+  }
+
+  const { data: commentsNewestFirst, error } = await commentsQuery;
 
   if (error) {
     console.error("Get comments error:", error);
     return c.json({ error: { message: "Failed to fetch comments" } }, 500);
   }
 
-  // Hide comments authored by a blocked user (either direction).
+  let candidates = commentsNewestFirst ?? [];
+  if (beforeCursor) {
+    candidates = candidates.filter((comment: any) =>
+      isOlderThanCursor(String(comment.created_at ?? ""), String(comment.id ?? ""), beforeCursor)
+    );
+  }
+
   const blockedSet = userId ? new Set(await getBlockedIds(userId)) : null;
 
-  const formatted = (comments ?? [])
-    .filter((comment: any) => !blockedSet || !blockedSet.has(comment.user_id))
-    .map((comment: any) => ({
+  // Friendship vs post owner is the same for every comment on a friends-audience
+  // post — resolve once instead of N identical DB round-trips.
+  const audience = postRow.audience ?? "friends";
+  let friendsOk = true;
+  if (audience === "friends" && userId && userId !== postRow.user_id) {
+    friendsOk = await isAcceptedFriend(userId, postRow.user_id);
+  }
+
+  const visibleComments: any[] = [];
+  for (const comment of candidates) {
+    if (blockedSet?.has(comment.user_id)) continue;
+    if (!userId) continue;
+    if (userId === postRow.user_id || userId === comment.user_id) {
+      visibleComments.push(comment);
+      continue;
+    }
+    if (audience === "private") continue;
+    if (audience === "close") {
+      if (whoStarredMe.has(postRow.user_id)) visibleComments.push(comment);
+      continue;
+    }
+    if (audience === "public") {
+      visibleComments.push(comment);
+      continue;
+    }
+    // friends (default)
+    if (friendsOk) visibleComments.push(comment);
+  }
+
+  const hasMore = visibleComments.length > limit;
+  const pageNewestFirst = hasMore ? visibleComments.slice(0, limit) : visibleComments;
+  // Ascending within the page (oldest → newest) for CommentsSheet.
+  const page = pageNewestFirst.slice().reverse();
+  const oldest = page.length > 0 ? page[0] : null;
+  const nextCursor =
+    hasMore && oldest?.created_at && oldest?.id
+      ? encodeCursor(String(oldest.created_at), String(oldest.id))
+      : null;
+
+  const formatted = page.map((comment: any) => ({
     id: comment.id,
     postId: comment.post_id,
     userId: comment.user_id,
     content: comment.content,
     createdAt: comment.created_at,
-    user: {
-      id: comment.user_id,
-      name: comment.profiles?.full_name ?? "",
-      avatar: comment.profiles?.avatar_url ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${comment.user_id}`,
-    },
+    user: formatCommentUser(comment.user_id, comment.profiles),
   }));
 
-  return c.json({ data: formatted });
+  return c.json({ data: formatted, nextCursor, hasMore, limit });
 });
 
 postsRouter.post("/:id/comments", async (c) => {
@@ -744,15 +1384,17 @@ postsRouter.post("/:id/comments", async (c) => {
   const body = await c.req.json();
   const userClient = createUserClient(token);
 
-  // Block commenting when the moment's author turned comments off. `select("*")`
-  // is safe even before the `comments_disabled` column exists (it's just absent,
-  // so the guard is a no-op until the column is added — degrade-safe).
-  const { data: targetPost } = await userClient
+  // Block commenting when the moment's author turned comments off.
+  // Service role so RLS can't hide the comments_disabled flag.
+  const { data: targetPost } = await supabaseAdmin
     .from("posts")
-    .select("*")
+    .select("id, comments_disabled, user_id, audience")
     .eq("id", id)
     .maybeSingle();
-  if (targetPost?.comments_disabled) {
+  if (!targetPost || !(await viewerCanAccessMoment(userId, targetPost))) {
+    return c.json({ error: { message: "Post not found" } }, 404);
+  }
+  if (targetPost.comments_disabled) {
     return c.json({ error: { message: "Comments are turned off for this moment" } }, 403);
   }
 
@@ -767,14 +1409,16 @@ postsRouter.post("/:id/comments", async (c) => {
     return c.json({ error: { message: "Failed to create comment" } }, 500);
   }
 
-  const { data: postData } = await userClient
+  // Service role: post owners' RLS would otherwise silently block commenters
+  // from bumping comment_count, leaving feed previews empty forever.
+  const { data: postData } = await supabaseAdmin
     .from("posts")
-    .select("comment_count")
+    .select("comment_count, user_id, content")
     .eq("id", id)
     .single();
 
   if (postData) {
-    await userClient
+    await supabaseAdmin
       .from("posts")
       .update({ comment_count: (postData.comment_count ?? 0) + 1 })
       .eq("id", id);
@@ -782,29 +1426,64 @@ postsRouter.post("/:id/comments", async (c) => {
 
   const { data: profile } = await supabaseAdmin
     .from("profiles")
-    .select("id, full_name, avatar_url")
+    .select("id, full_name, username, avatar_url, gender")
     .eq("id", userId)
     .single();
 
   // Notify the post owner (activity feed + push), never about their own comment.
   try {
-    const { data: postOwner } = await userClient.from("posts").select("user_id").eq("id", id).maybeSingle();
+    const postOwner = postData;
     if (postOwner && postOwner.user_id !== userId) {
-      await supabaseAdmin.from("notifications").insert({
-        user_id: postOwner.user_id,
-        from_user_id: userId,
-        type: "comment",
-        message: "commented on your moment",
-        post_id: id,
-        read: false,
-      });
+      const snippet = halfLineSnippet((postOwner as { content?: string | null }).content);
+      let inserted: { id: string } | null = null;
+      {
+        const withComment = await supabaseAdmin
+          .from("notifications")
+          .insert({
+            user_id: postOwner.user_id,
+            from_user_id: userId,
+            type: "comment",
+            message: "commented on your moment",
+            post_id: id,
+            comment_id: comment.id,
+            read: false,
+          })
+          .select("id")
+          .single();
+        if (withComment.error && /comment_id|column/i.test(withComment.error.message ?? "")) {
+          // Column not migrated yet — still notify without deep-link id.
+          const fallback = await supabaseAdmin
+            .from("notifications")
+            .insert({
+              user_id: postOwner.user_id,
+              from_user_id: userId,
+              type: "comment",
+              message: "commented on your moment",
+              post_id: id,
+              read: false,
+            })
+            .select("id")
+            .single();
+          inserted = fallback.data;
+        } else {
+          inserted = withComment.data;
+        }
+      }
 
-      const pushToken = await getPushToken(supabaseAdmin, postOwner.user_id);
-      await sendPushNotification(
-        pushToken,
+      void sendPushToUser(
+        supabaseAdmin,
+        postOwner.user_id,
         "New Comment",
-        `${user.full_name} commented on your moment`,
-        { postId: id, type: "comment" }
+        snippet
+          ? `${user.full_name} commented on your Moment ${snippet}`
+          : `${user.full_name} commented on your Moment`,
+        {
+          postId: id,
+          commentId: comment.id,
+          type: "comment",
+          fromUserId: userId,
+          notificationId: inserted?.id,
+        }
       );
     }
   } catch (e) {
@@ -817,16 +1496,11 @@ postsRouter.post("/:id/comments", async (c) => {
     userId: comment.user_id,
     content: comment.content,
     createdAt: comment.created_at,
-    user: {
-      id: userId,
-      name: (profile as any)?.full_name ?? "",
-      avatar: (profile as any)?.avatar_url ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${userId}`,
-    },
+    user: formatCommentUser(userId, profile),
   };
 
-  // Notify anyone @mentioned in the comment text. post_id points at the moment
-  // so tapping the notification opens the moment showing this comment.
-  await notifyMentions({
+  // Mentions (resolve + push) — don't hold the comment response.
+  void notifyMentions({
     authorId: userId,
     authorName: user.full_name,
     content: comment.content,
@@ -877,14 +1551,15 @@ postsRouter.delete("/:id/comments/:commentId", async (c) => {
     return c.json({ error: { message: "Failed to delete comment" } }, 500);
   }
 
-  const { data: postData } = await userClient
+  // Service role so non-owners (comment authors) can update the count under RLS.
+  const { data: postData } = await supabaseAdmin
     .from("posts")
     .select("comment_count")
     .eq("id", id)
     .single();
 
   if (postData) {
-    await userClient
+    await supabaseAdmin
       .from("posts")
       .update({ comment_count: Math.max((postData.comment_count ?? 1) - 1, 0) })
       .eq("id", id);
@@ -921,7 +1596,7 @@ postsRouter.patch("/:id/comments/:commentId", async (c) => {
     .from("comments")
     .update({ content })
     .eq("id", commentId)
-    .select("id, post_id, user_id, content, created_at, profiles:user_id(id, full_name, avatar_url)")
+    .select("id, post_id, user_id, content, created_at, profiles:user_id(id, full_name, username, avatar_url, gender, is_verified)")
     .single();
 
   if (updateError || !updated) {
@@ -936,11 +1611,7 @@ postsRouter.patch("/:id/comments/:commentId", async (c) => {
     userId: u.user_id,
     content: u.content,
     createdAt: u.created_at,
-    user: {
-      id: u.user_id,
-      name: u.profiles?.full_name ?? "",
-      avatar: u.profiles?.avatar_url ?? `https://api.dicebear.com/7.x/avataaars/svg?seed=${u.user_id}`,
-    },
+    user: formatCommentUser(u.user_id, u.profiles),
   };
 
   return c.json({ data: formatted });
