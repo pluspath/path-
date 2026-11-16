@@ -466,6 +466,14 @@ export function formatPost(p: any, viewerId?: string, blockedIds: string[] = [])
     // Raw totals BEFORE privacy filtering — profile Likes for visitors must use
     // these, not reactions.length (locked likes are stripped for non-owners).
     reactionCount: Array.isArray(p.reactions) ? p.reactions.length : 0,
+    // Authoritative unique public reactor count when attachUniqueReactorCounts ran.
+    // Older clients ignore this optional field.
+    uniqueReactorCount:
+      typeof p.unique_reactor_count === "number"
+        ? p.unique_reactor_count
+        : typeof p.uniqueReactorCount === "number"
+          ? p.uniqueReactorCount
+          : undefined,
     reactions: formatReactions(p.reactions ?? [], viewerId, p.user_id, blockedIds),
     // Prefer stored count; never report 0 when a preview comment is attached.
     commentCount: Math.max(

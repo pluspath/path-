@@ -48,6 +48,7 @@ import {
   parseIncomingLocation,
   postLocationColumns,
 } from "../lib/content-location";
+import { attachUniqueReactorCounts, listUniquePublicReactors } from "../lib/reactors";
 import type { HonoVariables } from "../types";
 
 const postsRouter = new Hono<{ Variables: HonoVariables }>();
@@ -78,6 +79,38 @@ function copyPollsToFormatted(rawPosts: any[], formatted: any[]): void {
     if (f?.original) {
       const op = byId.get(String(f.original.id ?? ""));
       if (op) f.original.poll = op;
+    }
+  }
+}
+
+/** Ensure uniqueReactorCount survives even if formatPost on an older host omits it. */
+function copyReactorCountsToFormatted(rawPosts: any[], formatted: any[]): void {
+  const byId = new Map<string, number>();
+  for (const p of rawPosts ?? []) {
+    if (!p?.id) continue;
+    const n =
+      typeof p.unique_reactor_count === "number"
+        ? p.unique_reactor_count
+        : typeof p.uniqueReactorCount === "number"
+          ? p.uniqueReactorCount
+          : undefined;
+    if (typeof n === "number") byId.set(String(p.id), n);
+    if (p.original?.id) {
+      const on =
+        typeof p.original.unique_reactor_count === "number"
+          ? p.original.unique_reactor_count
+          : typeof p.original.uniqueReactorCount === "number"
+            ? p.original.uniqueReactorCount
+            : undefined;
+      if (typeof on === "number") byId.set(String(p.original.id), on);
+    }
+  }
+  for (const f of formatted ?? []) {
+    const n = byId.get(String(f?.id ?? ""));
+    if (typeof n === "number") f.uniqueReactorCount = n;
+    if (f?.original) {
+      const on = byId.get(String(f.original.id ?? ""));
+      if (typeof on === "number") f.original.uniqueReactorCount = on;
     }
   }
 }
@@ -210,6 +243,7 @@ postsRouter.get("/", async (c) => {
 
   // Latest preview comment per moment in one batched query (before formatPost).
   await attachCommentPreviews(ordered, userId ?? undefined, blockedIds);
+  await attachUniqueReactorCounts(ordered, blockedIds);
   await withPolls(ordered, userId ?? undefined);
   if (userId && ordered.some((p) => p?.original)) {
     // Reuse the friends / close-friends / blocks / deletion sets already loaded above
@@ -224,6 +258,7 @@ postsRouter.get("/", async (c) => {
 
   const formatted = ordered.map((p) => formatPost(p, userId ?? undefined, blockedIds));
   copyPollsToFormatted(ordered, formatted);
+  copyReactorCountsToFormatted(ordered, formatted);
   // Independent profile lookups — run together instead of back to back.
   await Promise.all([
     refreshFriendshipAvatars(formatted), // always show friends' CURRENT avatars
@@ -372,10 +407,12 @@ postsRouter.get("/hashtag/:tag", async (c) => {
       : null;
 
   await attachCommentPreviews(page, userId ?? undefined, blockedIds);
+  await attachUniqueReactorCounts(page, blockedIds);
   await withPolls(page, userId ?? undefined);
 
   const formatted = page.map((p) => formatPost(p, userId ?? undefined, blockedIds));
   copyPollsToFormatted(page, formatted);
+  copyReactorCountsToFormatted(page, formatted);
   await refreshReactionActors(formatted);
   return c.json({
     data: formatted,
@@ -528,10 +565,12 @@ async function handleInteractedMoments(c: any) {
   await attachOriginals(userClient, orderedPosts);
 
   await attachCommentPreviews(orderedPosts, userId, blockedIds);
+  await attachUniqueReactorCounts(orderedPosts, blockedIds);
   await withPolls(orderedPosts, userId);
 
   const formatted = orderedPosts.map((p: any) => formatPost(p, userId, blockedIds));
   copyPollsToFormatted(orderedPosts, formatted);
+  copyReactorCountsToFormatted(orderedPosts, formatted);
   await refreshReactionActors(formatted);
   if (paged) {
     return c.json({
@@ -593,10 +632,12 @@ postsRouter.get("/:id", async (c) => {
 
   // Same preview selection as the feed (viewer-priority).
   await attachCommentPreviews([post], userId, blockedIds);
+  await attachUniqueReactorCounts([post], blockedIds);
   await withPolls([post], userId);
   scrubInvisibleOriginals([post], userId, visCtx);
   const formatted = formatPost(post, userId, blockedIds);
   copyPollsToFormatted([post], [formatted]);
+  copyReactorCountsToFormatted([post], [formatted]);
   await refreshReactionActors([formatted]);
   return c.json({ data: formatted });
 });
@@ -1103,7 +1144,7 @@ postsRouter.delete("/:id", async (c) => {
 
 /**
  * GET /api/posts/:id/reactors — paginated unique public reactors (newest first).
- * Distinct from POST /:id/reactions (toggle). Auth + visibility + blocks enforced.
+ * Returns `total` = unique public reactor count (not reaction-row count).
  * Query: ?limit=&cursor=  where cursor is `${createdAt}|${userId}`.
  */
 postsRouter.get("/:id/reactors", async (c) => {
@@ -1112,7 +1153,7 @@ postsRouter.get("/:id/reactors", async (c) => {
 
   const { id } = c.req.param();
   const limitRaw = Number(c.req.query("limit") ?? 40);
-  const limit = Math.min(Math.max(Number.isFinite(limitRaw) ? Math.floor(limitRaw) : 40, 1), 80);
+  const limit = Math.min(Math.max(Number.isFinite(limitRaw) ? Math.floor(limitRaw) : 40, 1), 100);
   const cursorRaw = String(c.req.query("cursor") ?? "").trim();
 
   const { data: post } = await supabaseAdmin
@@ -1124,158 +1165,25 @@ postsRouter.get("/:id/reactors", async (c) => {
     return c.json({ error: { message: "Post not found" } }, 404);
   }
 
-  const blockedIds = await getBlockedIds(userId);
-  const blockedSet = new Set(blockedIds);
-
-  let cursorCreatedAt: string | null = null;
-  let cursorUserId: string | null = null;
-  if (cursorRaw.includes("|")) {
-    const [ts, uid] = cursorRaw.split("|");
-    if (ts && uid) {
-      cursorCreatedAt = ts;
-      cursorUserId = uid;
-    }
-  }
-
-  // Over-fetch so locked / blocked / duplicate rows can be filtered while still
-  // returning a full page of unique public reactors.
-  const fetchSize = Math.min(limit * 4, 200);
-  let q = supabaseAdmin
-    .from("reactions")
-    .select("user_id, type, created_at")
-    .eq("post_id", id)
-    .order("created_at", { ascending: false })
-    .order("user_id", { ascending: false })
-    .limit(fetchSize);
-
-  if (cursorCreatedAt) {
-    // Strictly older than the cursor timestamp (newest-first page).
-    q = q.lt("created_at", cursorCreatedAt);
-  }
-
-  let { data: rows, error } = await q;
-  if (error && /created_at|column/i.test(error.message ?? "")) {
-    // Older schemas without reactions.created_at — return a single unpaginated page.
-    const fallback = await supabaseAdmin
-      .from("reactions")
-      .select("user_id, type")
-      .eq("post_id", id)
-      .limit(fetchSize);
-    rows = (fallback.data ?? []).map((r: any) => ({ ...r, created_at: null }));
-    error = fallback.error;
-  }
-  if (error) {
-    console.error("[posts/reactors] query failed:", error.message);
+  try {
+    const page = await listUniquePublicReactors({
+      postId: id,
+      viewerId: userId,
+      blockedIds: await getBlockedIds(userId),
+      limit,
+      cursorRaw: cursorRaw || undefined,
+    });
+    return c.json({
+      data: page.data,
+      nextCursor: page.nextCursor,
+      hasMore: page.hasMore,
+      total: page.total,
+      limit,
+    });
+  } catch (e) {
+    console.error("[posts/reactors] failed:", e instanceof Error ? e.message : e);
     return c.json({ error: { message: "Failed to load reactors" } }, 500);
   }
-
-  const seen = new Set<string>();
-  const filtered: any[] = [];
-  for (const r of rows ?? []) {
-    const uid = String(r.user_id ?? "");
-    if (!uid || seen.has(uid) || blockedSet.has(uid)) continue;
-    if (isReactionLocked(r.type)) continue; // public list only
-    // Tie-break when timestamps collide with the cursor user.
-    if (
-      cursorCreatedAt &&
-      cursorUserId &&
-      r.created_at === cursorCreatedAt &&
-      String(uid) >= cursorUserId
-    ) {
-      continue;
-    }
-    seen.add(uid);
-    filtered.push(r);
-    if (filtered.length >= limit + 1) break;
-  }
-
-  // If the first window was mostly locked/blocked, one more page deeper.
-  if (filtered.length < limit + 1 && (rows?.length ?? 0) >= fetchSize) {
-    const last = rows![rows!.length - 1];
-    if (last?.created_at) {
-      const more = await supabaseAdmin
-        .from("reactions")
-        .select("user_id, type, created_at")
-        .eq("post_id", id)
-        .lt("created_at", last.created_at)
-        .order("created_at", { ascending: false })
-        .order("user_id", { ascending: false })
-        .limit(fetchSize);
-      for (const r of more.data ?? []) {
-        const uid = String(r.user_id ?? "");
-        if (!uid || seen.has(uid) || blockedSet.has(uid)) continue;
-        if (isReactionLocked(r.type)) continue;
-        seen.add(uid);
-        filtered.push(r);
-        if (filtered.length >= limit + 1) break;
-      }
-    }
-  }
-
-  const hasMore = filtered.length > limit;
-  const page = hasMore ? filtered.slice(0, limit) : filtered;
-
-  const profileIds = page.map((r) => r.user_id as string);
-  const byId: Record<string, any> = {};
-  if (profileIds.length > 0) {
-    let { data: profiles, error: profileErr } = await supabaseAdmin
-      .from("profiles")
-      .select("id, full_name, username, avatar_url, gender, is_verified")
-      .in("id", profileIds);
-    if (profileErr && /is_verified|column/i.test(profileErr.message ?? "")) {
-      const fallback = await supabaseAdmin
-        .from("profiles")
-        .select("id, full_name, username, avatar_url, gender")
-        .in("id", profileIds);
-      profiles = fallback.data;
-    }
-    for (const p of profiles ?? []) byId[p.id] = p;
-  }
-
-  const data = page.map((r) => {
-    const profile = byId[r.user_id];
-    const username = String(profile?.username ?? "").trim() || null;
-    const fullName = String(profile?.full_name ?? "").trim();
-    const name = fullName || username || "Member";
-    return {
-      userId: r.user_id,
-      name,
-      username,
-      avatar: resolveAvatarUrl(r.user_id, profile?.avatar_url, profile?.gender),
-      verified: profile?.is_verified === true,
-      reaction: baseReactionType(r.type),
-      type: baseReactionType(r.type),
-      createdAt: r.created_at ?? null,
-    };
-  });
-
-  const last = page[page.length - 1];
-  const nextCursor =
-    hasMore && last?.created_at && last?.user_id
-      ? `${last.created_at}|${last.user_id}`
-      : null;
-
-  // Unique public reactors for +N chips (exclude locked; subtract blocked when possible).
-  let total: number | undefined;
-  try {
-    const { data: allPublic } = await supabaseAdmin
-      .from("reactions")
-      .select("user_id, type")
-      .eq("post_id", id)
-      .not("type", "like", "locked:%");
-    const unique = new Set<string>();
-    for (const r of allPublic ?? []) {
-      const uid = String(r.user_id ?? "");
-      if (!uid || blockedSet.has(uid)) continue;
-      if (isReactionLocked(r.type)) continue;
-      unique.add(uid);
-    }
-    total = unique.size;
-  } catch {
-    /* optional */
-  }
-
-  return c.json({ data, nextCursor, hasMore, ...(total !== undefined ? { total } : {}) });
 });
 
 postsRouter.post("/:id/reactions", async (c) => {
