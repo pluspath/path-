@@ -17,4 +17,14 @@ dashboardRoutes.get("/", requirePermission("dashboard:read"), async (c) => {
   }
 });
 
+/** Lightweight poll endpoint for the live online-users indicator. */
+dashboardRoutes.get("/presence", requirePermission("dashboard:read"), async (c) => {
+  try {
+    const presence = await dashboardService.getLivePresence();
+    return ok(c, presence);
+  } catch (e) {
+    return fail(c, e instanceof Error ? e.message : "Failed to load presence", 500);
+  }
+});
+
 export { dashboardRoutes };

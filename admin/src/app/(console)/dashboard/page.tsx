@@ -10,12 +10,15 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import Link from "next/link";
 import {
   Activity,
+  BadgeCheck,
   Bell,
   FileText,
   HeartHandshake,
   MessageSquareText,
+  Radio,
   Sparkles,
   Users,
   ClipboardList,
@@ -28,10 +31,18 @@ import { Badge } from "@/components/ui/badge";
 import { PageHeader } from "@/components/page-header";
 import { ErrorState, LoadingState, EmptyState } from "@/components/data-table";
 
+type PresenceData = {
+  onlineUsers: number;
+  windowSeconds: number;
+  asOf: string;
+  available: boolean;
+};
+
 type DashboardData = {
   cards: {
     totalUsers: number;
     activeUsers: number;
+    onlineUsers?: number | null;
     newUsersToday: number;
     postsCount: number;
     friendshipsCount: number;
@@ -40,6 +51,7 @@ type DashboardData = {
     notificationsCount: number;
     reportsCount: number;
   };
+  presence?: PresenceData;
   charts: {
     registrations: { date: string; count: number }[];
     posts: { date: string; count: number }[];
@@ -63,7 +75,7 @@ type DashboardData = {
 
 const kpiMeta = [
   { key: "totalUsers" as const, label: "Total Users", icon: Users, tone: "text-navy bg-cream dark:bg-[#132038] dark:text-gold" },
-  { key: "activeUsers" as const, label: "Active Users", icon: Sparkles, tone: "text-gold bg-gold-soft dark:bg-[#1A2A14] dark:text-gold" },
+  { key: "activeUsers" as const, label: "Active Accounts", icon: Sparkles, tone: "text-gold bg-gold-soft dark:bg-[#1A2A14] dark:text-gold" },
   { key: "newUsersToday" as const, label: "New Today", icon: UserPlus, tone: "text-navy bg-cream dark:bg-[#132038] dark:text-cream" },
   { key: "postsCount" as const, label: "Posts / Moments", icon: FileText, tone: "text-navy bg-[#F0EBE3] dark:bg-[#132038] dark:text-[#C5CBD6]" },
   { key: "friendshipsCount" as const, label: "Friendships", icon: HeartHandshake, tone: "text-gold-muted bg-gold-soft dark:bg-[#1A2A14] dark:text-gold" },
@@ -83,19 +95,69 @@ function ChartTooltip({ active, payload, label }: { active?: boolean; payload?: 
   );
 }
 
+function formatPresenceTime(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  try {
+    return new Date(iso).toLocaleTimeString(undefined, {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+  } catch {
+    return "—";
+  }
+}
+
 export default function DashboardPage() {
   const [data, setData] = useState<DashboardData | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [presence, setPresence] = useState<PresenceData | null>(null);
+  const [presenceError, setPresenceError] = useState<string | null>(null);
+  const [presenceLoading, setPresenceLoading] = useState(true);
 
   useEffect(() => {
     api
       .get<{ data: DashboardData }>("/dashboard")
-      .then((r) => setData(r.data))
+      .then((r) => {
+        setData(r.data);
+        if (r.data.presence) setPresence(r.data.presence);
+      })
       .catch((e) => setError(e.message));
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const poll = () => {
+      api
+        .get<{ data: PresenceData }>("/dashboard/presence")
+        .then((r) => {
+          if (cancelled) return;
+          setPresence(r.data);
+          setPresenceError(null);
+          setPresenceLoading(false);
+        })
+        .catch((e) => {
+          if (cancelled) return;
+          setPresenceError(e instanceof Error ? e.message : "Unavailable");
+          setPresenceLoading(false);
+        });
+    };
+    poll();
+    const timer = window.setInterval(poll, 20_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
   }, []);
 
   if (error) return <ErrorState message={error} />;
   if (!data) return <LoadingState />;
+
+  const onlineCount = presence?.available
+    ? presence.onlineUsers
+    : typeof data.cards.onlineUsers === "number"
+      ? data.cards.onlineUsers
+      : null;
 
   return (
     <div className="space-y-6 animate-fade-up">
@@ -104,6 +166,68 @@ export default function DashboardPage() {
         title="Dashboard"
         description="Live Path+ application statistics and recent operational activity"
       />
+
+      <Card
+        className="border-emerald-200/80 bg-gradient-to-br from-emerald-50/90 to-white shadow-atlas dark:border-emerald-900/40 dark:from-emerald-950/30 dark:to-[#0C1830]"
+        data-testid="dashboard-live-online-users"
+      >
+        <CardContent className="flex flex-col gap-4 pt-5 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-start gap-4">
+            <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-400">
+              <Radio className="h-5 w-5" />
+            </div>
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-[0.12em] text-emerald-700/80 dark:text-emerald-400/90">
+                Currently in the app
+              </p>
+              <p className="mt-1 text-4xl font-semibold tracking-tight tabular-nums text-navy dark:text-cream">
+                {presenceLoading && onlineCount === null
+                  ? "…"
+                  : presenceError || onlineCount === null
+                    ? "—"
+                    : formatNumber(onlineCount)}
+              </p>
+              <p className="mt-1 text-sm text-muted">
+                Unique signed-in mobile users with activity in the last{" "}
+                {presence?.windowSeconds
+                  ? Math.round(presence.windowSeconds / 60)
+                  : 3}{" "}
+                minutes
+              </p>
+            </div>
+          </div>
+          <div className="shrink-0 space-y-1 text-left sm:text-right">
+            <Badge variant={presenceError ? "danger" : presence?.available === false ? "muted" : "success"}>
+              {presenceError
+                ? "Unavailable"
+                : presenceLoading
+                  ? "Updating…"
+                  : presence?.available === false
+                    ? "Not ready"
+                    : "Live"}
+            </Badge>
+            <p className="font-mono text-[11px] text-muted">
+              Updated {formatPresenceTime(presence?.asOf)}
+            </p>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Link href="/verified-accounts" className="block" data-testid="dashboard-account-verification">
+        <Card className="transition duration-200 hover:-translate-y-0.5 hover:shadow-atlas">
+          <CardContent className="flex items-center gap-4 pt-5">
+            <div className="flex h-11 w-11 items-center justify-center rounded-lg bg-sky-50 text-sky-500 dark:bg-sky-950/40">
+              <BadgeCheck className="h-5 w-5" />
+            </div>
+            <div>
+              <p className="font-semibold text-navy dark:text-cream">Account Verification</p>
+              <p className="text-sm text-muted">
+                Grant or remove the blue verification badge. Only an administrator can do this.
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+      </Link>
 
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
         {kpiMeta.map((c) => {

@@ -16,6 +16,7 @@ import { attachCommentPreviews, formatPreviewComments } from "../lib/comment-pre
 import { ensureUserHasUsername } from "../lib/username-backfill";
 import { refreshAuthProfileCache } from "../lib/auth-profile-cache";
 import { profilePatchTriesToSetVerification } from "../lib/verification";
+import { heartbeatPresence } from "../lib/presence";
 import type { HonoVariables, Profile } from "../types";
 
 const USERNAME_RE = /^[a-z0-9_]{3,30}$/;
@@ -913,6 +914,24 @@ usersRouter.put("/me", async (c) => {
   return c.json({
     data: formatProfile(updated, counts.postCount, counts.friendCount, userId, counts.likeCount),
   });
+});
+
+// POST /api/me/presence — lightweight foreground heartbeat (unique user online).
+usersRouter.post("/me/presence", async (c) => {
+  const userId = c.get("userId");
+  if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const body = await c.req.json().catch(() => ({}));
+  const client =
+    typeof body?.client === "string" && body.client.trim()
+      ? body.client.trim().slice(0, 32)
+      : "mobile";
+
+  const result = await heartbeatPresence(userId, client);
+  if (!result.ok) {
+    return c.json({ data: { ok: false, lastSeenAt: result.lastSeenAt } }, 200);
+  }
+  return c.json({ data: { ok: true, lastSeenAt: result.lastSeenAt } }, 200);
 });
 
 // POST /api/me/push-deactivate — deactivate this device's push token (logout).

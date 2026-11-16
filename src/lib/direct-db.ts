@@ -47,12 +47,18 @@ export function getDirectSql(): postgres.Sql | null {
   }
   sqlUrl = url;
   sql = postgres(url, {
-    // Auth + unread aggregates share this pool when PostgREST is degraded.
-    max: 10,
+    // Keep the pool small: Supabase session/direct connections are scarce.
+    // Auth + unread + presence fall back here when PostgREST is degraded.
+    max: 8,
     idle_timeout: 20,
-    connect_timeout: 20,
+    connect_timeout: 15,
+    max_lifetime: 60 * 30,
     ssl: "require",
     prepare: false,
+    connection: {
+      application_name: "pathplus-backend",
+      statement_timeout: "15s",
+    },
   });
   return sql;
 }

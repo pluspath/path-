@@ -1386,18 +1386,20 @@ postsRouter.get("/:id/comments", async (c) => {
 postsRouter.post("/:id/comments", async (c) => {
   const user = c.get("user");
   const userId = c.get("userId");
-  const token = c.get("accessToken");
-  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+  if (!user || !userId) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const { id } = c.req.param();
   const body = await c.req.json();
-  const userClient = createUserClient(token);
+  const content = typeof body?.content === "string" ? body.content.trim() : "";
+  if (!content) {
+    return c.json({ error: { message: "Comment text is required" } }, 400);
+  }
 
   // Block commenting when the moment's author turned comments off.
   // Service role so RLS can't hide the comments_disabled flag.
   const { data: targetPost } = await supabaseAdmin
     .from("posts")
-    .select("id, comments_disabled, user_id, audience")
+    .select("id, comments_disabled, user_id, audience, content, comment_count")
     .eq("id", id)
     .maybeSingle();
   if (!targetPost || !(await viewerCanAccessMoment(userId, targetPost))) {
@@ -1409,7 +1411,7 @@ postsRouter.post("/:id/comments", async (c) => {
 
   const { data: comment, error } = await supabaseAdmin
     .from("comments")
-    .insert({ id: crypto.randomUUID(), post_id: id, user_id: userId, content: body.content })
+    .insert({ id: crypto.randomUUID(), post_id: id, user_id: userId, content })
     .select("id, post_id, user_id, content, created_at")
     .single();
 
@@ -1418,38 +1420,40 @@ postsRouter.post("/:id/comments", async (c) => {
     return c.json({ error: { message: "Failed to create comment" } }, 500);
   }
 
-  // Service role: post owners' RLS would otherwise silently block commenters
-  // from bumping comment_count, leaving feed previews empty forever.
-  const { data: postData } = await supabaseAdmin
-    .from("posts")
-    .select("comment_count, user_id, content")
-    .eq("id", id)
-    .single();
+  // Respond immediately with the created comment. Count bump, notifications,
+  // push, and mentions run after the response so the mobile UI feels instant.
+  const formatted = {
+    id: comment.id,
+    postId: comment.post_id,
+    userId: comment.user_id,
+    content: comment.content,
+    createdAt: comment.created_at,
+    user: formatCommentUser(userId, {
+      full_name: user.full_name,
+      username: user.username,
+      avatar_url: user.avatar_url,
+      gender: user.gender,
+    }),
+  };
 
-  if (postData) {
-    await supabaseAdmin
-      .from("posts")
-      .update({ comment_count: (postData.comment_count ?? 0) + 1 })
-      .eq("id", id);
-  }
+  void (async () => {
+    try {
+      await supabaseAdmin
+        .from("posts")
+        .update({ comment_count: (targetPost.comment_count ?? 0) + 1 })
+        .eq("id", id);
+    } catch (e) {
+      console.error("[comments] count bump error:", e);
+    }
 
-  const { data: profile } = await supabaseAdmin
-    .from("profiles")
-    .select("id, full_name, username, avatar_url, gender")
-    .eq("id", userId)
-    .single();
-
-  // Notify the post owner (activity feed + push), never about their own comment.
-  try {
-    const postOwner = postData;
-    if (postOwner && postOwner.user_id !== userId) {
-      const snippet = halfLineSnippet((postOwner as { content?: string | null }).content);
-      let inserted: { id: string } | null = null;
-      {
+    try {
+      if (targetPost.user_id !== userId) {
+        const snippet = halfLineSnippet(targetPost.content);
+        let inserted: { id: string } | null = null;
         const withComment = await supabaseAdmin
           .from("notifications")
           .insert({
-            user_id: postOwner.user_id,
+            user_id: targetPost.user_id,
             from_user_id: userId,
             type: "comment",
             message: "commented on your moment",
@@ -1460,11 +1464,10 @@ postsRouter.post("/:id/comments", async (c) => {
           .select("id")
           .single();
         if (withComment.error && /comment_id|column/i.test(withComment.error.message ?? "")) {
-          // Column not migrated yet — still notify without deep-link id.
           const fallback = await supabaseAdmin
             .from("notifications")
             .insert({
-              user_id: postOwner.user_id,
+              user_id: targetPost.user_id,
               from_user_id: userId,
               type: "comment",
               message: "commented on your moment",
@@ -1477,44 +1480,34 @@ postsRouter.post("/:id/comments", async (c) => {
         } else {
           inserted = withComment.data;
         }
+
+        void sendPushToUser(
+          supabaseAdmin,
+          targetPost.user_id,
+          "New Comment",
+          snippet
+            ? `${user.full_name} commented on your Moment ${snippet}`
+            : `${user.full_name} commented on your Moment`,
+          {
+            postId: id,
+            commentId: comment.id,
+            type: "comment",
+            fromUserId: userId,
+            notificationId: inserted?.id,
+          }
+        );
       }
-
-      void sendPushToUser(
-        supabaseAdmin,
-        postOwner.user_id,
-        "New Comment",
-        snippet
-          ? `${user.full_name} commented on your Moment ${snippet}`
-          : `${user.full_name} commented on your Moment`,
-        {
-          postId: id,
-          commentId: comment.id,
-          type: "comment",
-          fromUserId: userId,
-          notificationId: inserted?.id,
-        }
-      );
+    } catch (e) {
+      console.error("[notifications] comment insert error:", e);
     }
-  } catch (e) {
-    console.error("[notifications] comment insert error:", e);
-  }
 
-  const formatted = {
-    id: comment.id,
-    postId: comment.post_id,
-    userId: comment.user_id,
-    content: comment.content,
-    createdAt: comment.created_at,
-    user: formatCommentUser(userId, profile),
-  };
-
-  // Mentions (resolve + push) — don't hold the comment response.
-  void notifyMentions({
-    authorId: userId,
-    authorName: user.full_name,
-    content: comment.content,
-    postId: id,
-  });
+    void notifyMentions({
+      authorId: userId,
+      authorName: user.full_name,
+      content: comment.content,
+      postId: id,
+    });
+  })();
 
   return c.json({ data: formatted }, 201);
 });

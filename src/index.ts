@@ -429,6 +429,15 @@ SET comment_count = 0
 WHERE COALESCE(p.comment_count, 0) > 0
   AND NOT EXISTS (SELECT 1 FROM public.comments c WHERE c.post_id = p.id)`,
         "CREATE INDEX IF NOT EXISTS idx_comments_post_id_created_at_desc ON public.comments (post_id, created_at DESC)",
+        `CREATE TABLE IF NOT EXISTS public.user_presence (
+          user_id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+          last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          client TEXT NOT NULL DEFAULT 'mobile',
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )`,
+        "CREATE INDEX IF NOT EXISTS idx_user_presence_last_seen ON public.user_presence (last_seen_at DESC)",
+        "ALTER TABLE public.user_presence ENABLE ROW LEVEL SECURITY",
+        "CREATE INDEX IF NOT EXISTS idx_messages_conv_sender_created ON public.messages (conversation_id, sender_id, created_at DESC)",
       ];
       if (!skipBootDdl) {
         let schemaCacheBlocked = false;
