@@ -1,208 +1,389 @@
 import { Hono } from "hono";
-import { zValidator } from "@hono/zod-validator";
+import type { StatusCode } from "hono/utils/http-status";
 import { z } from "zod";
-import { Resend } from "resend";
 import { supabase, supabaseAdmin } from "../supabase";
 import { ensureJoinedPost } from "../lib/joined";
-import { isAdult } from "../lib/profileMeta";
-import { env } from "../env";
+import { isAdult, normalizeBirthday } from "../lib/profileMeta";
+import {
+  startRegistration,
+  resendRegistrationOtp,
+  verifyRegistrationOtp,
+  consumePendingRegistration,
+  decryptPendingPassword,
+  purgeExpiredPendingRegistrations,
+} from "../lib/pending-registration";
+import {
+  requestPasswordResetOtp,
+  verifyPasswordResetOtp,
+  confirmPasswordReset,
+  purgeExpiredPasswordResetOtps,
+} from "../lib/password-reset-otp";
+import { defaultAvatarForGender, normalizeGender } from "../lib/avatar";
+import { isSupabaseCircuitOpen, supabaseCircuitRetryAfterSec } from "../lib/supabase-circuit";
+import {
+  authMessage,
+  newRequestId,
+  resolveAuthLocale,
+  type AuthErrorCode,
+  type AuthLocale,
+} from "../lib/auth-messages";
 
 const authRouter = new Hono();
 
-// In-memory OTP store: email → { otp, expiry, username, fullName, password }
-const otpStore = new Map<string, { otp: string; expiry: number; username: string; fullName: string; password: string }>();
-
-function generateOTP(): string {
-  return Math.floor(100000 + Math.random() * 900000).toString();
+function httpStatus(code?: number): StatusCode {
+  return (code ?? 400) as StatusCode;
 }
 
-async function sendOTPEmail(email: string, otp: string, fullName: string): Promise<void> {
-  const resendKey = env.RESEND_API_KEY;
-  if (!resendKey) throw new Error("RESEND_API_KEY not configured");
+type IssueLike = { path: PropertyKey[]; message: string };
 
-  const resend = new Resend(resendKey);
-  const { error } = await resend.emails.send({
-    from: "noreply@pathplus.store",
-    to: email,
-    subject: "Your verification code",
-    html: `
-      <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto; padding: 32px;">
-        <h2 style="color: #0A1F44; margin-bottom: 8px;">Hi ${fullName},</h2>
-        <p style="color: #475569; margin-bottom: 24px;">Use this code to verify your account:</p>
-        <div style="background: #F1F5F9; border-radius: 12px; padding: 24px; text-align: center; margin-bottom: 24px;">
-          <span style="font-size: 40px; font-weight: 700; letter-spacing: 8px; color: #0A1F44;">${otp}</span>
-        </div>
-        <p style="color: #94A3B8; font-size: 13px;">This code expires in 10 minutes. If you didn't request this, ignore this email.</p>
-      </div>
-    `,
+function firstZodIssue(
+  error: { issues: IssueLike[] },
+  locale: AuthLocale
+): { message: string; code: AuthErrorCode } {
+  const issue = error.issues[0];
+  if (!issue) return { message: authMessage("UNEXPECTED_ERROR", locale), code: "UNEXPECTED_ERROR" };
+  const path = issue.path.map(String).join(".");
+  if (path === "email") return { message: authMessage("INVALID_EMAIL", locale), code: "INVALID_EMAIL" };
+  if (path === "password") return { message: authMessage("WEAK_PASSWORD", locale), code: "WEAK_PASSWORD" };
+  if (path === "username") return { message: authMessage("USERNAME_INVALID", locale), code: "USERNAME_INVALID" };
+  if (path === "fullName") return { message: authMessage("MISSING_FIELDS", locale), code: "MISSING_FIELDS" };
+  if (path === "gender") return { message: "Gender must be Male or Female when provided.", code: "INVALID_EMAIL" };
+  if (path === "birthday") return { message: "Please enter a valid date of birth (YYYY-MM-DD).", code: "INVALID_EMAIL" };
+  if (path === "otp") return { message: authMessage("INVALID_OTP", locale), code: "INVALID_OTP" };
+  return { message: issue.message || authMessage("UNEXPECTED_ERROR", locale), code: "UNEXPECTED_ERROR" };
+}
+
+function localizeRegistrationFailure(
+  result: { message: string; code?: string },
+  locale: AuthLocale
+): { message: string; code: string } {
+  const code = (result.code ?? "UNEXPECTED_ERROR") as AuthErrorCode;
+  const known: AuthErrorCode[] = [
+    "EMAIL_ALREADY_REGISTERED",
+    "INVALID_EMAIL",
+    "WEAK_PASSWORD",
+    "USERNAME_TAKEN",
+    "USERNAME_INVALID",
+    "REGISTRATION_UNAVAILABLE",
+    "VERIFICATION_EMAIL_FAILED",
+    "EMAIL_QUOTA_EXCEEDED",
+    "OTP_RATE_LIMIT",
+    "INVALID_OTP",
+    "OTP_EXPIRED",
+    "UNEXPECTED_ERROR",
+  ];
+  if (known.includes(code)) {
+    return { message: authMessage(code, locale), code };
+  }
+  return { message: result.message, code };
+}
+
+/** Gender and date of birth are OPTIONAL (Apple Guideline 5.1.1(v)). */
+const signupSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(6),
+  username: z
+    .string()
+    .trim()
+    .toLowerCase()
+    .regex(/^[a-z0-9_]{3,30}$/, "Username must be 3–30 characters: letters, numbers, underscore."),
+  fullName: z.string().min(1),
+  gender: z.enum(["Male", "Female"]).optional().nullable(),
+  birthday: z
+    .union([
+      z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Invalid birthday"),
+      z.literal(""),
+      z.null(),
+    ])
+    .optional(),
+});
+
+authRouter.post("/signup", async (c) => {
+  const requestId = newRequestId();
+  const locale = resolveAuthLocale(c.req.header("accept-language"));
+  c.header("X-Request-Id", requestId);
+  try {
+  const raw = await c.req.json().catch(() => null);
+  const parsed = signupSchema.safeParse(raw);
+  if (!parsed.success) {
+    const issue = firstZodIssue(parsed.error, locale);
+    return c.json({ error: { message: issue.message, code: issue.code, requestId } }, 400);
+  }
+
+  const { email, password, username, fullName } = parsed.data;
+  const gender =
+    parsed.data.gender === "Male" || parsed.data.gender === "Female"
+      ? parsed.data.gender
+      : null;
+  const birthday = normalizeBirthday(parsed.data.birthday);
+
+  if (parsed.data.birthday && !birthday) {
+    return c.json(
+      { error: { message: "Please enter a valid date of birth (YYYY-MM-DD).", code: "INVALID_EMAIL", requestId } },
+      400
+    );
+  }
+
+  if (birthday && !isAdult(birthday)) {
+    return c.json(
+      { error: { message: authMessage("UNDERAGE", locale), code: "UNDERAGE", requestId } },
+      400
+    );
+  }
+
+  const result = await startRegistration({
+    email,
+    password,
+    username,
+    fullName,
+    gender,
+    birthday,
   });
 
-  if (error) throw new Error(error.message);
-}
-
-authRouter.post(
-  "/signup",
-  zValidator("json", z.object({
-    email: z.string().email(),
-    password: z.string().min(6),
-    username: z.string().min(3),
-    fullName: z.string().min(1),
-    gender: z.enum(["Male", "Female"]),
-    birthday: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Invalid birthday"),
-  })),
-  async (c) => {
-    const { email, password, username, fullName, gender, birthday } = c.req.valid("json");
-
-    // Age gate — must be 18 or older.
-    if (!isAdult(birthday)) {
-      return c.json({ error: { message: "You must be 18 or older to use Path+" } }, 400);
-    }
-
-    // Create user in Supabase with email already confirmed (bypasses SMTP)
-    const { data: userData, error: createError } = await supabaseAdmin.auth.admin.createUser({
-      email,
-      password,
-      email_confirm: true,
-      user_metadata: { full_name: fullName, username },
-    });
-
-    let userId = userData?.user?.id ?? null;
-
-    if (createError) {
-      console.error("[auth/signup] createUser error:", createError.message);
-      const msg = createError.message.toLowerCase();
-      const isAlreadyExists = msg.includes("already registered") || msg.includes("already been registered") || msg.includes("duplicate");
-      const isDatabaseError = msg.includes("database error");
-
-      if (!isAlreadyExists && !isDatabaseError) {
-        return c.json({ error: { message: createError.message } }, 400);
-      }
-
-      // For "database error" (trigger failure) or "already exists", look up the user by email
-      if (!userId) {
-        const { data: listData } = await supabaseAdmin.auth.admin.listUsers({ page: 1, perPage: 1000 });
-        const found = (listData?.users ?? []).find(u => u.email?.toLowerCase() === email.toLowerCase());
-        if (found) {
-          userId = found.id;
-        } else if (isDatabaseError) {
-          return c.json({ error: { message: "Account creation failed due to a database error. Please try again." } }, 500);
-        }
-      }
-    }
-
-    // Upsert profile directly via supabaseAdmin (skip Prisma/SQLite entirely)
-    if (userId) {
-      const { error: profileError } = await supabaseAdmin
-        .from("profiles")
-        .upsert(
-          { id: userId, username: username.toLowerCase().trim(), full_name: fullName, gender, birthday },
-          { onConflict: "id" }
-        );
-      if (profileError) {
-        console.error("[auth/signup] Failed to upsert profile:", profileError.message, profileError);
-      }
-
-      // Give the new user their "Joined Path+" moment (the first/oldest item on
-      // their timeline), timestamped to now. Idempotent — never duplicates.
-      await ensureJoinedPost(userId, new Date().toISOString());
-    }
-
-    const otp = generateOTP();
-    const expiry = Date.now() + 10 * 60 * 1000; // 10 minutes
-    otpStore.set(email.toLowerCase(), { otp, expiry, username, fullName, password });
-
-    try {
-      await sendOTPEmail(email, otp, fullName);
-    } catch (err: any) {
-      console.error("[auth/signup] Failed to send OTP email:", err.message);
-      return c.json({ error: { message: "Failed to send verification email. Please try again." } }, 500);
-    }
-
-    return c.json({ data: { success: true, message: "Verification code sent to your email." } });
+  if (!result.ok) {
+    const localized = localizeRegistrationFailure(result, locale);
+    if (result.retryAfterSec) c.header("Retry-After", String(result.retryAfterSec));
+    console.error(
+      `[auth/signup] requestId=${requestId} code=${localized.code} status=${result.status ?? 400}`
+    );
+    return c.json(
+      { error: { message: localized.message, code: localized.code, requestId } },
+      httpStatus(result.status)
+    );
   }
-);
 
-authRouter.post(
-  "/verify-otp",
-  zValidator("json", z.object({
-    email: z.string().email(),
-    otp: z.string().length(6),
-  })),
-  async (c) => {
-    const { email, otp } = c.req.valid("json");
-    const key = email.toLowerCase();
-    const stored = otpStore.get(key);
+  return c.json({
+    data: {
+      success: true,
+      message: authMessage("VERIFICATION_REQUIRED", locale),
+      requestId,
+    },
+  });
+  } catch (err) {
+    console.error("[auth/signup]", requestId, err instanceof Error ? err.message : err);
+    return c.json(
+      {
+        error: {
+          message: authMessage("REGISTRATION_UNAVAILABLE", locale),
+          code: "REGISTRATION_UNAVAILABLE",
+          requestId,
+        },
+      },
+      500
+    );
+  }
+});
 
-    if (!stored) {
-      return c.json({ error: { message: "No verification code found. Please sign up again." } }, 400);
+authRouter.post("/verify-otp", async (c) => {
+  const requestId = newRequestId();
+  const locale = resolveAuthLocale(c.req.header("accept-language"));
+  c.header("X-Request-Id", requestId);
+  try {
+  const raw = await c.req.json().catch(() => null);
+  const parsed = z
+    .object({
+      email: z.string().email(),
+      otp: z.string().length(6),
+    })
+    .safeParse(raw);
+  if (!parsed.success) {
+    const issue = firstZodIssue(parsed.error, locale);
+    return c.json({ error: { message: issue.message, code: issue.code, requestId } }, 400);
+  }
+
+  const { email, otp } = parsed.data;
+  const verifyResult = await verifyRegistrationOtp(email, otp);
+  if (!verifyResult.ok) {
+    return c.json({ error: { message: verifyResult.message } }, httpStatus(verifyResult.status));
+  }
+
+  const pending = verifyResult.pending;
+  let plainPassword: string;
+  try {
+    plainPassword = decryptPendingPassword(pending);
+  } catch {
+    await consumePendingRegistration(email);
+    return c.json({ error: { message: "Registration data is invalid. Please sign up again." } }, 400);
+  }
+
+  const { data: userData, error: createError } = await supabaseAdmin.auth.admin.createUser({
+    email: pending.email,
+    password: plainPassword,
+    email_confirm: true,
+    user_metadata: { full_name: pending.full_name, username: pending.username },
+  });
+
+  let createdUserId: string | null = null;
+  if (createError || !userData?.user) {
+    const msg = createError?.message?.toLowerCase() ?? "";
+    const alreadyExists =
+      msg.includes("already registered") || msg.includes("already exists");
+    if (!alreadyExists) {
+      console.error("[auth/verify-otp] createUser error:", createError?.message);
+      return c.json({ error: { message: "Unable to create account. Please try again." } }, 500);
     }
-    if (Date.now() > stored.expiry) {
-      otpStore.delete(key);
-      return c.json({ error: { message: "Verification code expired. Please request a new one." } }, 400);
-    }
-    if (stored.otp !== otp) {
-      return c.json({ error: { message: "Invalid code. Please try again." } }, 400);
-    }
+    // A previous attempt created the user but the phone never received the
+    // session. Sign in with the same password instead of failing the retry.
+    console.warn("[auth/verify-otp] user already exists, completing sign-in");
+  } else {
+    createdUserId = userData.user.id;
+  }
 
-    otpStore.delete(key);
-
-    // Generate a magic link token via admin API — bypasses passwords entirely
-    const { data: linkData, error: linkError } = await supabaseAdmin.auth.admin.generateLink({
-      type: "magiclink",
-      email,
-    });
-    if (linkError || !linkData?.properties?.hashed_token) {
-      console.error("[auth/verify-otp] generateLink error:", linkError?.message);
-      return c.json({ error: { message: linkError?.message ?? "Failed to create session." } }, 500);
+  // Sign in with the password we stored at signup. This also recovers a retry
+  // when the first attempt created the user but the phone never got the response.
+  const { data: sessionData, error: sessionError } = await supabase.auth.signInWithPassword({
+    email: pending.email,
+    password: plainPassword,
+  });
+  if (sessionError || !sessionData.session || !sessionData.user) {
+    console.error("[auth/verify-otp] signIn error:", sessionError?.message);
+    if (!createdUserId) {
+      return c.json(
+        { error: { message: "An account with this email already exists. Please sign in instead." } },
+        400
+      );
     }
+    return c.json({ error: { message: "Account created but sign-in failed. Please sign in manually." } }, 500);
+  }
 
-    // Exchange the hashed token for a real session
-    const { data: sessionData, error: sessionError } = await supabase.auth.verifyOtp({
-      token_hash: linkData.properties.hashed_token,
-      type: "magiclink",
-    });
-    if (sessionError || !sessionData.session) {
-      console.error("[auth/verify-otp] verifyOtp error:", sessionError?.message);
-      return c.json({ error: { message: sessionError?.message ?? "Failed to establish session." } }, 500);
+  const userId = sessionData.user.id;
+  const profileRow: Record<string, unknown> = {
+    id: userId,
+    username: pending.username,
+    full_name: pending.full_name,
+  };
+  const gender = normalizeGender(pending.gender);
+  if (gender) profileRow.gender = gender;
+  // Distinct scenic default until the user uploads their own photo.
+  profileRow.avatar_url = defaultAvatarForGender(userId, gender);
+  if (pending.birthday) profileRow.birthday = pending.birthday;
+
+  const { error: profileError } = await supabaseAdmin
+    .from("profiles")
+    .upsert(profileRow, { onConflict: "id" });
+  if (profileError) {
+    console.error("[auth/verify-otp] profile upsert failed:", profileError.message);
+    if (createdUserId) {
+      await supabaseAdmin.auth.admin.deleteUser(userId);
     }
+    return c.json({ error: { message: "Unable to create profile. Please try again." } }, 500);
+  }
 
-    return c.json({ data: {
+  await ensureJoinedPost(userId, new Date().toISOString());
+  await consumePendingRegistration(email);
+
+  return c.json({
+    data: {
       success: true,
       session: {
         access_token: sessionData.session.access_token,
         refresh_token: sessionData.session.refresh_token,
       },
-    } });
+    },
+  });
+  } catch (err) {
+    console.error("[auth/verify-otp]", err instanceof Error ? err.message : err);
+    return c.json(
+      { error: { message: "Unable to verify the code. Please try again." } },
+      500
+    );
   }
-);
+});
 
-authRouter.post(
-  "/resend-otp",
-  zValidator("json", z.object({
-    email: z.string().email(),
-  })),
-  async (c) => {
-    const { email } = c.req.valid("json");
-    const key = email.toLowerCase();
-    const existing = otpStore.get(key);
-
-    const fullName = existing?.fullName ?? "there";
-    const username = existing?.username ?? "";
-    const password = existing?.password ?? "";
-
-    const otp = generateOTP();
-    const expiry = Date.now() + 10 * 60 * 1000;
-    otpStore.set(key, { otp, expiry, username, fullName, password });
-
-    try {
-      await sendOTPEmail(email, otp, fullName);
-    } catch (err: any) {
-      console.error("[auth/resend-otp] Failed to send OTP email:", err.message);
-      return c.json({ error: { message: "Failed to send verification email. Please try again." } }, 500);
-    }
-
-    return c.json({ data: { success: true, message: "New verification code sent." } });
+authRouter.post("/resend-otp", async (c) => {
+  const requestId = newRequestId();
+  const locale = resolveAuthLocale(c.req.header("accept-language"));
+  c.header("X-Request-Id", requestId);
+  const raw = await c.req.json().catch(() => null);
+  const parsed = z.object({ email: z.string().email() }).safeParse(raw);
+  if (!parsed.success) {
+    const issue = firstZodIssue(parsed.error, locale);
+    return c.json({ error: { message: issue.message, code: issue.code, requestId } }, 400);
   }
-);
 
-export { authRouter };
+  const result = await resendRegistrationOtp(parsed.data.email);
+  if (!result.ok) {
+    const localized = localizeRegistrationFailure(result, locale);
+    if (result.retryAfterSec) c.header("Retry-After", String(result.retryAfterSec));
+    return c.json(
+      { error: { message: localized.message, code: localized.code, requestId } },
+      httpStatus(result.status)
+    );
+  }
+
+  return c.json({ data: { success: true, message: "New verification code sent.", requestId } });
+});
+
+authRouter.post("/forgot-password", async (c) => {
+  if (isSupabaseCircuitOpen()) {
+    c.header("Retry-After", String(supabaseCircuitRetryAfterSec()));
+    return c.json(
+      {
+        error: {
+          message:
+            "Database is temporarily overloaded. Please wait a moment and try again.",
+        },
+      },
+      503
+    );
+  }
+
+  const raw = await c.req.json().catch(() => null);
+  const parsed = z.object({ email: z.string().email() }).safeParse(raw);
+  if (!parsed.success) {
+    return c.json({ error: { message: "Please enter a valid email address." } }, 400);
+  }
+
+  const result = await requestPasswordResetOtp(parsed.data.email);
+  if (!result.ok) return c.json({ error: { message: result.message } }, httpStatus(result.status));
+  return c.json({ data: { success: true, message: "Reset code sent to your email." } });
+});
+
+authRouter.post("/verify-reset-otp", async (c) => {
+  const raw = await c.req.json().catch(() => null);
+  const parsed = z
+    .object({ email: z.string().email(), otp: z.string().length(6) })
+    .safeParse(raw);
+  if (!parsed.success) {
+    const locale = resolveAuthLocale(c.req.header("accept-language"));
+    const issue = firstZodIssue(parsed.error, locale);
+    return c.json({ error: { message: issue.message, code: issue.code } }, 400);
+  }
+
+  const result = await verifyPasswordResetOtp(parsed.data.email, parsed.data.otp);
+  if (!result.ok) return c.json({ error: { message: result.message } }, httpStatus(result.status));
+  return c.json({ data: { success: true, verified: true } });
+});
+
+authRouter.post("/reset-password", async (c) => {
+  const raw = await c.req.json().catch(() => null);
+  const parsed = z
+    .object({
+      email: z.string().email(),
+      password: z.string().min(6),
+    })
+    .safeParse(raw);
+  if (!parsed.success) {
+    const locale = resolveAuthLocale(c.req.header("accept-language"));
+    const issue = firstZodIssue(parsed.error, locale);
+    return c.json({ error: { message: issue.message, code: issue.code } }, 400);
+  }
+
+  const result = await confirmPasswordReset(parsed.data.email, parsed.data.password);
+  if (!result.ok) return c.json({ error: { message: result.message } }, httpStatus(result.status));
+  return c.json({ data: { success: true, message: "Password updated successfully." } });
+});
+
+authRouter.post("/resend-reset-otp", async (c) => {
+  const raw = await c.req.json().catch(() => null);
+  const parsed = z.object({ email: z.string().email() }).safeParse(raw);
+  if (!parsed.success) {
+    return c.json({ error: { message: "Please enter a valid email address." } }, 400);
+  }
+
+  const result = await requestPasswordResetOtp(parsed.data.email);
+  if (!result.ok) return c.json({ error: { message: result.message } }, httpStatus(result.status));
+  return c.json({ data: { success: true, message: "A new reset code was sent." } });
+});
+
+export { authRouter, purgeExpiredPendingRegistrations, purgeExpiredPasswordResetOtps };
