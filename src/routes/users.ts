@@ -16,6 +16,7 @@ import { attachCommentPreviews, formatPreviewComments } from "../lib/comment-pre
 import { ensureUserHasUsername } from "../lib/username-backfill";
 import { refreshAuthProfileCache } from "../lib/auth-profile-cache";
 import { profilePatchTriesToSetVerification } from "../lib/verification";
+import { heartbeatPresence } from "../lib/presence";
 import type { HonoVariables, Profile } from "../types";
 
 const USERNAME_RE = /^[a-z0-9_]{3,30}$/;
@@ -443,6 +444,15 @@ export function formatPost(p: any, viewerId?: string, blockedIds: string[] = [])
     // moment can open it on a map — same as location messages in chat.
     locationLat: p.location_lat ?? undefined,
     locationLng: p.location_lng ?? undefined,
+    // Optional structured publish-location (additive; older clients ignore).
+    locationCity: p.location_city ?? undefined,
+    locationRegion: p.location_region ?? undefined,
+    locationCountry: p.location_country ?? undefined,
+    locationPrecision: p.location_precision ?? undefined,
+    locationCapturedAt: p.location_captured_at ?? undefined,
+    locationShared: p.location_shared === true ? true : undefined,
+    // Embedded poll results when present (attached by attachPollsToPosts).
+    poll: p.poll ?? undefined,
     venueCategory: p.venue_category ?? undefined,
     musicTitle: p.music_title ?? undefined,
     musicArtist: p.music_artist ?? undefined,
@@ -913,6 +923,25 @@ usersRouter.put("/me", async (c) => {
   return c.json({
     data: formatProfile(updated, counts.postCount, counts.friendCount, userId, counts.likeCount),
   });
+});
+
+// POST /api/me/presence — lightweight foreground heartbeat (unique user online).
+usersRouter.post("/me/presence", async (c) => {
+  const userId = c.get("userId");
+  if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const body = await c.req.json().catch(() => ({}));
+  const client =
+    typeof body?.client === "string" && body.client.trim()
+      ? body.client.trim().slice(0, 32)
+      : "mobile";
+
+  const result = await heartbeatPresence(userId, client);
+  if (!result.ok) {
+    // Soft-fail: table may not be migrated yet; do not break the app.
+    return c.json({ data: { ok: false, lastSeenAt: result.lastSeenAt } }, 200);
+  }
+  return c.json({ data: { ok: true, lastSeenAt: result.lastSeenAt } }, 200);
 });
 
 // POST /api/me/push-deactivate — deactivate this device's push token (logout).
@@ -1525,7 +1554,7 @@ usersRouter.get("/:id/posts", async (c) => {
     ordered = await loadPostsByIds(walked.page.map((p) => p.id), {
       hydrateReactions: false,
     });
-    await attachOriginals(null, ordered);
+    await attachOriginals(null, ordered, { hydrateReactions: false });
   } catch (e) {
     console.error("[users/posts] hydrate failed:", e instanceof Error ? e.message : e);
     return c.json({ error: { message: "Failed to load moments" } }, 500);

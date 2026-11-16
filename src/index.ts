@@ -459,10 +459,18 @@ WHERE COALESCE(p.comment_count, 0) > 0
           }
         }
         if (!schemaCacheBlocked) {
-          const { ensureRepathColumn, ensureThemePreferenceColumn, ensureVerifiedColumn } = await import("./lib/schema");
+          const {
+            ensureRepathColumn,
+            ensureThemePreferenceColumn,
+            ensureVerifiedColumn,
+            ensureContentLocationColumns,
+            ensurePollTables,
+          } = await import("./lib/schema");
           await ensureRepathColumn();
           await ensureThemePreferenceColumn();
           await ensureVerifiedColumn();
+          await ensureContentLocationColumns();
+          await ensurePollTables();
           const { ensureInboxColumns } = await import("./lib/inbox-columns");
           await ensureInboxColumns();
           await ensurePostsBucketForChat();

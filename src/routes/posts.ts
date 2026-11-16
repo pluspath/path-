@@ -17,7 +17,7 @@ import { getBlockedIds } from "../lib/blocks";
 import { parseDurationToMinutes } from "../lib/duration";
 import { POST_SELECT, loadPosts, attachOriginals, loadPostsByIds } from "../lib/load-posts";
 import { resolveAvatarUrl } from "../lib/avatar";
-import { attachCommentPreviews, formatCommentUser } from "../lib/comment-previews";
+import { attachCommentPreviews, formatCommentRow, formatCommentUser } from "../lib/comment-previews";
 import { halfLineSnippet } from "../lib/moment-preview";
 import { getDeletionHiddenUserIds } from "../lib/account-deletion";
 import { fetchNewestMomentBatch } from "../lib/moment-feed";
@@ -36,9 +36,34 @@ import {
 } from "../lib/moment-visibility";
 import { viewLimiter } from "../lib/rate-limit";
 import { isSupabaseCircuitOpen } from "../lib/supabase-circuit";
+import {
+  assertVerifiedForPoll,
+  attachPollsToPosts,
+  castPollVote,
+  createPollForPost,
+  normalizePollPayload,
+} from "../lib/polls";
+import {
+  commentLocationColumns,
+  parseIncomingLocation,
+  postLocationColumns,
+} from "../lib/content-location";
 import type { HonoVariables } from "../types";
 
 const postsRouter = new Hono<{ Variables: HonoVariables }>();
+
+const COMMENT_LIST_SELECT =
+  "id, post_id, user_id, content, created_at, location_label, location_city, location_region, location_country, location_precision, location_captured_at, location_shared, profiles:user_id(id, full_name, username, avatar_url, gender, is_verified)";
+const COMMENT_LIST_SELECT_LEGACY =
+  "id, post_id, user_id, content, created_at, profiles:user_id(id, full_name, username, avatar_url, gender, is_verified)";
+
+async function withPolls(posts: any[], viewerId?: string): Promise<void> {
+  try {
+    await attachPollsToPosts(posts, viewerId);
+  } catch (e) {
+    console.warn("[polls] attach failed:", e instanceof Error ? e.message : e);
+  }
+}
 
 // The set of authors who have privately starred `viewerId` as a close friend.
 // Read with the admin client because RLS restricts `close_friends` rows to their
@@ -168,6 +193,7 @@ postsRouter.get("/", async (c) => {
 
   // Latest preview comment per moment in one batched query (before formatPost).
   await attachCommentPreviews(ordered, userId ?? undefined, blockedIds);
+  await withPolls(ordered, userId ?? undefined);
   if (userId && ordered.some((p) => p?.original)) {
     // Reuse the friends / close-friends / blocks / deletion sets already loaded above
     // instead of re-querying all four (identical data, same request).
@@ -328,6 +354,7 @@ postsRouter.get("/hashtag/:tag", async (c) => {
       : null;
 
   await attachCommentPreviews(page, userId ?? undefined, blockedIds);
+  await withPolls(page, userId ?? undefined);
 
   const formatted = page.map((p) => formatPost(p, userId ?? undefined, blockedIds));
   await refreshReactionActors(formatted);
@@ -482,6 +509,7 @@ async function handleInteractedMoments(c: any) {
   await attachOriginals(userClient, orderedPosts);
 
   await attachCommentPreviews(orderedPosts, userId, blockedIds);
+  await withPolls(orderedPosts, userId);
 
   const formatted = orderedPosts.map((p: any) => formatPost(p, userId, blockedIds));
   await refreshReactionActors(formatted);
@@ -545,6 +573,7 @@ postsRouter.get("/:id", async (c) => {
 
   // Same preview selection as the feed (viewer-priority).
   await attachCommentPreviews([post], userId, blockedIds);
+  await withPolls([post], userId);
   scrubInvisibleOriginals([post], userId, visCtx);
   const formatted = formatPost(post, userId, blockedIds);
   await refreshReactionActors([formatted]);
@@ -691,6 +720,23 @@ postsRouter.post("/", async (c) => {
     return c.json({ data: formatted }, 201);
   }
 
+  // Optional poll — verified accounts only (enforced server-side).
+  const wantsPoll = body.poll != null && typeof body.poll === "object";
+  let normalizedPoll: { question: string; options: string[] } | null = null;
+  if (wantsPoll) {
+    const gate = await assertVerifiedForPoll(userId);
+    if (!gate.ok) {
+      return c.json({ error: { message: gate.message } }, gate.status);
+    }
+    const parsed = normalizePollPayload(body.poll);
+    if (!parsed.ok) {
+      return c.json({ error: { message: parsed.message } }, 400);
+    }
+    normalizedPoll = { question: parsed.question, options: parsed.options };
+  }
+
+  // Optional structured location (explicit share). Legacy locationName/Lat/Lng still work.
+  const structuredLoc = parseIncomingLocation(body.location ?? body.contentLocation);
   const insertData: Record<string, any> = {
     user_id: userId,
     type: body.type,
@@ -712,7 +758,14 @@ postsRouter.post("/", async (c) => {
     // sleep_duration is an INTEGER (minutes) column; the client sends "8h 30m".
     // Parse to minutes here so the Awake moment actually inserts.
     sleep_duration: parseDurationToMinutes(body.sleepDuration),
+    ...postLocationColumns(structuredLoc),
   };
+  // Prefer explicit legacy fields when structured location was not sent.
+  if (!structuredLoc) {
+    if (body.locationName) insertData.location = body.locationName;
+    if (body.locationLat != null) insertData.location_lat = body.locationLat;
+    if (body.locationLng != null) insertData.location_lng = body.locationLng;
+  }
   // Audience ("Close Friends" etc.): only set when the client explicitly sends a
   // non-default value, so normal posting still works if the column doesn't exist
   // yet. 'close' delivers only to the author's starred close friends (enforced in
@@ -731,19 +784,32 @@ postsRouter.post("/", async (c) => {
     .select(POST_SELECT)
     .single();
 
-  // If an optional column (audience / comments_disabled) hasn't been added yet,
-  // don't fail the post — strip the optional fields and retry so the moment
-  // still publishes (audience behaves as "friends", comments stay enabled).
+  // If an optional column (audience / comments_disabled / location_*) hasn't been
+  // added yet, don't fail the post — strip optional fields and retry.
   if (
     error &&
-    ("audience" in insertData || "comments_disabled" in insertData) &&
-    /audience|comments_disabled|column/i.test(error.message ?? "")
+    ("audience" in insertData ||
+      "comments_disabled" in insertData ||
+      "location_city" in insertData ||
+      "location_shared" in insertData) &&
+    /audience|comments_disabled|location_|column/i.test(error.message ?? "")
   ) {
     console.error(
-      "[posts] optional column missing on create — run migrations/012_posts_audience_comments_disabled.sql:",
+      "[posts] optional column missing on create — run pending migrations:",
       error.message
     );
-    const { audience: _a, comments_disabled: _cd, ...withoutOptional } = insertData;
+    const {
+      audience: _a,
+      comments_disabled: _cd,
+      location_city: _lc,
+      location_region: _lr,
+      location_country: _lco,
+      location_accuracy_m: _la,
+      location_precision: _lp,
+      location_captured_at: _lca,
+      location_shared: _ls,
+      ...withoutOptional
+    } = insertData;
     ({ data: post, error } = await userClient
       .from("posts")
       .insert(withoutOptional)
@@ -818,7 +884,63 @@ postsRouter.post("/", async (c) => {
     postId: post.id,
   });
 
+  if (normalizedPoll && post?.id) {
+    const created = await createPollForPost({
+      postId: post.id,
+      userId,
+      question: normalizedPoll.question,
+      options: normalizedPoll.options,
+    });
+    if ("error" in created) {
+      // Moment already published — surface poll failure without rolling back the Moment
+      // (preserves existing clients). Client can retry poll attachment in a future release.
+      console.error("[polls] create after post failed:", created.error);
+      return c.json(
+        { error: { message: "Moment created but poll could not be attached" } },
+        500
+      );
+    }
+    await withPolls([post], userId);
+  }
+
   return c.json({ data: formatPost(post, userId) }, 201);
+});
+
+/** POST /api/posts/:id/poll/vote — single-choice vote (auth + visibility). */
+postsRouter.post("/:id/poll/vote", async (c) => {
+  const userId = c.get("userId");
+  if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const { id } = c.req.param();
+  const body = await c.req.json().catch(() => ({}));
+  const optionId = typeof body?.optionId === "string" ? body.optionId.trim() : "";
+  if (!optionId) return c.json({ error: { message: "optionId is required" } }, 400);
+
+  const { data: post } = await supabaseAdmin
+    .from("posts")
+    .select("id, user_id, audience")
+    .eq("id", id)
+    .maybeSingle();
+  if (!post || !(await viewerCanAccessMoment(userId, post))) {
+    return c.json({ error: { message: "Post not found" } }, 404);
+  }
+
+  const { data: poll } = await supabaseAdmin
+    .from("polls")
+    .select("id")
+    .eq("post_id", id)
+    .maybeSingle();
+  if (!poll) return c.json({ error: { message: "Poll not found" } }, 404);
+
+  const result = await castPollVote({
+    pollId: poll.id,
+    optionId,
+    userId,
+  });
+  if ("error" in result) {
+    return c.json({ error: { message: result.error } }, result.status as 400 | 404 | 500);
+  }
+  return c.json({ data: result.poll });
 });
 
 postsRouter.patch("/:id", async (c) => {
@@ -845,9 +967,24 @@ postsRouter.patch("/:id", async (c) => {
   if ("content" in body) updateData.content = body.content || null;
   if ("image" in body || "images" in body) updateData.image_url = encodeImages(body.images, body.image);
   // Location (check-in): allow adding, changing, or clearing (null) on edit.
+  // Never invent location from another user/Moment — only apply fields the owner sends.
   if ("locationName" in body) updateData.location = body.locationName || null;
   if ("locationLat" in body) updateData.location_lat = body.locationLat ?? null;
   if ("locationLng" in body) updateData.location_lng = body.locationLng ?? null;
+  const editLoc = parseIncomingLocation(body.location ?? body.contentLocation);
+  if (editLoc) Object.assign(updateData, postLocationColumns(editLoc));
+  if (body.clearLocation === true) {
+    updateData.location = null;
+    updateData.location_lat = null;
+    updateData.location_lng = null;
+    updateData.location_city = null;
+    updateData.location_region = null;
+    updateData.location_country = null;
+    updateData.location_accuracy_m = null;
+    updateData.location_precision = null;
+    updateData.location_captured_at = null;
+    updateData.location_shared = false;
+  }
   // Audience: same delivery-scope values as create. Default missing/empty to
   // "friends" so we never write null into the column.
   if ("audience" in body) updateData.audience = body.audience || "friends";
@@ -1095,15 +1232,22 @@ postsRouter.get("/:id/reactors", async (c) => {
       ? `${last.created_at}|${last.user_id}`
       : null;
 
-  // Best-effort public reactor count for +N chips (may include blocked rows).
+  // Unique public reactors for +N chips (exclude locked; subtract blocked when possible).
   let total: number | undefined;
   try {
-    const { count } = await supabaseAdmin
+    const { data: allPublic } = await supabaseAdmin
       .from("reactions")
-      .select("user_id", { count: "exact", head: true })
+      .select("user_id, type")
       .eq("post_id", id)
       .not("type", "like", "locked:%");
-    if (typeof count === "number") total = count;
+    const unique = new Set<string>();
+    for (const r of allPublic ?? []) {
+      const uid = String(r.user_id ?? "");
+      if (!uid || blockedSet.has(uid)) continue;
+      if (isReactionLocked(r.type)) continue;
+      unique.add(uid);
+    }
+    total = unique.size;
   } catch {
     /* optional */
   }
@@ -1478,7 +1622,7 @@ postsRouter.get("/:id/comments", async (c) => {
   // Newest-first fetch (limit+1), then reverse to ascending for display.
   let commentsQuery = supabaseAdmin
     .from("comments")
-    .select("id, post_id, user_id, content, created_at, profiles:user_id(id, full_name, username, avatar_url, gender, is_verified)")
+    .select(COMMENT_LIST_SELECT)
     .eq("post_id", id)
     .order("created_at", { ascending: false })
     .limit(limit + 1);
@@ -1486,7 +1630,19 @@ postsRouter.get("/:id/comments", async (c) => {
     commentsQuery = commentsQuery.lte("created_at", beforeCursor.createdAt);
   }
 
-  const { data: commentsNewestFirst, error } = await commentsQuery;
+  let { data: commentsNewestFirst, error } = await commentsQuery;
+  if (error && /location_|column/i.test(error.message ?? "")) {
+    commentsQuery = supabaseAdmin
+      .from("comments")
+      .select(COMMENT_LIST_SELECT_LEGACY)
+      .eq("post_id", id)
+      .order("created_at", { ascending: false })
+      .limit(limit + 1);
+    if (beforeCursor?.createdAt) {
+      commentsQuery = commentsQuery.lte("created_at", beforeCursor.createdAt);
+    }
+    ({ data: commentsNewestFirst, error } = await commentsQuery);
+  }
 
   if (error) {
     console.error("Get comments error:", error);
@@ -1541,14 +1697,7 @@ postsRouter.get("/:id/comments", async (c) => {
       ? encodeCursor(String(oldest.created_at), String(oldest.id))
       : null;
 
-  const formatted = page.map((comment: any) => ({
-    id: comment.id,
-    postId: comment.post_id,
-    userId: comment.user_id,
-    content: comment.content,
-    createdAt: comment.created_at,
-    user: formatCommentUser(comment.user_id, comment.profiles),
-  }));
+  const formatted = page.map((comment: any) => formatCommentRow(comment));
 
   return c.json({ data: formatted, nextCursor, hasMore, limit });
 });
@@ -1579,11 +1728,32 @@ postsRouter.post("/:id/comments", async (c) => {
     return c.json({ error: { message: "Comments are turned off for this moment" } }, 403);
   }
 
-  const { data: comment, error } = await supabaseAdmin
+  // Comment location is independent of the Moment's location — never copy it.
+  const commentLoc = parseIncomingLocation(body.location ?? body.contentLocation);
+  const insertRow: Record<string, unknown> = {
+    id: crypto.randomUUID(),
+    post_id: id,
+    user_id: userId,
+    content,
+    ...commentLocationColumns(commentLoc),
+  };
+
+  let { data: comment, error } = await supabaseAdmin
     .from("comments")
-    .insert({ id: crypto.randomUUID(), post_id: id, user_id: userId, content })
-    .select("id, post_id, user_id, content, created_at")
+    .insert(insertRow)
+    .select(
+      "id, post_id, user_id, content, created_at, location_label, location_city, location_region, location_country, location_precision, location_captured_at, location_shared"
+    )
     .single();
+
+  // If location columns are not migrated yet, still publish the comment.
+  if (error && /location_|column/i.test(error.message ?? "")) {
+    ({ data: comment, error } = await supabaseAdmin
+      .from("comments")
+      .insert({ id: insertRow.id, post_id: id, user_id: userId, content })
+      .select("id, post_id, user_id, content, created_at")
+      .single());
+  }
 
   if (error || !comment) {
     console.error("Create comment error:", error);
@@ -1592,19 +1762,16 @@ postsRouter.post("/:id/comments", async (c) => {
 
   // Respond immediately with the created comment. Count bump, notifications,
   // push, and mentions run after the response so the mobile UI feels instant.
-  const formatted = {
-    id: comment.id,
-    postId: comment.post_id,
-    userId: comment.user_id,
-    content: comment.content,
-    createdAt: comment.created_at,
-    user: formatCommentUser(userId, {
+  const formatted = formatCommentRow({
+    ...comment,
+    profiles: {
       full_name: user.full_name,
       username: user.username,
       avatar_url: user.avatar_url,
       gender: user.gender,
-    }),
-  };
+      is_verified: user.is_verified,
+    },
+  });
 
   void (async () => {
     try {
