@@ -160,7 +160,7 @@ postsRouter.get("/", async (c) => {
     ordered = await loadPostsByIds(walked.page.map((p) => p.id), {
       hydrateReactions: false,
     });
-    await attachOriginals(userClient, ordered);
+    await attachOriginals(userClient, ordered, { hydrateReactions: false });
   } catch (e) {
     console.error("[posts] feed hydrate failed:", e instanceof Error ? e.message : e);
     return c.json({ error: { message: "Failed to load moments" } }, 500);
@@ -941,6 +941,176 @@ postsRouter.delete("/:id", async (c) => {
   return c.json({ data: null });
 });
 
+/**
+ * GET /api/posts/:id/reactors — paginated unique public reactors (newest first).
+ * Distinct from POST /:id/reactions (toggle). Auth + visibility + blocks enforced.
+ * Query: ?limit=&cursor=  where cursor is `${createdAt}|${userId}`.
+ */
+postsRouter.get("/:id/reactors", async (c) => {
+  const userId = c.get("userId");
+  if (!userId) return c.json({ error: { message: "Unauthorized" } }, 401);
+
+  const { id } = c.req.param();
+  const limitRaw = Number(c.req.query("limit") ?? 40);
+  const limit = Math.min(Math.max(Number.isFinite(limitRaw) ? Math.floor(limitRaw) : 40, 1), 80);
+  const cursorRaw = String(c.req.query("cursor") ?? "").trim();
+
+  const { data: post } = await supabaseAdmin
+    .from("posts")
+    .select("id, user_id, audience")
+    .eq("id", id)
+    .maybeSingle();
+  if (!post || !(await viewerCanAccessMoment(userId, post))) {
+    return c.json({ error: { message: "Post not found" } }, 404);
+  }
+
+  const blockedIds = await getBlockedIds(userId);
+  const blockedSet = new Set(blockedIds);
+
+  let cursorCreatedAt: string | null = null;
+  let cursorUserId: string | null = null;
+  if (cursorRaw.includes("|")) {
+    const [ts, uid] = cursorRaw.split("|");
+    if (ts && uid) {
+      cursorCreatedAt = ts;
+      cursorUserId = uid;
+    }
+  }
+
+  // Over-fetch so locked / blocked / duplicate rows can be filtered while still
+  // returning a full page of unique public reactors.
+  const fetchSize = Math.min(limit * 4, 200);
+  let q = supabaseAdmin
+    .from("reactions")
+    .select("user_id, type, created_at")
+    .eq("post_id", id)
+    .order("created_at", { ascending: false })
+    .order("user_id", { ascending: false })
+    .limit(fetchSize);
+
+  if (cursorCreatedAt) {
+    // Strictly older than the cursor timestamp (newest-first page).
+    q = q.lt("created_at", cursorCreatedAt);
+  }
+
+  let { data: rows, error } = await q;
+  if (error && /created_at|column/i.test(error.message ?? "")) {
+    // Older schemas without reactions.created_at — return a single unpaginated page.
+    const fallback = await supabaseAdmin
+      .from("reactions")
+      .select("user_id, type")
+      .eq("post_id", id)
+      .limit(fetchSize);
+    rows = (fallback.data ?? []).map((r: any) => ({ ...r, created_at: null }));
+    error = fallback.error;
+  }
+  if (error) {
+    console.error("[posts/reactors] query failed:", error.message);
+    return c.json({ error: { message: "Failed to load reactors" } }, 500);
+  }
+
+  const seen = new Set<string>();
+  const filtered: any[] = [];
+  for (const r of rows ?? []) {
+    const uid = String(r.user_id ?? "");
+    if (!uid || seen.has(uid) || blockedSet.has(uid)) continue;
+    if (isReactionLocked(r.type)) continue; // public list only
+    // Tie-break when timestamps collide with the cursor user.
+    if (
+      cursorCreatedAt &&
+      cursorUserId &&
+      r.created_at === cursorCreatedAt &&
+      String(uid) >= cursorUserId
+    ) {
+      continue;
+    }
+    seen.add(uid);
+    filtered.push(r);
+    if (filtered.length >= limit + 1) break;
+  }
+
+  // If the first window was mostly locked/blocked, one more page deeper.
+  if (filtered.length < limit + 1 && (rows?.length ?? 0) >= fetchSize) {
+    const last = rows![rows!.length - 1];
+    if (last?.created_at) {
+      const more = await supabaseAdmin
+        .from("reactions")
+        .select("user_id, type, created_at")
+        .eq("post_id", id)
+        .lt("created_at", last.created_at)
+        .order("created_at", { ascending: false })
+        .order("user_id", { ascending: false })
+        .limit(fetchSize);
+      for (const r of more.data ?? []) {
+        const uid = String(r.user_id ?? "");
+        if (!uid || seen.has(uid) || blockedSet.has(uid)) continue;
+        if (isReactionLocked(r.type)) continue;
+        seen.add(uid);
+        filtered.push(r);
+        if (filtered.length >= limit + 1) break;
+      }
+    }
+  }
+
+  const hasMore = filtered.length > limit;
+  const page = hasMore ? filtered.slice(0, limit) : filtered;
+
+  const profileIds = page.map((r) => r.user_id as string);
+  const byId: Record<string, any> = {};
+  if (profileIds.length > 0) {
+    let { data: profiles, error: profileErr } = await supabaseAdmin
+      .from("profiles")
+      .select("id, full_name, username, avatar_url, gender, is_verified")
+      .in("id", profileIds);
+    if (profileErr && /is_verified|column/i.test(profileErr.message ?? "")) {
+      const fallback = await supabaseAdmin
+        .from("profiles")
+        .select("id, full_name, username, avatar_url, gender")
+        .in("id", profileIds);
+      profiles = fallback.data;
+    }
+    for (const p of profiles ?? []) byId[p.id] = p;
+  }
+
+  const data = page.map((r) => {
+    const profile = byId[r.user_id];
+    const username = String(profile?.username ?? "").trim() || null;
+    const fullName = String(profile?.full_name ?? "").trim();
+    const name = fullName || username || "Member";
+    return {
+      userId: r.user_id,
+      name,
+      username,
+      avatar: resolveAvatarUrl(r.user_id, profile?.avatar_url, profile?.gender),
+      verified: profile?.is_verified === true,
+      reaction: baseReactionType(r.type),
+      type: baseReactionType(r.type),
+      createdAt: r.created_at ?? null,
+    };
+  });
+
+  const last = page[page.length - 1];
+  const nextCursor =
+    hasMore && last?.created_at && last?.user_id
+      ? `${last.created_at}|${last.user_id}`
+      : null;
+
+  // Best-effort public reactor count for +N chips (may include blocked rows).
+  let total: number | undefined;
+  try {
+    const { count } = await supabaseAdmin
+      .from("reactions")
+      .select("user_id", { count: "exact", head: true })
+      .eq("post_id", id)
+      .not("type", "like", "locked:%");
+    if (typeof count === "number") total = count;
+  } catch {
+    /* optional */
+  }
+
+  return c.json({ data, nextCursor, hasMore, ...(total !== undefined ? { total } : {}) });
+});
+
 postsRouter.post("/:id/reactions", async (c) => {
   const user = c.get("user");
   const userId = c.get("userId");
@@ -1386,18 +1556,20 @@ postsRouter.get("/:id/comments", async (c) => {
 postsRouter.post("/:id/comments", async (c) => {
   const user = c.get("user");
   const userId = c.get("userId");
-  const token = c.get("accessToken");
-  if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
+  if (!user || !userId) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const { id } = c.req.param();
   const body = await c.req.json();
-  const userClient = createUserClient(token);
+  const content = typeof body?.content === "string" ? body.content.trim() : "";
+  if (!content) {
+    return c.json({ error: { message: "Comment text is required" } }, 400);
+  }
 
   // Block commenting when the moment's author turned comments off.
   // Service role so RLS can't hide the comments_disabled flag.
   const { data: targetPost } = await supabaseAdmin
     .from("posts")
-    .select("id, comments_disabled, user_id, audience")
+    .select("id, comments_disabled, user_id, audience, content, comment_count")
     .eq("id", id)
     .maybeSingle();
   if (!targetPost || !(await viewerCanAccessMoment(userId, targetPost))) {
@@ -1409,7 +1581,7 @@ postsRouter.post("/:id/comments", async (c) => {
 
   const { data: comment, error } = await supabaseAdmin
     .from("comments")
-    .insert({ id: crypto.randomUUID(), post_id: id, user_id: userId, content: body.content })
+    .insert({ id: crypto.randomUUID(), post_id: id, user_id: userId, content })
     .select("id, post_id, user_id, content, created_at")
     .single();
 
@@ -1418,38 +1590,40 @@ postsRouter.post("/:id/comments", async (c) => {
     return c.json({ error: { message: "Failed to create comment" } }, 500);
   }
 
-  // Service role: post owners' RLS would otherwise silently block commenters
-  // from bumping comment_count, leaving feed previews empty forever.
-  const { data: postData } = await supabaseAdmin
-    .from("posts")
-    .select("comment_count, user_id, content")
-    .eq("id", id)
-    .single();
+  // Respond immediately with the created comment. Count bump, notifications,
+  // push, and mentions run after the response so the mobile UI feels instant.
+  const formatted = {
+    id: comment.id,
+    postId: comment.post_id,
+    userId: comment.user_id,
+    content: comment.content,
+    createdAt: comment.created_at,
+    user: formatCommentUser(userId, {
+      full_name: user.full_name,
+      username: user.username,
+      avatar_url: user.avatar_url,
+      gender: user.gender,
+    }),
+  };
 
-  if (postData) {
-    await supabaseAdmin
-      .from("posts")
-      .update({ comment_count: (postData.comment_count ?? 0) + 1 })
-      .eq("id", id);
-  }
+  void (async () => {
+    try {
+      await supabaseAdmin
+        .from("posts")
+        .update({ comment_count: (targetPost.comment_count ?? 0) + 1 })
+        .eq("id", id);
+    } catch (e) {
+      console.error("[comments] count bump error:", e);
+    }
 
-  const { data: profile } = await supabaseAdmin
-    .from("profiles")
-    .select("id, full_name, username, avatar_url, gender")
-    .eq("id", userId)
-    .single();
-
-  // Notify the post owner (activity feed + push), never about their own comment.
-  try {
-    const postOwner = postData;
-    if (postOwner && postOwner.user_id !== userId) {
-      const snippet = halfLineSnippet((postOwner as { content?: string | null }).content);
-      let inserted: { id: string } | null = null;
-      {
+    try {
+      if (targetPost.user_id !== userId) {
+        const snippet = halfLineSnippet(targetPost.content);
+        let inserted: { id: string } | null = null;
         const withComment = await supabaseAdmin
           .from("notifications")
           .insert({
-            user_id: postOwner.user_id,
+            user_id: targetPost.user_id,
             from_user_id: userId,
             type: "comment",
             message: "commented on your moment",
@@ -1460,11 +1634,10 @@ postsRouter.post("/:id/comments", async (c) => {
           .select("id")
           .single();
         if (withComment.error && /comment_id|column/i.test(withComment.error.message ?? "")) {
-          // Column not migrated yet — still notify without deep-link id.
           const fallback = await supabaseAdmin
             .from("notifications")
             .insert({
-              user_id: postOwner.user_id,
+              user_id: targetPost.user_id,
               from_user_id: userId,
               type: "comment",
               message: "commented on your moment",
@@ -1477,44 +1650,35 @@ postsRouter.post("/:id/comments", async (c) => {
         } else {
           inserted = withComment.data;
         }
+
+        void sendPushToUser(
+          supabaseAdmin,
+          targetPost.user_id,
+          "New Comment",
+          snippet
+            ? `${user.full_name} commented on your Moment ${snippet}`
+            : `${user.full_name} commented on your Moment`,
+          {
+            postId: id,
+            commentId: comment.id,
+            type: "comment",
+            fromUserId: userId,
+            notificationId: inserted?.id,
+          }
+        );
       }
-
-      void sendPushToUser(
-        supabaseAdmin,
-        postOwner.user_id,
-        "New Comment",
-        snippet
-          ? `${user.full_name} commented on your Moment ${snippet}`
-          : `${user.full_name} commented on your Moment`,
-        {
-          postId: id,
-          commentId: comment.id,
-          type: "comment",
-          fromUserId: userId,
-          notificationId: inserted?.id,
-        }
-      );
+    } catch (e) {
+      console.error("[notifications] comment insert error:", e);
     }
-  } catch (e) {
-    console.error("[notifications] comment insert error:", e);
-  }
 
-  const formatted = {
-    id: comment.id,
-    postId: comment.post_id,
-    userId: comment.user_id,
-    content: comment.content,
-    createdAt: comment.created_at,
-    user: formatCommentUser(userId, profile),
-  };
-
-  // Mentions (resolve + push) — don't hold the comment response.
-  void notifyMentions({
-    authorId: userId,
-    authorName: user.full_name,
-    content: comment.content,
-    postId: id,
-  });
+    void notifyMentions({
+      authorId: userId,
+      authorName: user.full_name,
+      content: comment.content,
+      postId: id,
+      commentId: comment.id,
+    });
+  })();
 
   return c.json({ data: formatted }, 201);
 });

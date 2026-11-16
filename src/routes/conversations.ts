@@ -499,6 +499,25 @@ conversationsRouter.get("/", async (c) => {
         lastMsgByConv[m.conversation_id] = m;
       }
     }
+    // Quiet threads can fall outside the global newest-N window — fill gaps.
+    {
+      const missing = visibleIds.filter((id: string) => !lastMsgByConv[id]);
+      const chunkSize = 20;
+      for (let i = 0; i < missing.length; i += chunkSize) {
+        const chunk = missing.slice(i, i + chunkSize);
+        await Promise.all(
+          chunk.map(async (id: string) => {
+            const { data } = await db
+              .from("messages")
+              .select("id, conversation_id, content, created_at, sender_id, type")
+              .eq("conversation_id", id)
+              .order("created_at", { ascending: false })
+              .limit(1);
+            if (data?.[0]) lastMsgByConv[id] = data[0];
+          })
+        );
+      }
+    }
 
     // Message Requests: friendship + inbound peer messages (no extra tables).
     const [friendshipByPeer, incomingByConv] = await Promise.all([
@@ -1488,7 +1507,7 @@ conversationsRouter.post("/start/:userId", async (c) => {
     const { data: targetProfile } = await db.from("profiles").select("*").eq("id", targetId).single();
     const { data: msgs } = await db
       .from("messages")
-      .select("content, text, created_at")
+      .select("content, text, created_at, type")
       .eq("conversation_id", existingConvId)
       .order("created_at", { ascending: false })
       .limit(1);
@@ -1496,7 +1515,9 @@ conversationsRouter.post("/start/:userId", async (c) => {
       data: {
         id: existingConvId,
         user: targetProfile ? formatProfile(targetProfile) : emptyUser(targetId),
-        lastMessage: msgs?.[0]?.content ?? msgs?.[0]?.text ?? "",
+        lastMessage: msgs?.[0]
+          ? messagePreview(msgs[0].type, msgs[0].content ?? msgs[0].text)
+          : "",
         lastMessageTime: conv?.updated_at ?? new Date().toISOString(),
         unreadCount: 0,
         messages: [],

@@ -1,5 +1,6 @@
 import { supabaseAdmin } from "../supabase";
-import { sendPushNotification, getPushToken } from "./push";
+import { sendPushToUser } from "./push";
+import { isBlocked } from "./blocks";
 
 // Matches @mention tokens: latin + accented + Arabic letters, digits, underscore.
 // Mirrors the client-side TOKEN_RE in mobile/src/components/RichText.tsx so the
@@ -48,26 +49,74 @@ async function resolveHandle(handle: string): Promise<{ id: string } | null> {
   );
 }
 
+/** true / false when known; null when the friendship lookup failed (allow notify). */
+async function areAcceptedFriends(a: string, b: string): Promise<boolean | null> {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("friendships")
+      .select("id")
+      .eq("status", "accepted")
+      .or(
+        `and(requester_id.eq.${a},receiver_id.eq.${b}),and(requester_id.eq.${b},receiver_id.eq.${a})`
+      )
+      .maybeSingle();
+    if (error) return null;
+    return !!data;
+  } catch {
+    return null;
+  }
+}
+
+async function persistMentionRow(opts: {
+  postId: string;
+  mentionedUserId: string;
+  mentionedBy: string;
+  commentId?: string;
+}): Promise<void> {
+  try {
+    const base = {
+      post_id: opts.postId,
+      mentioned_user_id: opts.mentionedUserId,
+      mentioned_by: opts.mentionedBy,
+    };
+    // Prefer comment-aware row when the column exists; ignore missing-table/column.
+    if (opts.commentId) {
+      const withComment = await supabaseAdmin.from("mentions").upsert(
+        { ...base, comment_id: opts.commentId },
+        { onConflict: "post_id,mentioned_user_id" }
+      );
+      if (!withComment.error) return;
+      if (!/comment_id|column|does not exist|relation|schema cache/i.test(withComment.error.message ?? "")) {
+        return;
+      }
+    }
+    await supabaseAdmin
+      .from("mentions")
+      .upsert(base, { onConflict: "post_id,mentioned_user_id" });
+  } catch {
+    // Mentions table is optional — never fail notifications on it.
+  }
+}
+
 /**
  * Notify every real, distinct user @mentioned in `content` that
  * `authorName` mentioned them. Creates a "mention" notification (driving the
- * bell badge) + a push, with `post_id` so tapping opens the moment/comment.
+ * bell badge) + a push, with `post_id` (and optional `comment_id`) so tapping
+ * opens the moment/comment.
  *
  * - Never notifies the author for mentioning themselves.
  * - Only notifies mentions that resolve to a real user.
- * - Does NOT filter by feed privacy: we still notify even for a moment the
- *   mentioned user can't access; tapping it goes through /post/:id, which is
- *   itself access-controlled, so a private moment stays inaccessible.
- *
- * Safe to call fire-and-forget — never throws.
+ * - Skips blocked relationships; prefers accepted friends (falls open if check fails).
+ * - Safe to call fire-and-forget — never throws.
  */
 export async function notifyMentions(opts: {
   authorId: string;
   authorName: string;
   content: string | null | undefined;
   postId: string;
+  commentId?: string;
 }): Promise<void> {
-  const { authorId, authorName, content, postId } = opts;
+  const { authorId, authorName, content, postId, commentId } = opts;
   try {
     const handles = extractMentions(content);
     if (handles.length === 0) return;
@@ -83,7 +132,33 @@ export async function notifyMentions(opts: {
     }
     if (targetIds.size === 0) return;
 
-    const rows = [...targetIds].map((uid) => ({
+    const allowedIds: string[] = [];
+    for (const uid of targetIds) {
+      try {
+        const blocked =
+          (await isBlocked(authorId, uid)) || (await isBlocked(uid, authorId));
+        if (blocked) continue;
+        const friends = await areAcceptedFriends(authorId, uid);
+        // Prefer friends-only; if friendship status is unknown, still notify
+        // (backward compatible / never throw).
+        if (friends === false) continue;
+        allowedIds.push(uid);
+      } catch {
+        allowedIds.push(uid);
+      }
+    }
+    if (allowedIds.length === 0) return;
+
+    for (const uid of allowedIds) {
+      void persistMentionRow({
+        postId,
+        mentionedUserId: uid,
+        mentionedBy: authorId,
+        commentId,
+      });
+    }
+
+    const baseRows = allowedIds.map((uid) => ({
       user_id: uid,
       from_user_id: authorId,
       type: "mention",
@@ -91,14 +166,43 @@ export async function notifyMentions(opts: {
       post_id: postId,
       read: false,
     }));
-    await supabaseAdmin.from("notifications").insert(rows);
 
-    for (const uid of targetIds) {
+    let insertedRows: Array<{ id: string; user_id: string }> | null = null;
+    if (commentId) {
+      const withComment = await supabaseAdmin
+        .from("notifications")
+        .insert(baseRows.map((r) => ({ ...r, comment_id: commentId })))
+        .select("id, user_id");
+      if (withComment.error && /comment_id|column/i.test(withComment.error.message ?? "")) {
+        const fallback = await supabaseAdmin
+          .from("notifications")
+          .insert(baseRows)
+          .select("id, user_id");
+        insertedRows = fallback.data;
+      } else {
+        insertedRows = withComment.data;
+      }
+    } else {
+      const { data } = await supabaseAdmin
+        .from("notifications")
+        .insert(baseRows)
+        .select("id, user_id");
+      insertedRows = data;
+    }
+
+    const insertedByUser = new Map<string, string>();
+    for (const row of insertedRows ?? []) {
+      insertedByUser.set(row.user_id, row.id);
+    }
+
+    for (const uid of allowedIds) {
       try {
-        const pushToken = await getPushToken(supabaseAdmin, uid);
-        await sendPushNotification(pushToken, "New Mention", `${authorName} mentioned you`, {
+        await sendPushToUser(supabaseAdmin, uid, "New Mention", `${authorName} mentioned you`, {
           postId,
+          ...(commentId ? { commentId } : {}),
           type: "mention",
+          fromUserId: authorId,
+          notificationId: insertedByUser.get(uid),
         });
       } catch (e) {
         console.error("[notifications] mention push error:", e);

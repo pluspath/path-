@@ -13,6 +13,7 @@ import { moderationRouter } from "./routes/moderation";
 import { authRouter } from "./routes/auth";
 import { configRouter } from "./routes/config";
 import { socialRouter } from "./routes/social";
+import { linkPreviewRouter } from "./routes/link-preview";
 import {
   contentRouter,
   registerMarketingPages,
@@ -333,6 +334,7 @@ app.get("/__marketing", (c) =>
         "CREATE INDEX IF NOT EXISTS idx_reactions_user ON public.reactions (user_id);",
         "CREATE INDEX IF NOT EXISTS idx_reactions_post ON public.reactions (post_id);",
         "CREATE INDEX IF NOT EXISTS idx_reactions_user_created ON public.reactions (user_id, created_at DESC);",
+        "CREATE INDEX IF NOT EXISTS idx_reactions_post_created ON public.reactions (post_id, created_at DESC);",
         "CREATE INDEX IF NOT EXISTS idx_comments_user ON public.comments (user_id);",
         "CREATE INDEX IF NOT EXISTS idx_comments_post ON public.comments (post_id);",
         "CREATE INDEX IF NOT EXISTS idx_comments_user_created ON public.comments (user_id, created_at DESC);",
@@ -429,6 +431,17 @@ SET comment_count = 0
 WHERE COALESCE(p.comment_count, 0) > 0
   AND NOT EXISTS (SELECT 1 FROM public.comments c WHERE c.post_id = p.id)`,
         "CREATE INDEX IF NOT EXISTS idx_comments_post_id_created_at_desc ON public.comments (post_id, created_at DESC)",
+        // Live mobile presence (admin online-users). Idempotent.
+        `CREATE TABLE IF NOT EXISTS public.user_presence (
+          user_id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+          last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          client TEXT NOT NULL DEFAULT 'mobile',
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )`,
+        "CREATE INDEX IF NOT EXISTS idx_user_presence_last_seen ON public.user_presence (last_seen_at DESC)",
+        "ALTER TABLE public.user_presence ENABLE ROW LEVEL SECURITY",
+        // Unread DM aggregate helper index
+        "CREATE INDEX IF NOT EXISTS idx_messages_conv_sender_created ON public.messages (conversation_id, sender_id, created_at DESC)",
       ];
       if (!skipBootDdl) {
         let schemaCacheBlocked = false;
@@ -644,7 +657,8 @@ app.use("*", async (c, next) => {
       const cached = getAuthProfileCache(token);
       if (cached) {
         // Never keep a suspended/deleted account live from a stale cache hit.
-        if (cached.profile?.status === "suspended") {
+        const cachedStatus = String(cached.profile?.status ?? "").toLowerCase();
+        if (cachedStatus === "suspended" || cachedStatus === "deleted") {
           authProfileCache.delete(token);
         } else {
           c.set("userId", cached.userId);
@@ -899,6 +913,7 @@ app.route("/api/conversations", conversationsRouter);
 app.route("/api/places", placesRouter);
 app.route("/api/upload", uploadRouter);
 app.route("/api/social", socialRouter);
+app.route("/api/link-preview", linkPreviewRouter);
 app.route("/api/admin", adminRouter);
 // Moderation (/api/reports, /api/blocks) must be mounted BEFORE usersRouter so
 // its concrete paths aren't captured by usersRouter's "/:id".
