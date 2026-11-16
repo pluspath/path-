@@ -65,6 +65,23 @@ async function withPolls(posts: any[], viewerId?: string): Promise<void> {
   }
 }
 
+/** Copy poll payloads onto formatted API objects (formatPost may omit unknown fields). */
+function copyPollsToFormatted(rawPosts: any[], formatted: any[]): void {
+  const byId = new Map<string, any>();
+  for (const p of rawPosts ?? []) {
+    if (p?.id && p.poll) byId.set(String(p.id), p.poll);
+    if (p?.original?.id && p.original.poll) byId.set(String(p.original.id), p.original.poll);
+  }
+  for (const f of formatted ?? []) {
+    const poll = byId.get(String(f?.id ?? ""));
+    if (poll) f.poll = poll;
+    if (f?.original) {
+      const op = byId.get(String(f.original.id ?? ""));
+      if (op) f.original.poll = op;
+    }
+  }
+}
+
 // The set of authors who have privately starred `viewerId` as a close friend.
 // Read with the admin client because RLS restricts `close_friends` rows to their
 // owner. Used to deliver audience='close' moments only to the author's starred
@@ -206,6 +223,7 @@ postsRouter.get("/", async (c) => {
   }
 
   const formatted = ordered.map((p) => formatPost(p, userId ?? undefined, blockedIds));
+  copyPollsToFormatted(ordered, formatted);
   // Independent profile lookups — run together instead of back to back.
   await Promise.all([
     refreshFriendshipAvatars(formatted), // always show friends' CURRENT avatars
@@ -357,6 +375,7 @@ postsRouter.get("/hashtag/:tag", async (c) => {
   await withPolls(page, userId ?? undefined);
 
   const formatted = page.map((p) => formatPost(p, userId ?? undefined, blockedIds));
+  copyPollsToFormatted(page, formatted);
   await refreshReactionActors(formatted);
   return c.json({
     data: formatted,
@@ -512,6 +531,7 @@ async function handleInteractedMoments(c: any) {
   await withPolls(orderedPosts, userId);
 
   const formatted = orderedPosts.map((p: any) => formatPost(p, userId, blockedIds));
+  copyPollsToFormatted(orderedPosts, formatted);
   await refreshReactionActors(formatted);
   if (paged) {
     return c.json({
@@ -576,6 +596,7 @@ postsRouter.get("/:id", async (c) => {
   await withPolls([post], userId);
   scrubInvisibleOriginals([post], userId, visCtx);
   const formatted = formatPost(post, userId, blockedIds);
+  copyPollsToFormatted([post], [formatted]);
   await refreshReactionActors([formatted]);
   return c.json({ data: formatted });
 });
@@ -903,7 +924,9 @@ postsRouter.post("/", async (c) => {
     await withPolls([post], userId);
   }
 
-  return c.json({ data: formatPost(post, userId) }, 201);
+  const createdFormatted = formatPost(post, userId);
+  copyPollsToFormatted([post], [createdFormatted]);
+  return c.json({ data: createdFormatted }, 201);
 });
 
 /** POST /api/posts/:id/poll/vote — single-choice vote (auth + visibility). */
