@@ -319,8 +319,13 @@ export default function ReportDetailPage() {
                   <p className="text-xs text-slate-500 break-all">{comment.id}</p>
                   <p className="whitespace-pre-wrap text-sm">{comment.content}</p>
                   <p className="text-xs text-slate-500">{formatDate(comment.created_at)}</p>
-                  {hasPermission("comments:delete") ? (
-                    <Button size="sm" variant="destructive" disabled={busy} onClick={() => void deleteComment(comment.id)}>
+                  {hasPermission("comments:delete") && comment.id ? (
+                    <Button
+                      size="sm"
+                      variant="destructive"
+                      disabled={busy}
+                      onClick={() => void deleteComment(comment.id!)}
+                    >
                       Delete comment
                     </Button>
                   ) : null}
