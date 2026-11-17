@@ -27,6 +27,17 @@ function acceptPrivate(
   return visibility.friendIds.has(post.user_id);
 }
 
+/** Mirrors GET /api/posts?mode=starred accept rules (non-base checks). */
+function acceptStarred(
+  viewerId: string,
+  post: { user_id: string; audience?: string | null },
+  myStarredIds: Set<string>,
+  visibility: MomentVisibilityContext,
+): boolean {
+  if (!myStarredIds.has(post.user_id)) return false;
+  return canViewerSeeMoment(viewerId, post, visibility);
+}
+
 describe("home feed mode rules", () => {
   test("public mode only includes audience=public", () => {
     expect(normalizeAudience("public")).toBe("public");
@@ -41,6 +52,29 @@ describe("home feed mode rules", () => {
     expect(acceptPrivate("me", { user_id: "closer", audience: "close" }, visibility)).toBe(true);
     expect(acceptPrivate("me", { user_id: "me", audience: "friends" }, visibility)).toBe(true);
     expect(acceptPrivate("me", { user_id: "me", audience: "public" }, visibility)).toBe(false);
+  });
+
+  test("starred mode only includes moments from starred publishers", () => {
+    const starred = new Set(["starred"]);
+    const visibility = ctx({ friendIds: new Set(["starred", "friend"]) });
+    expect(acceptStarred("me", { user_id: "starred", audience: "public" }, starred, visibility)).toBe(true);
+    expect(acceptStarred("me", { user_id: "friend", audience: "public" }, starred, visibility)).toBe(false);
+    expect(acceptStarred("me", { user_id: "me", audience: "public" }, starred, visibility)).toBe(false);
+  });
+
+  test("starred mode never bypasses friends-only or close privacy", () => {
+    const starred = new Set(["starred"]);
+    const visibility = ctx();
+    expect(acceptStarred("me", { user_id: "starred", audience: "friends" }, starred, visibility)).toBe(false);
+    expect(acceptStarred("me", { user_id: "starred", audience: "close" }, starred, visibility)).toBe(false);
+    expect(acceptStarred("me", { user_id: "starred", audience: "private" }, starred, visibility)).toBe(false);
+
+    visibility.friendIds.add("starred");
+    expect(acceptStarred("me", { user_id: "starred", audience: "friends" }, starred, visibility)).toBe(true);
+    expect(acceptStarred("me", { user_id: "starred", audience: "close" }, starred, visibility)).toBe(false);
+
+    visibility.closeAuthorIds.add("starred");
+    expect(acceptStarred("me", { user_id: "starred", audience: "close" }, starred, visibility)).toBe(true);
   });
 
   test("pending non-friend cannot see friends-only", () => {

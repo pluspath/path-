@@ -12,6 +12,7 @@ REMOTE = "/root/path-/backend"
 FILES = [
     "src/routes/posts.ts",
     "src/lib/moment-visibility.ts",
+    "src/lib/moment-visibility.test.ts",
     "src/lib/feed-mode.test.ts",
 ]
 
@@ -71,10 +72,13 @@ def main() -> int:
         client.close()
         return 1
 
-    code, out, err = run(
-        "curl -sS -m 10 -o /tmp/feed-unauth.txt -w '%{http_code}' 'https://api.pathplus.store/api/posts?mode=private&limit=1'; echo; head -c 160 /tmp/feed-unauth.txt; echo"
-    )
-    print("unauth_private", out.strip())
+    for mode in ("public", "private", "starred"):
+        code, out, err = run(
+            "curl -sS -m 10 -o /tmp/feed-unauth.txt -w '%{http_code}' "
+            f"'https://api.pathplus.store/api/posts?mode={mode}&limit=1'; echo; "
+            "head -c 160 /tmp/feed-unauth.txt; echo"
+        )
+        print(f"unauth_{mode}", out.strip())
     client.close()
     print("DEPLOY_DONE", 0)
     return 0

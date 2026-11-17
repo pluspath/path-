@@ -175,6 +175,27 @@ async function getWhoStarredMe(viewerId: string): Promise<Set<string>> {
   }
 }
 
+/** People the viewer has privately starred (close_friends owned by viewer). */
+async function getMyStarredIds(viewerId: string): Promise<Set<string>> {
+  try {
+    let { data, error } = await supabaseAdmin
+      .from("close_friends")
+      .select("friend_id")
+      .eq("user_id", viewerId);
+
+    if (error || !data) {
+      ({ data, error } = await supabaseAdmin
+        .from("close_friends")
+        .select("friend_id")
+        .eq("owner_id", viewerId));
+      if (error || !data) return new Set();
+    }
+    return new Set(data.map((r: any) => r.friend_id).filter(Boolean));
+  } catch {
+    return new Set();
+  }
+}
+
 postsRouter.get("/", async (c) => {
   const user = c.get("user");
   const userId = c.get("userId");
@@ -187,16 +208,16 @@ postsRouter.get("/", async (c) => {
   // Batch is larger than the page so audience filters still fill one page.
   // The database orders each batch before this limit is applied.
   const batchSize = Math.min(Math.max(limit * 3, limit + 10), 80);
-  // Feed mode: public | private | all (default = legacy combined feed for older clients).
+  // Feed mode: public | private | starred | all (default = legacy combined feed).
   const modeRaw = String(c.req.query("mode") ?? "").trim().toLowerCase();
-  const feedMode: "public" | "private" | "all" =
-    modeRaw === "public" || modeRaw === "private" ? modeRaw : "all";
+  const feedMode: "public" | "private" | "starred" | "all" =
+    modeRaw === "public" || modeRaw === "private" || modeRaw === "starred" ? modeRaw : "all";
 
   // Privacy: own moments, moments from accepted friends, and public moments.
   // Pending friendships never expose moments. Private moments stay with the
   // author. Close-friends moments stay with people that author starred.
   // Parallelize the hot-path lookups that used to run as a waterfall.
-  const [friendshipsResult, blockedIds, whoStarredMe, deletionHidden] = await Promise.all([
+  const [friendshipsResult, blockedIds, whoStarredMe, myStarredIds, deletionHidden] = await Promise.all([
     supabaseAdmin
       .from("friendships")
       .select("requester_id, receiver_id")
@@ -204,6 +225,7 @@ postsRouter.get("/", async (c) => {
       .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
     getBlockedIds(userId),
     getWhoStarredMe(userId),
+    feedMode === "starred" ? getMyStarredIds(userId) : Promise.resolve(new Set<string>()),
     getDeletionHiddenUserIds(),
   ]);
 
@@ -231,6 +253,17 @@ postsRouter.get("/", async (c) => {
   const allowedUserIds = Array.from(new Set([userId, ...friendIds])).filter(
     (id): id is string => typeof id === "string" && id.length > 0 && (id === userId || !blockedSet.has(id))
   );
+  // Starred feed: publishers the viewer starred. Blocking still excludes them.
+  const starredAuthorIds = Array.from(myStarredIds).filter(
+    (id): id is string =>
+      typeof id === "string" && id.length > 0 && id !== userId && !blockedSet.has(id)
+  );
+  const visibilityCtx = {
+    friendIds: friendIdSet,
+    closeAuthorIds: whoStarredMe,
+    blockedIds: blockedSet,
+    deletionHiddenIds: deletionHidden,
+  };
 
   // Birthday ensure is idempotent but can add latency — run in background so
   // the feed response isn't blocked. Next refresh will pick up new moments.
@@ -305,6 +338,32 @@ postsRouter.get("/", async (c) => {
           if (audience === "private") return false;
           if (audience === "close") return whoStarredMe.has(p.user_id);
           return friendIdSet.has(p.user_id);
+        },
+      });
+    } else if (feedMode === "starred") {
+      // Moments from people I starred — still gated by audience / friendship /
+      // Close Circle / blocks. Starring never grants extra access.
+      walked = await walkNewestPage({
+        cursor,
+        limit,
+        batchSize,
+        fetchFriends: (pageCursor, size) =>
+          starredAuthorIds.length === 0
+            ? Promise.resolve([])
+            : fetchNewestMomentBatch(
+                (q) =>
+                  q
+                    .in("user_id", starredAuthorIds)
+                    .eq("is_hidden", false)
+                    .neq("is_published", false),
+                pageCursor,
+                size
+              ),
+        fetchPublic: async () => [],
+        accept: (p: any) => {
+          if (!acceptBase(p)) return false;
+          if (!myStarredIds.has(p.user_id)) return false;
+          return canViewerSeeMoment(userId, p, visibilityCtx);
         },
       });
     } else {
