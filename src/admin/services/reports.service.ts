@@ -17,6 +17,45 @@ async function loadProfile(userId: string | null | undefined) {
   }
 }
 
+function mediaTypeFromUrl(url: string): "image" | "video" {
+  const lower = url.toLowerCase().split("?")[0] ?? "";
+  if (/\.(mp4|mov|webm|m4v|avi|mkv)$/.test(lower)) return "video";
+  return "image";
+}
+
+async function enrichPostPayload(post: Record<string, any>) {
+  const urls = decodeImages(post.image_url);
+  const media = urls.map((url: string, index: number) => ({
+    index,
+    url,
+    type: mediaTypeFromUrl(url),
+  }));
+  const [reactionCount, viewCount, commentCount] = await Promise.all([
+    dataRepository.countReactionsForPost(post.id).catch(() => 0),
+    dataRepository.countViewsForPost(post.id).catch(() => 0),
+    dataRepository
+      .listComments({ postId: post.id, limit: 1, offset: 0 })
+      .then((r) => r.total)
+      .catch(() => Number(post.comment_count ?? 0)),
+  ]);
+  return {
+    ...post,
+    media,
+    mediaCount: media.length,
+    mediaKind:
+      media.some((m) => m.type === "video") && media.some((m) => m.type === "image")
+        ? "mixed"
+        : media.some((m) => m.type === "video")
+          ? "video"
+          : media.length
+            ? "image"
+            : "text",
+    reactionCount,
+    viewCount,
+    commentCount,
+  };
+}
+
 async function hydrateTarget(report: Record<string, any>) {
   const targetType = String(report.target_type ?? "").toLowerCase();
   const targetId = String(report.target_id ?? report.reported_post_id ?? "");
@@ -29,27 +68,21 @@ async function hydrateTarget(report: Record<string, any>) {
         available: false,
         kind: "post",
         message: "The reported post is no longer available (deleted or missing).",
+        reportedUserId: reportedUserId || null,
       };
     }
-    const urls = decodeImages((post as any).image_url);
     return {
       available: true,
       kind: "post",
-      post: {
-        ...(post as any),
-        media: urls.map((url: string, index: number) => ({
-          index,
-          url,
-          type: /\.(mp4|mov|webm|m4v)$/i.test(url) ? "video" : "image",
-        })),
-      },
+      reportedUserId: reportedUserId || (post as any).user_id || null,
+      post: await enrichPostPayload(post as any),
     };
   }
 
   if (targetType === "comment" && targetId) {
     const { data: comment, error } = await supabaseAdmin
       .from("comments")
-      .select("*, profiles(id, username, full_name, avatar_url)")
+      .select("*, profiles(id, username, full_name, avatar_url, status, created_at)")
       .eq("id", targetId)
       .maybeSingle();
     if (error) throw error;
@@ -58,24 +91,16 @@ async function hydrateTarget(report: Record<string, any>) {
         available: false,
         kind: "comment",
         message: "The reported comment is no longer available (deleted or missing).",
+        reportedUserId: reportedUserId || null,
       };
     }
     const parent = comment.post_id ? await dataRepository.getPost(comment.post_id) : null;
-    const parentMedia = parent ? decodeImages((parent as any).image_url) : [];
     return {
       available: true,
       kind: "comment",
+      reportedUserId: reportedUserId || comment.user_id || null,
       comment,
-      parentPost: parent
-        ? {
-            ...(parent as any),
-            media: parentMedia.map((url: string, index: number) => ({
-              index,
-              url,
-              type: /\.(mp4|mov|webm|m4v)$/i.test(url) ? "video" : "image",
-            })),
-          }
-        : null,
+      parentPost: parent ? await enrichPostPayload(parent as any) : null,
     };
   }
 
@@ -87,15 +112,17 @@ async function hydrateTarget(report: Record<string, any>) {
         available: false,
         kind: "user",
         message: "The reported user profile is no longer available.",
+        reportedUserId: userId || null,
       };
     }
-    return { available: true, kind: "user", user: profile };
+    return { available: true, kind: "user", reportedUserId: userId, user: profile };
   }
 
   return {
     available: false,
     kind: targetType || "unknown",
     message: "No detailed target content is available for this report type.",
+    reportedUserId: reportedUserId || null,
   };
 }
 
@@ -123,12 +150,51 @@ export const reportsService = {
         profiles[id] = await loadProfile(id);
       })
     );
+    // For post/comment reports without reported_user_id, resolve publisher/author ids.
+    const needsOwnerLookup = (items as any[]).filter(
+      (row) =>
+        !row.reported_user_id &&
+        (row.target_type === "post" || row.target_type === "comment") &&
+        row.target_id
+    );
+    const ownerByTarget: Record<string, string> = {};
+    await Promise.all(
+      needsOwnerLookup.map(async (row) => {
+        try {
+          if (row.target_type === "post") {
+            const post = await dataRepository.getPost(row.target_id);
+            if ((post as any)?.user_id) ownerByTarget[row.id] = (post as any).user_id;
+          } else if (row.target_type === "comment") {
+            const { data: comment } = await supabaseAdmin
+              .from("comments")
+              .select("user_id")
+              .eq("id", row.target_id)
+              .maybeSingle();
+            if (comment?.user_id) ownerByTarget[row.id] = comment.user_id;
+          }
+        } catch {
+          /* ignore lookup failures for list enrichment */
+        }
+      })
+    );
+    for (const id of Object.values(ownerByTarget)) userIds.add(id);
+    await Promise.all(
+      [...userIds]
+        .filter((id) => !profiles[id])
+        .map(async (id) => {
+          profiles[id] = await loadProfile(id);
+        })
+    );
+
     const enriched = (items as any[]).map((row) => {
       const reporterId = row.reporter_user_id || row.reporter_id || null;
       const reportedId =
-        row.reported_user_id || (row.target_type === "user" ? row.target_id : null);
+        row.reported_user_id ||
+        ownerByTarget[row.id] ||
+        (row.target_type === "user" ? row.target_id : null);
       return {
         ...row,
+        reported_user_id: reportedId,
         reporter: reporterId ? profiles[reporterId] ?? null : null,
         reportedUser: reportedId ? profiles[reportedId] ?? null : null,
       };
@@ -140,21 +206,25 @@ export const reportsService = {
     const report = await reportRepository.get(id);
     if (!report) return null;
     const reporterId = (report as any).reporter_user_id || (report as any).reporter_id || null;
+    const target = await hydrateTarget(report as any);
     const reportedId =
       (report as any).reported_user_id ||
+      (target as any)?.reportedUserId ||
       ((report as any).target_type === "user" ? (report as any).target_id : null);
-    const [reporter, reportedUser, target, logs] = await Promise.all([
+    const [reporter, reportedUser, logs] = await Promise.all([
       loadProfile(reporterId),
       loadProfile(reportedId),
-      hydrateTarget(report as any),
-      logRepository.list({
-        search: id,
-        limit: 30,
-        offset: 0,
-      }).catch(() => ({ items: [], total: 0 })),
+      logRepository
+        .list({
+          search: id,
+          limit: 30,
+          offset: 0,
+        })
+        .catch(() => ({ items: [], total: 0 })),
     ]);
     return {
       ...(report as any),
+      reported_user_id: reportedId,
       reporter,
       reportedUser,
       target,

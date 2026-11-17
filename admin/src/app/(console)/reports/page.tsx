@@ -24,6 +24,7 @@ type Report = {
   details?: string | null;
   resolution_note?: string | null;
   reporter_user_id?: string | null;
+  reported_user_id?: string | null;
   created_at?: string;
   reporter?: { username?: string | null; full_name?: string | null; avatar_url?: string | null } | null;
   reportedUser?: { username?: string | null; full_name?: string | null; avatar_url?: string | null } | null;
@@ -130,26 +131,51 @@ export default function ReportsPage() {
       key: "people",
       header: "People",
       cell: (r) => (
-        <div className="space-y-1 text-xs text-slate-600 dark:text-slate-300">
-          <p>
-            Reporter:{" "}
-            {r.reporter?.full_name || r.reporter?.username
-              ? `${r.reporter?.full_name || ""} ${r.reporter?.username ? `@${r.reporter.username}` : ""}`.trim()
-              : r.reporter_user_id?.slice(0, 8) || "—"}
-          </p>
-          <p>
-            Reported:{" "}
-            {r.reportedUser?.full_name || r.reportedUser?.username
-              ? `${r.reportedUser?.full_name || ""} ${r.reportedUser?.username ? `@${r.reportedUser.username}` : ""}`.trim()
-              : "—"}
-          </p>
+        <div className="space-y-2 text-xs text-slate-600 dark:text-slate-300">
+          <div className="flex items-center gap-2">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={r.reporter?.avatar_url || "/favicon.ico"}
+              alt=""
+              className="h-7 w-7 rounded-full object-cover bg-slate-200"
+            />
+            <div className="min-w-0">
+              <p className="font-medium text-slate-800 dark:text-slate-100">Reporter</p>
+              <p className="truncate">
+                {r.reporter?.full_name || "Unknown"}{" "}
+                {r.reporter?.username ? `@${r.reporter.username}` : ""}
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={r.reportedUser?.avatar_url || "/favicon.ico"}
+              alt=""
+              className="h-7 w-7 rounded-full object-cover bg-slate-200"
+            />
+            <div className="min-w-0">
+              <p className="font-medium text-slate-800 dark:text-slate-100">Reported User</p>
+              <p className="truncate">
+                {r.reportedUser?.full_name || "Unknown"}{" "}
+                {r.reportedUser?.username ? `@${r.reportedUser.username}` : ""}
+              </p>
+            </div>
+          </div>
         </div>
       ),
     },
     {
       key: "status",
       header: "Status",
-      cell: (r) => <Badge variant={statusVariant(r.status)}>{r.status || "open"}</Badge>,
+      cell: (r) => (
+        <div className="space-y-1">
+          <Badge variant={statusVariant(r.status)}>{r.status || "open"}</Badge>
+          {(r.status === "open" || !r.status) && (
+            <p className="text-[10px] font-semibold uppercase tracking-wide text-rose-600">Unresolved</p>
+          )}
+        </div>
+      ),
     },
     {
       key: "created",

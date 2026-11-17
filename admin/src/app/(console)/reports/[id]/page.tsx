@@ -1,12 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
-import { formatDate } from "@/lib/utils";
+import { formatDate, formatNumber } from "@/lib/utils";
 import { PageHeader } from "@/components/page-header";
 import { ErrorState, LoadingState } from "@/components/data-table";
 import { Button } from "@/components/ui/button";
@@ -22,6 +22,26 @@ type Profile = {
   avatar_url?: string | null;
   status?: string | null;
   created_at?: string | null;
+};
+
+type MediaItem = { index?: number; url: string; type: string };
+
+type PostPayload = {
+  id?: string;
+  user_id?: string;
+  content?: string | null;
+  created_at?: string | null;
+  audience?: string | null;
+  location?: string | null;
+  is_hidden?: boolean;
+  is_published?: boolean;
+  media?: MediaItem[];
+  mediaCount?: number;
+  mediaKind?: string;
+  reactionCount?: number;
+  viewCount?: number;
+  commentCount?: number;
+  profiles?: Profile | null;
 };
 
 type ReportDetail = {
@@ -44,21 +64,16 @@ type ReportDetail = {
     available?: boolean;
     kind?: string;
     message?: string;
-    post?: {
-      id?: string;
-      content?: string | null;
-      media?: { url: string; type: string }[];
-    };
+    reportedUserId?: string | null;
+    post?: PostPayload;
     comment?: {
       id?: string;
+      user_id?: string;
       content?: string | null;
       created_at?: string | null;
+      profiles?: Profile | null;
     };
-    parentPost?: {
-      id?: string;
-      content?: string | null;
-      media?: { url: string; type: string }[];
-    };
+    parentPost?: PostPayload;
     user?: Profile;
   };
   audit?: {
@@ -100,9 +115,9 @@ function ProfileCard({
             alt=""
             className="h-12 w-12 rounded-full object-cover bg-slate-200"
           />
-          <div>
-            <p className="font-semibold">{profile?.full_name || "Unknown"}</p>
-            <p className="text-sm text-slate-500">
+          <div className="min-w-0">
+            <p className="font-semibold truncate">{profile?.full_name || "Unknown"}</p>
+            <p className="text-sm text-slate-500 truncate">
               {profile?.username ? `@${profile.username}` : "—"}
             </p>
           </div>
@@ -119,6 +134,180 @@ function ProfileCard({
         ) : null}
       </CardContent>
     </Card>
+  );
+}
+
+function MediaViewer({ media }: { media: MediaItem[] }) {
+  const [active, setActive] = useState(0);
+  const [lightbox, setLightbox] = useState(false);
+  const item = media[active];
+
+  if (!media.length) {
+    return <p className="text-sm text-slate-500">No media attachments on this Moment.</p>;
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="overflow-hidden rounded-xl border border-slate-200 bg-slate-950 dark:border-slate-800">
+        {item?.type === "video" ? (
+          <video
+            key={item.url}
+            src={item.url}
+            controls
+            preload="metadata"
+            className="max-h-[28rem] w-full bg-black"
+            onError={(e) => {
+              e.currentTarget.insertAdjacentHTML(
+                "afterend",
+                '<p class="p-3 text-sm text-rose-300">Video unavailable or expired.</p>'
+              );
+            }}
+          />
+        ) : item?.url ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={item.url}
+            alt="Reported media"
+            className="max-h-[28rem] w-full cursor-zoom-in object-contain bg-black"
+            onClick={() => setLightbox(true)}
+            onError={(e) => {
+              (e.currentTarget as HTMLImageElement).alt = "Media unavailable";
+              (e.currentTarget as HTMLImageElement).style.opacity = "0.35";
+            }}
+          />
+        ) : null}
+      </div>
+      <div className="flex flex-wrap gap-2">
+        {media.map((m, idx) => (
+          <button
+            key={`${m.url}-${idx}`}
+            type="button"
+            onClick={() => setActive(idx)}
+            className={`overflow-hidden rounded-lg border ${
+              idx === active ? "border-blue-500 ring-2 ring-blue-200" : "border-slate-200 dark:border-slate-700"
+            }`}
+          >
+            {m.type === "video" ? (
+              <div className="flex h-16 w-16 items-center justify-center bg-slate-900 text-[10px] font-semibold text-white">
+                VIDEO
+              </div>
+            ) : (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={m.url} alt="" className="h-16 w-16 object-cover" />
+            )}
+          </button>
+        ))}
+      </div>
+      {item?.url ? (
+        <a href={item.url} target="_blank" rel="noreferrer" className="text-sm font-medium text-blue-600 hover:underline">
+          Open original media
+        </a>
+      ) : null}
+      {lightbox && item?.type !== "video" && item?.url ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4"
+          onClick={() => setLightbox(false)}
+        >
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src={item.url} alt="" className="max-h-full max-w-full object-contain" />
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function MomentCard({
+  title,
+  post,
+  busy,
+  canWrite,
+  canDelete,
+  onHide,
+  onRestore,
+  onDelete,
+}: {
+  title: string;
+  post: PostPayload;
+  busy: boolean;
+  canWrite: boolean;
+  canDelete: boolean;
+  onHide: (id: string) => void;
+  onRestore: (id: string) => void;
+  onDelete: (id: string) => void;
+}) {
+  const publisher = post.profiles;
+  return (
+    <div className="space-y-4 rounded-xl border border-slate-200 p-4 dark:border-slate-800">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p className="text-sm font-semibold">{title}</p>
+          <p className="mt-1 break-all text-xs text-slate-500">{post.id}</p>
+        </div>
+        <div className="flex flex-wrap gap-1">
+          <Badge variant={post.is_published === false ? "muted" : "success"}>
+            {post.is_published === false ? "unpublished" : "published"}
+          </Badge>
+          {post.is_hidden ? <Badge variant="warning">hidden</Badge> : <Badge variant="info">visible</Badge>}
+          <Badge variant="muted">{post.mediaKind || "text"}</Badge>
+        </div>
+      </div>
+
+      <div className="flex items-center gap-3">
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={publisher?.avatar_url || "/favicon.ico"}
+          alt=""
+          className="h-10 w-10 rounded-full object-cover bg-slate-200"
+        />
+        <div className="min-w-0">
+          <p className="font-medium truncate">{publisher?.full_name || "Unknown publisher"}</p>
+          <p className="text-xs text-slate-500 truncate">
+            {publisher?.username ? `@${publisher.username}` : post.user_id || "—"}
+          </p>
+        </div>
+        {post.user_id ? (
+          <Button asChild size="sm" variant="outline" className="ml-auto">
+            <Link href={`/users?search=${post.user_id}`}>Publisher</Link>
+          </Button>
+        ) : null}
+      </div>
+
+      <p className="whitespace-pre-wrap text-sm leading-6">{post.content || "(no text content)"}</p>
+
+      <div className="grid gap-2 text-xs text-slate-600 dark:text-slate-300 sm:grid-cols-2">
+        <p>Published: {formatDate(post.created_at)}</p>
+        <p>Audience: {post.audience || "—"}</p>
+        <p>Location: {post.location || "—"}</p>
+        <p>Comments: {formatNumber(post.commentCount ?? 0)}</p>
+        <p>Reactions: {formatNumber(post.reactionCount ?? 0)}</p>
+        <p>Views: {formatNumber(post.viewCount ?? 0)}</p>
+      </div>
+
+      <MediaViewer media={post.media || []} />
+
+      <div className="flex flex-wrap gap-2 border-t border-slate-200 pt-3 dark:border-slate-800">
+        {post.id ? (
+          <Button asChild size="sm" variant="outline">
+            <Link href={`/posts/${post.id}`}>Open full post</Link>
+          </Button>
+        ) : null}
+        {canWrite && post.id && !post.is_hidden ? (
+          <Button size="sm" variant="secondary" disabled={busy} onClick={() => onHide(post.id!)}>
+            Disable / Hide
+          </Button>
+        ) : null}
+        {canWrite && post.id && post.is_hidden ? (
+          <Button size="sm" disabled={busy} onClick={() => onRestore(post.id!)}>
+            Restore
+          </Button>
+        ) : null}
+        {canDelete && post.id ? (
+          <Button size="sm" variant="destructive" disabled={busy} onClick={() => onDelete(post.id!)}>
+            Delete Moment
+          </Button>
+        ) : null}
+      </div>
+    </div>
   );
 }
 
@@ -175,7 +364,7 @@ export default function ReportDetailPage() {
     setBusy(true);
     try {
       await api.post(`/posts/${postId}/hide`);
-      toast.success("Reported post hidden");
+      toast.success("Moment hidden from feeds");
       await load();
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Hide failed");
@@ -184,9 +373,38 @@ export default function ReportDetailPage() {
     }
   }
 
+  async function restorePost(postId: string) {
+    if (!hasPermission("posts:write") || busy) return;
+    setBusy(true);
+    try {
+      await api.post(`/posts/${postId}/unhide`);
+      toast.success("Moment restored");
+      await load();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Restore failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deletePost(postId: string) {
+    if (!hasPermission("posts:delete") || busy) return;
+    if (!confirm(`Permanently delete Moment ${postId}? This cannot be undone.`)) return;
+    setBusy(true);
+    try {
+      await api.delete(`/posts/${postId}`);
+      toast.success("Moment deleted");
+      await load();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Delete failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function deleteComment(commentId: string) {
     if (!hasPermission("comments:delete") || busy) return;
-    if (!confirm("Delete only this reported comment?")) return;
+    if (!confirm("Delete only this reported comment? The Moment will remain.")) return;
     setBusy(true);
     try {
       await api.delete(`/comments/${commentId}`);
@@ -199,11 +417,54 @@ export default function ReportDetailPage() {
     }
   }
 
+  async function suspendUser(userId: string) {
+    if (!hasPermission("users:suspend") || busy) return;
+    const reason = window.prompt("Suspension reason (optional):");
+    if (reason === null) return;
+    if (!confirm("Suspend this account? They will not be able to use the app until reactivated.")) return;
+    setBusy(true);
+    try {
+      await api.post(`/users/${userId}/suspend`, { reason: reason.trim() || undefined });
+      toast.success("User suspended");
+      await load();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Suspend failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function activateUser(userId: string) {
+    if (!hasPermission("users:suspend") || busy) return;
+    if (!confirm("Reactivate this account?")) return;
+    setBusy(true);
+    try {
+      await api.post(`/users/${userId}/activate`);
+      toast.success("User reactivated");
+      await load();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Activate failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const reportedUserId = useMemo(
+    () =>
+      report?.reported_user_id ||
+      report?.reportedUser?.id ||
+      report?.target?.reportedUserId ||
+      report?.target?.post?.user_id ||
+      report?.target?.comment?.user_id ||
+      null,
+    [report]
+  );
+
   if (loading) return <LoadingState />;
   if (error || !report) return <ErrorState message={error || "Report not found"} />;
 
   const target = report.target;
-  const post = target?.post || target?.parentPost;
+  const moment = target?.post || target?.parentPost;
   const comment = target?.comment;
 
   return (
@@ -211,7 +472,7 @@ export default function ReportDetailPage() {
       <PageHeader
         eyebrow="Community"
         title="Report details"
-        description="Full incident context for moderation"
+        description="Inspect the exact reported Moment, people, and take moderation actions"
         actions={
           <div className="flex flex-wrap gap-2">
             <Button variant="outline" onClick={() => router.push("/reports")}>
@@ -224,7 +485,7 @@ export default function ReportDetailPage() {
         }
       />
 
-      <div className="grid gap-6 xl:grid-cols-[1.35fr_1fr]">
+      <div className="grid gap-6 xl:grid-cols-[1.4fr_1fr]">
         <div className="space-y-6">
           <Card>
             <CardHeader className="flex flex-row items-start justify-between gap-3">
@@ -270,7 +531,7 @@ export default function ReportDetailPage() {
                     </Button>
                   </div>
                   <p className="text-xs text-slate-500">
-                    Changing report status does not automatically delete or hide the reported content.
+                    Changing report status does not automatically delete content or suspend the user.
                   </p>
                 </div>
               ) : null}
@@ -279,56 +540,63 @@ export default function ReportDetailPage() {
 
           <Card>
             <CardHeader>
-              <CardTitle className="text-base">Reported content</CardTitle>
+              <CardTitle className="text-base">Reported Moment / content</CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
               {!target?.available ? (
                 <p className="text-sm text-slate-500">{target?.message || "Target unavailable."}</p>
               ) : null}
 
-              {post ? (
-                <div className="space-y-3 rounded-xl border border-slate-200 p-3 dark:border-slate-800">
-                  <div className="flex items-center justify-between gap-2">
-                    <p className="text-sm font-semibold">Post {post.id}</p>
-                    <Link href={`/posts/${post.id}`} className="text-sm text-blue-600 hover:underline">
-                      Open post
-                    </Link>
-                  </div>
-                  <p className="whitespace-pre-wrap text-sm">{post.content || "(no text)"}</p>
-                  <div className="grid gap-2 sm:grid-cols-2">
-                    {(post.media || []).map((m, idx) =>
-                      m.type === "video" ? (
-                        <video key={idx} src={m.url} controls className="max-h-56 w-full rounded-lg bg-black" />
-                      ) : (
-                        // eslint-disable-next-line @next/next/no-img-element
-                        <img key={idx} src={m.url} alt="" className="max-h-56 w-full rounded-lg object-cover" />
-                      )
-                    )}
-                  </div>
-                  {hasPermission("posts:write") && post.id ? (
-                    <Button size="sm" variant="secondary" disabled={busy} onClick={() => void hidePost(post.id!)}>
-                      Hide reported post
-                    </Button>
-                  ) : null}
-                </div>
+              {moment ? (
+                <MomentCard
+                  title={target?.kind === "comment" ? "Parent Moment" : "Reported Moment"}
+                  post={moment}
+                  busy={busy}
+                  canWrite={hasPermission("posts:write")}
+                  canDelete={hasPermission("posts:delete")}
+                  onHide={(id) => void hidePost(id)}
+                  onRestore={(id) => void restorePost(id)}
+                  onDelete={(id) => void deletePost(id)}
+                />
               ) : null}
 
               {comment ? (
-                <div className="space-y-2 rounded-xl border border-amber-200 bg-amber-50/50 p-3 dark:border-amber-900 dark:bg-amber-950/20">
+                <div className="space-y-3 rounded-xl border border-amber-200 bg-amber-50/50 p-4 dark:border-amber-900 dark:bg-amber-950/20">
                   <p className="text-sm font-semibold">Reported comment</p>
-                  <p className="text-xs text-slate-500 break-all">{comment.id}</p>
+                  <div className="flex items-center gap-3">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={comment.profiles?.avatar_url || "/favicon.ico"}
+                      alt=""
+                      className="h-9 w-9 rounded-full object-cover bg-slate-200"
+                    />
+                    <div>
+                      <p className="text-sm font-medium">{comment.profiles?.full_name || "Unknown"}</p>
+                      <p className="text-xs text-slate-500">
+                        {comment.profiles?.username ? `@${comment.profiles.username}` : comment.user_id}
+                      </p>
+                    </div>
+                  </div>
+                  <p className="text-xs text-slate-500 break-all">Comment ID: {comment.id}</p>
                   <p className="whitespace-pre-wrap text-sm">{comment.content}</p>
                   <p className="text-xs text-slate-500">{formatDate(comment.created_at)}</p>
-                  {hasPermission("comments:delete") && comment.id ? (
-                    <Button
-                      size="sm"
-                      variant="destructive"
-                      disabled={busy}
-                      onClick={() => void deleteComment(comment.id!)}
-                    >
-                      Delete comment
-                    </Button>
-                  ) : null}
+                  <div className="flex flex-wrap gap-2">
+                    {comment.user_id ? (
+                      <Button asChild size="sm" variant="outline">
+                        <Link href={`/users?search=${comment.user_id}`}>Comment author</Link>
+                      </Button>
+                    ) : null}
+                    {hasPermission("comments:delete") && comment.id ? (
+                      <Button
+                        size="sm"
+                        variant="destructive"
+                        disabled={busy}
+                        onClick={() => void deleteComment(comment.id!)}
+                      >
+                        Delete comment
+                      </Button>
+                    ) : null}
+                  </div>
                 </div>
               ) : null}
 
@@ -346,16 +614,36 @@ export default function ReportDetailPage() {
         </div>
 
         <div className="space-y-6">
-          <ProfileCard
-            title="Reporter"
-            profile={report.reporter}
-            fallbackId={report.reporter_user_id}
-          />
-          <ProfileCard
-            title="Reported user"
-            profile={report.reportedUser}
-            fallbackId={report.reported_user_id}
-          />
+          <ProfileCard title="Reporter" profile={report.reporter} fallbackId={report.reporter_user_id} />
+          <ProfileCard title="Reported User" profile={report.reportedUser} fallbackId={reportedUserId} />
+
+          {reportedUserId && hasPermission("users:suspend") ? (
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-base">User moderation</CardTitle>
+              </CardHeader>
+              <CardContent className="flex flex-wrap gap-2">
+                {report.reportedUser?.status === "suspended" ? (
+                  <Button size="sm" disabled={busy} onClick={() => void activateUser(reportedUserId)}>
+                    Reactivate account
+                  </Button>
+                ) : (
+                  <Button
+                    size="sm"
+                    variant="destructive"
+                    disabled={busy}
+                    onClick={() => void suspendUser(reportedUserId)}
+                  >
+                    Suspend account
+                  </Button>
+                )}
+                <p className="w-full text-xs text-slate-500">
+                  Account actions require confirmation and do not change the report status automatically.
+                </p>
+              </CardContent>
+            </Card>
+          ) : null}
+
           <Card>
             <CardHeader>
               <CardTitle className="text-base">Audit trail</CardTitle>

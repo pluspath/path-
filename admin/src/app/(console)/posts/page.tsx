@@ -206,45 +206,27 @@ export default function PostsPage() {
       key: "actions",
       header: "Actions",
       cell: (p) => (
-        <div className="flex flex-wrap gap-1">
+        <div className="flex min-w-[9.5rem] flex-col gap-1">
           <Button size="sm" variant="outline" asChild>
-            <Link href={`/posts/${p.id}`}>View</Link>
+            <Link href={`/posts/${p.id}`}>View details</Link>
           </Button>
-          {hasPermission("posts:write") && (
-            <>
-              <Button size="sm" variant="outline" onClick={() => openEdit(p)}>
-                Edit
+          {hasPermission("posts:write") ? (
+            !p.is_hidden ? (
+              <Button size="sm" variant="secondary" onClick={() => void act(`/posts/${p.id}/hide`, "Hidden")}>
+                Disable
               </Button>
-              {!p.is_hidden ? (
-                <Button size="sm" variant="secondary" onClick={() => void act(`/posts/${p.id}/hide`, "Hidden")}>
-                  Hide
-                </Button>
-              ) : (
-                <Button size="sm" onClick={() => void act(`/posts/${p.id}/unhide`, "Restored")}>
-                  Restore
-                </Button>
-              )}
-              {p.is_published === false ? (
-                <Button size="sm" onClick={() => void act(`/posts/${p.id}/publish`, "Published")}>
-                  Publish
-                </Button>
-              ) : (
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  onClick={() => void act(`/posts/${p.id}/unpublish`, "Unpublished")}
-                >
-                  Unpublish
-                </Button>
-              )}
-            </>
-          )}
-          {hasPermission("posts:delete") && (
+            ) : (
+              <Button size="sm" onClick={() => void act(`/posts/${p.id}/unhide`, "Restored")}>
+                Restore
+              </Button>
+            )
+          ) : null}
+          {hasPermission("posts:delete") ? (
             <Button
               size="sm"
               variant="destructive"
               onClick={() => {
-                if (!confirm("Delete this post permanently?")) return;
+                if (!confirm(`Permanently delete post ${p.id}?`)) return;
                 void api
                   .delete(`/posts/${p.id}`)
                   .then(() => {
@@ -256,7 +238,7 @@ export default function PostsPage() {
             >
               Delete
             </Button>
-          )}
+          ) : null}
         </div>
       ),
     },
