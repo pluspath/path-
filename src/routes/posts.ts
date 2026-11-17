@@ -1849,15 +1849,8 @@ postsRouter.delete("/:id/comments/:commentId", async (c) => {
     return c.json({ error: { message: "Comment not found" } }, 404);
   }
 
-  // Delete permission: the comment's author OR the moment's owner.
-  const { data: postOwner } = await supabaseAdmin
-    .from("posts")
-    .select("user_id")
-    .eq("id", id)
-    .maybeSingle();
-  const isCommentAuthor = comment.user_id === userId;
-  const isMomentOwner = postOwner?.user_id === userId;
-  if (!isCommentAuthor && !isMomentOwner) {
+  // Delete permission: ONLY the comment's original author (not the moment owner).
+  if (comment.user_id !== userId) {
     return c.json({ error: { message: "Forbidden" } }, 403);
   }
 
@@ -1912,12 +1905,23 @@ postsRouter.patch("/:id/comments/:commentId", async (c) => {
   // Edit permission: ONLY the comment's author may edit (not the moment owner).
   if (comment.user_id !== userId) return c.json({ error: { message: "Forbidden" } }, 403);
 
-  const { data: updated, error: updateError } = await supabaseAdmin
+  const nowIso = new Date().toISOString();
+  let updated: any = null;
+  let updateError: any = null;
+  ({ data: updated, error: updateError } = await supabaseAdmin
     .from("comments")
-    .update({ content })
+    .update({ content, updated_at: nowIso })
     .eq("id", commentId)
-    .select("id, post_id, user_id, content, created_at, profiles:user_id(id, full_name, username, avatar_url, gender, is_verified)")
-    .single();
+    .select("id, post_id, user_id, content, created_at, updated_at, profiles:user_id(id, full_name, username, avatar_url, gender, is_verified)")
+    .single());
+  if (updateError && /updated_at|column/i.test(updateError.message ?? "")) {
+    ({ data: updated, error: updateError } = await supabaseAdmin
+      .from("comments")
+      .update({ content })
+      .eq("id", commentId)
+      .select("id, post_id, user_id, content, created_at, profiles:user_id(id, full_name, username, avatar_url, gender, is_verified)")
+      .single());
+  }
 
   if (updateError || !updated) {
     console.error("Update comment error:", updateError);
@@ -1931,6 +1935,7 @@ postsRouter.patch("/:id/comments/:commentId", async (c) => {
     userId: u.user_id,
     content: u.content,
     createdAt: u.created_at,
+    updatedAt: u.updated_at ?? nowIso,
     user: formatCommentUser(u.user_id, u.profiles),
   };
 

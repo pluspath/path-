@@ -17,18 +17,23 @@ import {
   setPairConversationId,
 } from "../lib/direct-pairs";
 import { publicVerificationStatus } from "../lib/verification";
-import { countUnreadByConversationDirect } from "../lib/unread-counts";
+import {
+  countUnreadByConversationDirect,
+  visibilityFloorIso,
+  type UnreadParticipation,
+} from "../lib/unread-counts";
 import type { HonoVariables } from "../types";
 
 const conversationsRouter = new Hono<{ Variables: HonoVariables }>();
 
 /**
  * Unread DM counts via exact COUNT queries (never undercounts from row caps).
+ * Respects each participant's hidden_at deletion boundary.
  */
 async function computeUnreadCounts(
   db: any,
   userId: string,
-  participations: { conversation_id: string; last_read_at?: string | null }[]
+  participations: UnreadParticipation[]
 ): Promise<Record<string, number>> {
   const result: Record<string, number> = {};
   for (const p of participations) {
@@ -58,7 +63,8 @@ async function computeUnreadCounts(
           .select("id", { count: "exact", head: true })
           .eq("conversation_id", p.conversation_id)
           .neq("sender_id", userId);
-        if (p.last_read_at) q = q.gt("created_at", p.last_read_at);
+        const floor = visibilityFloorIso(p.last_read_at, p.hidden_at);
+        if (floor) q = q.gt("created_at", floor);
         const { count, error } = await q;
         if (error) {
           console.warn("[conversations] unread count failed:", error.message);
@@ -69,6 +75,12 @@ async function computeUnreadCounts(
     );
   }
   return result;
+}
+
+/** Apply per-user delete-for-me floor to a messages query builder. */
+function withHiddenFloor(q: any, hiddenAt: string | null | undefined) {
+  if (hiddenAt) return q.gt("created_at", hiddenAt);
+  return q;
 }
 
 function formatProfile(p: any) {
@@ -395,16 +407,19 @@ conversationsRouter.get("/", async (c) => {
       return c.json({ error: { message: "Failed to load conversations" } }, 500);
     }
 
-    // Delete-for-me: hide chats the user removed from their inbox.
-    const visibleParts = (participations ?? []).filter((p: any) => !p.hidden_at);
-    const convIds = visibleParts.map((p: any) => p.conversation_id);
+    // Delete-for-me uses hidden_at as a per-user visibility boundary.
+    // Keep the row when hidden_at is null OR when newer messages exist after it.
+    const allParts = participations ?? [];
+    const convIds = allParts.map((p: any) => p.conversation_id as string);
     if (convIds.length === 0) return c.json({ data: [] });
 
     const lastReadByConv: Record<string, string | null> = {};
     const pinnedAtByConv: Record<string, string | null> = {};
-    for (const p of visibleParts) {
+    const hiddenAtByConv: Record<string, string | null> = {};
+    for (const p of allParts) {
       lastReadByConv[p.conversation_id] = p.last_read_at ?? null;
       pinnedAtByConv[p.conversation_id] = p.pinned_at ?? null;
+      hiddenAtByConv[p.conversation_id] = p.hidden_at ?? null;
     }
 
     const [
@@ -474,6 +489,7 @@ conversationsRouter.get("/", async (c) => {
         visibleIds.map((id: string) => ({
           conversation_id: id,
           last_read_at: lastReadByConv[id] ?? null,
+          hidden_at: hiddenAtByConv[id] ?? null,
         }))
       ),
     ]);
@@ -507,11 +523,13 @@ conversationsRouter.get("/", async (c) => {
 
     const lastMsgByConv: Record<string, any> = {};
     for (const m of lastMsgsResult.data ?? []) {
-      if (m?.conversation_id && !lastMsgByConv[m.conversation_id]) {
-        lastMsgByConv[m.conversation_id] = m;
-      }
+      if (!m?.conversation_id || lastMsgByConv[m.conversation_id]) continue;
+      const floor = hiddenAtByConv[m.conversation_id];
+      // Drop pre-boundary previews from the global newest-N batch.
+      if (floor && !(new Date(m.created_at).getTime() > new Date(floor).getTime())) continue;
+      lastMsgByConv[m.conversation_id] = m;
     }
-    // Quiet threads can fall outside the global newest-N window — fill gaps.
+    // Quiet threads / boundary-filtered gaps — fill with per-id newest visible msg.
     {
       const missing = visibleIds.filter((id: string) => !lastMsgByConv[id]);
       const chunkSize = 20;
@@ -519,12 +537,14 @@ conversationsRouter.get("/", async (c) => {
         const chunk = missing.slice(i, i + chunkSize);
         await Promise.all(
           chunk.map(async (id: string) => {
-            const { data } = await db
+            let q = db
               .from("messages")
               .select("id, conversation_id, content, created_at, sender_id, type")
               .eq("conversation_id", id)
               .order("created_at", { ascending: false })
               .limit(1);
+            q = withHiddenFloor(q, hiddenAtByConv[id]);
+            const { data } = await q;
             if (data?.[0]) lastMsgByConv[id] = data[0];
           })
         );
@@ -675,16 +695,28 @@ conversationsRouter.get("/:id", async (c) => {
   const db = supabaseAdmin;
   const { id } = c.req.param();
 
-  // Security + my read cursor in one round-trip.
-  const { data: participation } = await db
+  // Security + my read cursor + delete-for-me boundary in one round-trip.
+  let participation: any = null;
+  let partErr: any = null;
+  ({ data: participation, error: partErr } = await db
     .from("conversation_participants")
-    .select("user_id, last_read_at")
+    .select("user_id, last_read_at, hidden_at")
     .eq("conversation_id", id)
     .eq("user_id", userId)
-    .maybeSingle();
+    .maybeSingle());
+  if (partErr && /hidden_at|column/i.test(partErr.message ?? "")) {
+    ({ data: participation, error: partErr } = await db
+      .from("conversation_participants")
+      .select("user_id, last_read_at")
+      .eq("conversation_id", id)
+      .eq("user_id", userId)
+      .maybeSingle());
+  }
 
   if (!participation) return c.json({ error: { message: "Not found" } }, 404);
   const myLastReadAt: string | null = participation.last_read_at ?? null;
+  const myHiddenAt: string | null = participation.hidden_at ?? null;
+  const unreadFloor = visibilityFloorIso(myLastReadAt, myHiddenAt);
 
   const rawLimit = Number(c.req.query("limit") ?? 12);
   const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.floor(rawLimit), 1), 40) : 12;
@@ -699,7 +731,7 @@ conversationsRouter.get("/:id", async (c) => {
       .neq("sender_id", userId)
       .order("created_at", { ascending: true })
       .limit(1);
-    if (myLastReadAt) q = q.gt("created_at", myLastReadAt);
+    if (unreadFloor) q = q.gt("created_at", unreadFloor);
     const { data } = await q;
     return (data?.[0] as { id: string; created_at: string } | undefined) ?? null;
   };
@@ -713,13 +745,20 @@ conversationsRouter.get("/:id", async (c) => {
   };
 
   const loadAfterPage = async (): Promise<MsgPage> => {
-    const { data } = await db
+    // Never return pre-deletion messages even if the client cursor is older.
+    const afterCursor =
+      myHiddenAt && new Date(after!).getTime() < new Date(myHiddenAt).getTime()
+        ? myHiddenAt
+        : after!;
+    let q = db
       .from("messages")
       .select("*")
       .eq("conversation_id", id)
-      .gt("created_at", after!)
+      .gt("created_at", afterCursor)
       .order("created_at", { ascending: true })
       .limit(limit + 1);
+    q = withHiddenFloor(q, myHiddenAt);
+    const { data } = await q;
     const rows = data ?? [];
     const hasMoreNewer = rows.length > limit;
     return {
@@ -732,13 +771,15 @@ conversationsRouter.get("/:id", async (c) => {
   };
 
   const loadBeforePage = async (): Promise<MsgPage> => {
-    const { data } = await db
+    let q = db
       .from("messages")
       .select("*")
       .eq("conversation_id", id)
       .lt("created_at", before!)
       .order("created_at", { ascending: false })
       .limit(limit + 1);
+    q = withHiddenFloor(q, myHiddenAt);
+    const { data } = await q;
     const newestFirst = data ?? [];
     const hasMore = newestFirst.length > limit;
     const pageNewestFirst = hasMore ? newestFirst.slice(0, limit) : newestFirst;
@@ -754,28 +795,32 @@ conversationsRouter.get("/:id", async (c) => {
   const loadUnreadForward = async (
     firstUnread: { id: string; created_at: string }
   ): Promise<MsgPage> => {
+    let forwardQ = db
+      .from("messages")
+      .select("*")
+      .eq("conversation_id", id)
+      .gte("created_at", firstUnread.created_at)
+      .order("created_at", { ascending: true })
+      .limit(limit + 1);
+    forwardQ = withHiddenFloor(forwardQ, myHiddenAt);
+    let olderQ = db
+      .from("messages")
+      .select("id")
+      .eq("conversation_id", id)
+      .lt("created_at", firstUnread.created_at)
+      .limit(1)
+      .maybeSingle();
+    olderQ = withHiddenFloor(olderQ, myHiddenAt);
     const [{ data: forward }, olderCheck, countRes] = await Promise.all([
-      db
-        .from("messages")
-        .select("*")
-        .eq("conversation_id", id)
-        .gte("created_at", firstUnread.created_at)
-        .order("created_at", { ascending: true })
-        .limit(limit + 1),
-      db
-        .from("messages")
-        .select("id")
-        .eq("conversation_id", id)
-        .lt("created_at", firstUnread.created_at)
-        .limit(1)
-        .maybeSingle(),
+      forwardQ,
+      olderQ,
       (async () => {
         let countQuery = db
           .from("messages")
           .select("id", { count: "exact", head: true })
           .eq("conversation_id", id)
           .neq("sender_id", userId);
-        if (myLastReadAt) countQuery = countQuery.gt("created_at", myLastReadAt);
+        if (unreadFloor) countQuery = countQuery.gt("created_at", unreadFloor);
         return countQuery;
       })(),
     ]);
@@ -791,12 +836,14 @@ conversationsRouter.get("/:id", async (c) => {
   };
 
   const loadNewestPage = async (): Promise<MsgPage> => {
-    const { data: newestFirst } = await db
+    let q = db
       .from("messages")
       .select("*")
       .eq("conversation_id", id)
       .order("created_at", { ascending: false })
       .limit(limit + 1);
+    q = withHiddenFloor(q, myHiddenAt);
+    const { data: newestFirst } = await q;
     const rows = newestFirst ?? [];
     const hasMore = rows.length > limit;
     const pageNewestFirst = hasMore ? rows.slice(0, limit) : rows;
@@ -870,7 +917,7 @@ conversationsRouter.get("/:id", async (c) => {
           .select("id", { count: "exact", head: true })
           .eq("conversation_id", id)
           .neq("sender_id", userId);
-        if (myLastReadAt) countQuery = countQuery.gt("created_at", myLastReadAt);
+        if (unreadFloor) countQuery = countQuery.gt("created_at", unreadFloor);
         return countQuery;
       })(),
     ]);
@@ -935,14 +982,13 @@ conversationsRouter.post("/unread-counts", async (c) => {
 
   const db = supabaseAdmin;
 
-  // Hidden (deleted-for-me) chats never count toward unread.
+  // Include hidden chats: unread only counts messages after each user's hidden_at.
   let participations: any[] | null = null;
   let partErr: any = null;
   ({ data: participations, error: partErr } = await db
     .from("conversation_participants")
-    .select("conversation_id, last_read_at")
-    .eq("user_id", userId)
-    .is("hidden_at", null));
+    .select("conversation_id, last_read_at, hidden_at")
+    .eq("user_id", userId));
   if (partErr && /hidden_at|column/i.test(partErr.message ?? "")) {
     ({ data: participations, error: partErr } = await db
       .from("conversation_participants")
@@ -1027,31 +1073,17 @@ async function hideConversationsForUser(
 }
 
 /**
- * Unhide a chat for ALL participants (including the sender) — used when a new
- * message arrives. Pass exceptUserId only if a caller really needs to skip one user.
+ * Intentionally a no-op.
+ * hidden_at is a per-user deletion boundary and must NEVER be cleared because
+ * another participant (or the sender) posted a new message. Inbox reactivation
+ * is handled by list/message queries that show rows with activity after hidden_at.
  */
 async function unhideConversationForOthers(
-  db: typeof supabaseAdmin,
-  conversationId: string,
-  exceptUserId?: string
+  _db: typeof supabaseAdmin,
+  _conversationId: string,
+  _exceptUserId?: string
 ): Promise<void> {
-  try {
-    let q = db
-      .from("conversation_participants")
-      .update({ hidden_at: null })
-      .eq("conversation_id", conversationId)
-      .not("hidden_at", "is", null);
-    if (exceptUserId) q = q.neq("user_id", exceptUserId);
-    const { error } = await q;
-    if (error) {
-      console.warn("[conversations] unhide failed:", error.message);
-    }
-  } catch (e) {
-    console.warn(
-      "[conversations] unhide skipped:",
-      e instanceof Error ? e.message : e
-    );
-  }
+  /* keep deletion boundaries intact */
 }
 
 function hideErrorResponse(c: any, msg: string) {
@@ -1364,9 +1396,9 @@ conversationsRouter.post("/:id/messages", async (c) => {
     if (parent?.id) replyTo = parent.id;
   }
 
-  // Clear hidden_at for every participant BEFORE the insert so realtime consumers
-  // that refetch on the new message already see the chat in the inbox.
-  await unhideConversationForOthers(db, id);
+  // Do not clear any participant's hidden_at. New messages reactivate the inbox
+  // via list queries that surface activity after each user's deletion boundary.
+  void unhideConversationForOthers(db, id);
 
   const rowFull: Record<string, any> = {
     conversation_id: id,
@@ -1546,21 +1578,27 @@ conversationsRouter.post("/start/:userId", async (c) => {
       await db.from("conversation_participants").insert({ conversation_id: existingConvId, user_id: targetId });
     }
 
-    // Re-opening a chat from a profile unhides it for the opener.
-    await db
+    // Do NOT clear hidden_at here — opening/start must keep the opener's
+    // deletion boundary. New messages after the boundary reactivate the inbox.
+
+    const { data: myPart } = await db
       .from("conversation_participants")
-      .update({ hidden_at: null })
+      .select("hidden_at")
       .eq("conversation_id", existingConvId)
-      .eq("user_id", userId);
+      .eq("user_id", userId)
+      .maybeSingle();
+    const openerHiddenAt: string | null = myPart?.hidden_at ?? null;
 
     const { data: conv } = await db.from("conversations").select("*").eq("id", existingConvId).single();
     const { data: targetProfile } = await db.from("profiles").select("*").eq("id", targetId).single();
-    const { data: msgs } = await db
+    let msgQ = db
       .from("messages")
       .select("content, text, created_at, type")
       .eq("conversation_id", existingConvId)
       .order("created_at", { ascending: false })
       .limit(1);
+    msgQ = withHiddenFloor(msgQ, openerHiddenAt);
+    const { data: msgs } = await msgQ;
     return c.json({
       data: {
         id: existingConvId,
@@ -1634,11 +1672,7 @@ conversationsRouter.post("/start/:userId", async (c) => {
     console.log(`[conversations/start] lost pair race; using ${ownerId}, dropping ${newConv.id}`);
     await db.from("conversation_participants").delete().eq("conversation_id", newConv.id);
     await db.from("conversations").delete().eq("id", newConv.id);
-    await db
-      .from("conversation_participants")
-      .update({ hidden_at: null })
-      .eq("conversation_id", ownerId)
-      .eq("user_id", userId);
+    // Preserve opener's deletion boundary on the winning conversation id.
     const { data: ownerConv } = await db.from("conversations").select("*").eq("id", ownerId).maybeSingle();
     const { data: ownerProfile } = await db.from("profiles").select("*").eq("id", targetId).single();
     return c.json({
@@ -1691,8 +1725,8 @@ conversationsRouter.post("/:id/ping", async (c) => {
     return c.json({ error: { message: "Unable to message this user" } }, 403);
   }
 
-  // Clear hidden_at for every participant BEFORE the insert (see POST /:id/messages).
-  await unhideConversationForOthers(db, id);
+  // Keep per-user deletion boundaries intact (see POST /:id/messages).
+  void unhideConversationForOthers(db, id);
 
   const { data: message, error: pingError } = await db
     .from("messages")

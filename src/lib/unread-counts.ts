@@ -3,7 +3,21 @@ import { withDirectSql } from "./direct-db";
 export type UnreadParticipation = {
   conversation_id: string;
   last_read_at?: string | null;
+  /** Per-user delete-for-me boundary; messages at/before this stay hidden. */
+  hidden_at?: string | null;
 };
+
+/** Exclusive lower bound for visible/unread messages for one participant. */
+export function visibilityFloorIso(
+  lastReadAt?: string | null,
+  hiddenAt?: string | null
+): string | null {
+  const a = lastReadAt && !Number.isNaN(Date.parse(lastReadAt)) ? lastReadAt : null;
+  const b = hiddenAt && !Number.isNaN(Date.parse(hiddenAt)) ? hiddenAt : null;
+  if (!a) return b;
+  if (!b) return a;
+  return new Date(a).getTime() >= new Date(b).getTime() ? a : b;
+}
 
 /**
  * One GROUP BY aggregate for unread DMs across the given conversations.
@@ -20,14 +34,16 @@ export async function countUnreadByConversationDirect(
   try {
     const rows = await withDirectSql(async (sql) => {
       // postgres.js: use sql.array() for UUID[] binds (raw JS arrays fail the cast).
+      // hidden_at is a per-user visibility floor, not a permanent inbox ban.
+      // Count only messages strictly after both last_read_at and hidden_at.
       return (await sql`
         SELECT m.conversation_id::text AS conversation_id, COUNT(*)::int AS unread
         FROM conversation_participants cp
         INNER JOIN messages m ON m.conversation_id = cp.conversation_id
         WHERE cp.user_id = ${userId}::uuid
-          AND cp.hidden_at IS NULL
           AND m.conversation_id = ANY(${sql.array(convIds)}::uuid[])
           AND m.sender_id <> ${userId}::uuid
+          AND (cp.hidden_at IS NULL OR m.created_at > cp.hidden_at)
           AND (cp.last_read_at IS NULL OR m.created_at > cp.last_read_at)
         GROUP BY m.conversation_id
       `) as { conversation_id: string; unread: number }[];
@@ -83,7 +99,8 @@ export async function computeUnreadCountsBatched(
           .select("id", { count: "exact", head: true })
           .eq("conversation_id", p.conversation_id)
           .neq("sender_id", userId);
-        if (p.last_read_at) q = q.gt("created_at", p.last_read_at);
+        const floor = visibilityFloorIso(p.last_read_at, p.hidden_at);
+        if (floor) q = q.gt("created_at", floor);
         const { count, error } = await q;
         if (error) {
           console.warn("[unread] count failed:", error.message);
