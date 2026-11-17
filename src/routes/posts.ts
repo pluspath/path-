@@ -31,6 +31,7 @@ import {
 import {
   canViewerSeeMoment,
   loadMomentVisibilityContext,
+  normalizeAudience,
   scrubInvisibleOriginals,
   viewerCanAccessMoment,
 } from "../lib/moment-visibility";
@@ -186,6 +187,10 @@ postsRouter.get("/", async (c) => {
   // Batch is larger than the page so audience filters still fill one page.
   // The database orders each batch before this limit is applied.
   const batchSize = Math.min(Math.max(limit * 3, limit + 10), 80);
+  // Feed mode: public | private | all (default = legacy combined feed for older clients).
+  const modeRaw = String(c.req.query("mode") ?? "").trim().toLowerCase();
+  const feedMode: "public" | "private" | "all" =
+    modeRaw === "public" || modeRaw === "private" ? modeRaw : "all";
 
   // Privacy: own moments, moments from accepted friends, and public moments.
   // Pending friendships never expose moments. Private moments stay with the
@@ -214,6 +219,15 @@ postsRouter.get("/", async (c) => {
   // Self + accepted friends. (Always include self even with no friends yet.)
   // Then remove anyone blocked in either direction (self is never blocked).
   const blockedSet = new Set(blockedIds);
+  const friendIdSet = new Set(friendIds);
+  // Private feed also includes authors who starred the viewer as close friends
+  // (Close Circle access does not require friendship).
+  const privateAuthorIds = Array.from(
+    new Set([userId, ...friendIds, ...whoStarredMe])
+  ).filter(
+    (id): id is string =>
+      typeof id === "string" && id.length > 0 && (id === userId || !blockedSet.has(id))
+  );
   const allowedUserIds = Array.from(new Set([userId, ...friendIds])).filter(
     (id): id is string => typeof id === "string" && id.length > 0 && (id === userId || !blockedSet.has(id))
   );
@@ -224,50 +238,109 @@ postsRouter.get("/", async (c) => {
     console.warn("[posts] birthday ensure failed:", e instanceof Error ? e.message : e);
   });
 
-  const friendIdSet = new Set(friendIds);
+  const acceptBase = (p: any): boolean => {
+    if (!p?.id) return false;
+    if (p.is_hidden === true) return false;
+    if (p.is_published === false) return false;
+    if (p.user_id !== userId && blockedSet.has(p.user_id)) return false;
+    if (p.user_id !== userId && deletionHidden.has(p.user_id)) return false;
+    return true;
+  };
 
   // Page after ordering. Friend moments and public moments are separate
   // streams so a limited public window cannot push a newer friend moment
   // off the first page, and a refresh without new rows returns the same page.
   let walked;
   try {
-    walked = await walkNewestPage({
-      cursor,
-      limit,
-      batchSize,
-      fetchFriends: (pageCursor, size) =>
-        fetchNewestMomentBatch(
-          (q) => q.in("user_id", allowedUserIds).eq("is_hidden", false).neq("is_published", false),
-          pageCursor,
-          size
-        ),
-      fetchPublic: async (pageCursor, size) => {
-        try {
-          return await fetchNewestMomentBatch(
-            (q) => q.eq("audience", "public").eq("is_hidden", false).neq("is_published", false),
+    if (feedMode === "public") {
+      walked = await walkNewestPage({
+        cursor,
+        limit,
+        batchSize,
+        fetchFriends: async () => [],
+        fetchPublic: async (pageCursor, size) => {
+          try {
+            return await fetchNewestMomentBatch(
+              (q) => q.eq("audience", "public").eq("is_hidden", false).neq("is_published", false),
+              pageCursor,
+              size
+            );
+          } catch (e) {
+            console.warn("[posts] public moment window failed:", e instanceof Error ? e.message : e);
+            return [];
+          }
+        },
+        accept: (p: any) => {
+          if (!acceptBase(p)) return false;
+          return normalizeAudience(p.audience) === "public";
+        },
+      });
+    } else if (feedMode === "private") {
+      walked = await walkNewestPage({
+        cursor,
+        limit,
+        batchSize,
+        fetchFriends: (pageCursor, size) =>
+          privateAuthorIds.length === 0
+            ? Promise.resolve([])
+            : fetchNewestMomentBatch(
+                (q) =>
+                  q
+                    .in("user_id", privateAuthorIds)
+                    .eq("is_hidden", false)
+                    .neq("is_published", false),
+                pageCursor,
+                size
+              ),
+        fetchPublic: async () => [],
+        accept: (p: any) => {
+          if (!acceptBase(p)) return false;
+          const audience = normalizeAudience(p.audience);
+          // Public moments belong in the Public tab only.
+          if (audience === "public") return false;
+          if (p.user_id === userId) {
+            // Author sees their own friends/close/only-me moments in Private.
+            return audience === "friends" || audience === "close" || audience === "private";
+          }
+          if (audience === "private") return false;
+          if (audience === "close") return whoStarredMe.has(p.user_id);
+          return friendIdSet.has(p.user_id);
+        },
+      });
+    } else {
+      walked = await walkNewestPage({
+        cursor,
+        limit,
+        batchSize,
+        fetchFriends: (pageCursor, size) =>
+          fetchNewestMomentBatch(
+            (q) => q.in("user_id", allowedUserIds).eq("is_hidden", false).neq("is_published", false),
             pageCursor,
             size
-          );
-        } catch (e) {
-          console.warn("[posts] public moment window failed:", e instanceof Error ? e.message : e);
-          return [];
-        }
-      },
-      accept: (p: any) => {
-        if (!p?.id) return false;
-        // Admin-hidden / unpublished moments never appear in the user feed.
-        if (p.is_hidden === true) return false;
-        if (p.is_published === false) return false;
-        if (p.user_id !== userId && blockedSet.has(p.user_id)) return false;
-        if (p.user_id !== userId && deletionHidden.has(p.user_id)) return false;
-        if (p.user_id === userId) return true;
-        const audience = p.audience ?? "friends";
-        if (audience === "private") return false;
-        if (audience === "close") return whoStarredMe.has(p.user_id);
-        if (audience === "public") return true;
-        return friendIdSet.has(p.user_id);
-      },
-    });
+          ),
+        fetchPublic: async (pageCursor, size) => {
+          try {
+            return await fetchNewestMomentBatch(
+              (q) => q.eq("audience", "public").eq("is_hidden", false).neq("is_published", false),
+              pageCursor,
+              size
+            );
+          } catch (e) {
+            console.warn("[posts] public moment window failed:", e instanceof Error ? e.message : e);
+            return [];
+          }
+        },
+        accept: (p: any) => {
+          if (!acceptBase(p)) return false;
+          if (p.user_id === userId) return true;
+          const audience = p.audience ?? "friends";
+          if (audience === "private") return false;
+          if (audience === "close") return whoStarredMe.has(p.user_id);
+          if (audience === "public") return true;
+          return friendIdSet.has(p.user_id);
+        },
+      });
+    }
   } catch (e) {
     console.error("[posts] feed query failed:", e instanceof Error ? e.message : e);
     return c.json({ error: { message: "Failed to load moments" } }, 500);
