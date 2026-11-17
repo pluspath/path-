@@ -44,12 +44,30 @@ type ReportDetail = {
     available?: boolean;
     kind?: string;
     message?: string;
-    post?: any;
-    comment?: any;
-    parentPost?: any;
+    post?: {
+      id?: string;
+      content?: string | null;
+      media?: { url: string; type: string }[];
+    };
+    comment?: {
+      id?: string;
+      content?: string | null;
+      created_at?: string | null;
+    };
+    parentPost?: {
+      id?: string;
+      content?: string | null;
+      media?: { url: string; type: string }[];
+    };
     user?: Profile;
   };
-  audit?: any[];
+  audit?: {
+    id: string;
+    action?: string;
+    actor_name?: string | null;
+    actor_id?: string | null;
+    created_at?: string | null;
+  }[];
 };
 
 function statusVariant(status?: string | null): "success" | "warning" | "danger" | "muted" {
@@ -278,7 +296,7 @@ export default function ReportDetailPage() {
                   </div>
                   <p className="whitespace-pre-wrap text-sm">{post.content || "(no text)"}</p>
                   <div className="grid gap-2 sm:grid-cols-2">
-                    {(post.media || []).map((m: any, idx: number) =>
+                    {(post.media || []).map((m, idx) =>
                       m.type === "video" ? (
                         <video key={idx} src={m.url} controls className="max-h-56 w-full rounded-lg bg-black" />
                       ) : (
@@ -341,7 +359,7 @@ export default function ReportDetailPage() {
               {!report.audit?.length ? (
                 <p className="text-sm text-slate-500">No related audit entries yet.</p>
               ) : (
-                report.audit.map((entry: any) => (
+                report.audit.map((entry) => (
                   <div key={entry.id} className="rounded-lg border border-slate-200 p-2 text-xs dark:border-slate-800">
                     <p className="font-semibold">{entry.action}</p>
                     <p>{entry.actor_name || entry.actor_id || "system"}</p>
