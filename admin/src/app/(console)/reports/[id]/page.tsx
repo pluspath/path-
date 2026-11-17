@@ -305,8 +305,8 @@ export default function ReportDetailPage() {
                       )
                     )}
                   </div>
-                  {hasPermission("posts:write") ? (
-                    <Button size="sm" variant="secondary" disabled={busy} onClick={() => void hidePost(post.id)}>
+                  {hasPermission("posts:write") && post.id ? (
+                    <Button size="sm" variant="secondary" disabled={busy} onClick={() => void hidePost(post.id!)}>
                       Hide reported post
                     </Button>
                   ) : null}
