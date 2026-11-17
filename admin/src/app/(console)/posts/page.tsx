@@ -1,6 +1,7 @@
 ﻿"use client";
 
 import { useCallback, useEffect, useState } from "react";
+import Link from "next/link";
 import { toast } from "sonner";
 import { api, type Paginated } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
@@ -24,7 +25,14 @@ type Post = {
   is_hidden?: boolean;
   is_published?: boolean;
   created_at?: string;
-  profiles?: { username?: string; full_name?: string | null } | null;
+  mediaCount?: number;
+  mediaKind?: string;
+  media?: { url: string; type: string }[];
+  profiles?: {
+    username?: string;
+    full_name?: string | null;
+    avatar_url?: string | null;
+  } | null;
 };
 
 const emptyForm = {
@@ -138,11 +146,31 @@ export default function PostsPage() {
       key: "content",
       header: "Post",
       cell: (p) => (
-        <div className="max-w-md">
-          <p className="line-clamp-2 font-medium">{p.content || "(no content)"}</p>
-          <p className="text-xs text-slate-500">
-            {p.profiles?.username ? `@${p.profiles.username}` : p.user_id?.slice(0, 8)} آ· {p.type}
-          </p>
+        <div className="flex max-w-lg items-start gap-3">
+          {p.media?.[0]?.url ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img src={p.media[0].url} alt="" className="h-12 w-12 rounded-lg object-cover bg-slate-200" />
+          ) : (
+            <div className="flex h-12 w-12 items-center justify-center rounded-lg bg-slate-100 text-[10px] font-semibold text-slate-500">
+              {(p.mediaKind || "text").toUpperCase()}
+            </div>
+          )}
+          <div>
+            <p className="line-clamp-2 font-medium">{p.content || "(no content)"}</p>
+            <div className="mt-1 flex items-center gap-2">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={p.profiles?.avatar_url || "/favicon.ico"}
+                alt=""
+                className="h-5 w-5 rounded-full object-cover bg-slate-200"
+              />
+              <p className="text-xs text-slate-500">
+                {p.profiles?.full_name || "Unknown"} ·{" "}
+                {p.profiles?.username ? `@${p.profiles.username}` : p.user_id?.slice(0, 8)} · {p.type}
+              </p>
+            </div>
+            <p className="mt-1 break-all text-[11px] text-slate-400">{p.id}</p>
+          </div>
         </div>
       ),
     },
@@ -155,13 +183,19 @@ export default function PostsPage() {
             {p.is_published === false ? "unpublished" : "published"}
           </Badge>
           {p.is_hidden ? <Badge variant="warning">hidden</Badge> : null}
+          <Badge variant="muted">{p.mediaKind || "text"}</Badge>
         </div>
       ),
     },
     {
+      key: "media",
+      header: "Media",
+      cell: (p) => String(p.mediaCount ?? p.media?.length ?? 0),
+    },
+    {
       key: "location",
       header: "Location",
-      cell: (p) => p.location || "â€”",
+      cell: (p) => p.location || "—",
     },
     {
       key: "created",
@@ -173,14 +207,21 @@ export default function PostsPage() {
       header: "Actions",
       cell: (p) => (
         <div className="flex flex-wrap gap-1">
+          <Button size="sm" variant="outline" asChild>
+            <Link href={`/posts/${p.id}`}>View</Link>
+          </Button>
           {hasPermission("posts:write") && (
             <>
               <Button size="sm" variant="outline" onClick={() => openEdit(p)}>
                 Edit
               </Button>
-              {!p.is_hidden && (
+              {!p.is_hidden ? (
                 <Button size="sm" variant="secondary" onClick={() => void act(`/posts/${p.id}/hide`, "Hidden")}>
                   Hide
+                </Button>
+              ) : (
+                <Button size="sm" onClick={() => void act(`/posts/${p.id}/unhide`, "Restored")}>
+                  Restore
                 </Button>
               )}
               {p.is_published === false ? (
@@ -203,7 +244,7 @@ export default function PostsPage() {
               size="sm"
               variant="destructive"
               onClick={() => {
-                if (!confirm("Delete this post?")) return;
+                if (!confirm("Delete this post permanently?")) return;
                 void api
                   .delete(`/posts/${p.id}`)
                   .then(() => {
@@ -242,7 +283,7 @@ export default function PostsPage() {
             <Input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Content, locationâ€¦"
+              placeholder="Content, location, username, post ID..."
               onKeyDown={(e) => e.key === "Enter" && setPage(1)}
             />
           </div>

@@ -13,6 +13,7 @@ export const commentsService = {
     offset: number;
     search?: string;
     status?: string;
+    postId?: string;
   }) {
     const { items, total } = await dataRepository.listComments(opts);
     return toPaginated(items, total, opts.page, opts.limit);

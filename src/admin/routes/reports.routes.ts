@@ -18,9 +18,20 @@ reportsRoutes.get("/", requirePermission("reports:read"), async (c) => {
       search: c.req.query("search"),
     });
     const status = c.req.query("status") || undefined;
-    return paginated(c, await reportsService.list({ ...p, status }));
+    const targetType = c.req.query("targetType") || c.req.query("target_type") || undefined;
+    return paginated(c, await reportsService.list({ ...p, status, targetType }));
   } catch (e) {
     return fail(c, e instanceof Error ? e.message : "Failed to list reports", 500);
+  }
+});
+
+reportsRoutes.get("/:id", requirePermission("reports:read"), async (c) => {
+  try {
+    const report = await reportsService.get(c.req.param("id"));
+    if (!report) return fail(c, "Report not found", 404);
+    return ok(c, report);
+  } catch (e) {
+    return fail(c, e instanceof Error ? e.message : "Failed to get report", 500);
   }
 });
 

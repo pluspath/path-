@@ -1,6 +1,7 @@
 ﻿"use client";
 
 import { useCallback, useEffect, useState } from "react";
+import Link from "next/link";
 import { toast } from "sonner";
 import { api, type Paginated } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
@@ -24,6 +25,8 @@ type Report = {
   resolution_note?: string | null;
   reporter_user_id?: string | null;
   created_at?: string;
+  reporter?: { username?: string | null; full_name?: string | null; avatar_url?: string | null } | null;
+  reportedUser?: { username?: string | null; full_name?: string | null; avatar_url?: string | null } | null;
 };
 
 const emptyCreate = {
@@ -48,6 +51,7 @@ export default function ReportsPage() {
   const [page, setPage] = useState(1);
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState("");
+  const [targetType, setTargetType] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
@@ -61,6 +65,7 @@ export default function ReportsPage() {
       const params = new URLSearchParams({ page: String(page), limit: "20" });
       if (search.trim()) params.set("search", search.trim());
       if (status) params.set("status", status);
+      if (targetType) params.set("targetType", targetType);
       const res = await api.get<Paginated<Report>>(`/reports?${params}`);
       setRows(res.data);
       setMeta(res.meta);
@@ -69,7 +74,7 @@ export default function ReportsPage() {
     } finally {
       setLoading(false);
     }
-  }, [page, search, status]);
+  }, [page, search, status, targetType]);
 
   useEffect(() => {
     void load();
@@ -113,10 +118,31 @@ export default function ReportsPage() {
       cell: (r) => (
         <div className="max-w-md">
           <p className="font-medium">
-            {r.target_type} آ· {r.target_id}
+            {r.target_type} · <span className="break-all text-xs">{r.target_id}</span>
           </p>
           <p className="line-clamp-2 text-sm text-slate-500">{r.reason}</p>
           {r.details ? <p className="mt-1 line-clamp-2 text-xs text-slate-400">{r.details}</p> : null}
+          <p className="mt-1 break-all text-[11px] text-slate-400">{r.id}</p>
+        </div>
+      ),
+    },
+    {
+      key: "people",
+      header: "People",
+      cell: (r) => (
+        <div className="space-y-1 text-xs text-slate-600 dark:text-slate-300">
+          <p>
+            Reporter:{" "}
+            {r.reporter?.full_name || r.reporter?.username
+              ? `${r.reporter?.full_name || ""} ${r.reporter?.username ? `@${r.reporter.username}` : ""}`.trim()
+              : r.reporter_user_id?.slice(0, 8) || "—"}
+          </p>
+          <p>
+            Reported:{" "}
+            {r.reportedUser?.full_name || r.reportedUser?.username
+              ? `${r.reportedUser?.full_name || ""} ${r.reportedUser?.username ? `@${r.reportedUser.username}` : ""}`.trim()
+              : "—"}
+          </p>
         </div>
       ),
     },
@@ -133,42 +159,30 @@ export default function ReportsPage() {
     {
       key: "actions",
       header: "Actions",
-      cell: (r) =>
-        hasPermission("reports:write") ? (
-          <div className="space-y-2">
-            <Input
-              className="h-8"
-              placeholder="Resolution note"
-              value={editNote[r.id] || ""}
-              onChange={(e) => setEditNote((m) => ({ ...m, [r.id]: e.target.value }))}
-            />
-            <div className="flex flex-wrap gap-1">
-              {(["open", "reviewing", "resolved", "dismissed"] as const).map((s) => (
-                <Button key={s} size="sm" variant="outline" onClick={() => void updateStatus(r.id, s)}>
-                  {s}
-                </Button>
-              ))}
-              <Button
-                size="sm"
-                variant="destructive"
-                onClick={() => {
-                  if (!confirm("Delete this report?")) return;
-                  void api
-                    .delete(`/reports/${r.id}`)
-                    .then(() => {
-                      toast.success("Deleted");
-                      return load();
-                    })
-                    .catch((e) => toast.error(e.message));
-                }}
-              >
-                Delete
-              </Button>
-            </div>
-          </div>
-        ) : (
-          "â€”"
-        ),
+      cell: (r) => (
+        <div className="space-y-2">
+          <Button size="sm" variant="outline" asChild>
+            <Link href={`/reports/${r.id}`}>View details</Link>
+          </Button>
+          {hasPermission("reports:write") ? (
+            <>
+              <Input
+                className="h-8"
+                placeholder="Resolution note"
+                value={editNote[r.id] || ""}
+                onChange={(e) => setEditNote((m) => ({ ...m, [r.id]: e.target.value }))}
+              />
+              <div className="flex flex-wrap gap-1">
+                {(["open", "reviewing", "resolved", "dismissed"] as const).map((s) => (
+                  <Button key={s} size="sm" variant="outline" onClick={() => void updateStatus(r.id, s)}>
+                    {s}
+                  </Button>
+                ))}
+              </div>
+            </>
+          ) : null}
+        </div>
+      ),
     },
   ];
 
@@ -193,11 +207,11 @@ export default function ReportsPage() {
             <Input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Reason, targetâ€¦"
+              placeholder="Reason, report ID, user ID, post ID..."
               onKeyDown={(e) => e.key === "Enter" && setPage(1)}
             />
           </div>
-          <div className="w-full space-y-1.5 md:w-48">
+          <div className="w-full space-y-1.5 md:w-44">
             <Label>Status</Label>
             <select
               className="atlas-select"
@@ -212,6 +226,24 @@ export default function ReportsPage() {
               <option value="reviewing">Reviewing</option>
               <option value="resolved">Resolved</option>
               <option value="dismissed">Dismissed</option>
+            </select>
+          </div>
+          <div className="w-full space-y-1.5 md:w-44">
+            <Label>Type</Label>
+            <select
+              className="atlas-select"
+              value={targetType}
+              onChange={(e) => {
+                setTargetType(e.target.value);
+                setPage(1);
+              }}
+            >
+              <option value="">All</option>
+              <option value="post">Post</option>
+              <option value="comment">Comment</option>
+              <option value="user">User</option>
+              <option value="message">Message</option>
+              <option value="other">Other</option>
             </select>
           </div>
           <Button

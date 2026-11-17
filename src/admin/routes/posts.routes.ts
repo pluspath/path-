@@ -7,6 +7,15 @@ import { createPostSchema, updatePostSchema } from "../validation/schemas";
 import { parsePagination } from "../utils/pagination";
 import { fail, ok, paginated } from "../utils/response";
 
+function errorText(e: unknown, fallback: string): string {
+  if (e instanceof Error && e.message.trim()) return e.message;
+  if (e && typeof e === "object" && "message" in e) {
+    const message = (e as { message?: unknown }).message;
+    if (typeof message === "string" && message.trim()) return message;
+  }
+  return fallback;
+}
+
 const postsRoutes = new Hono<AdminEnv>();
 postsRoutes.use("*", adminAuthMiddleware);
 
@@ -28,7 +37,7 @@ postsRoutes.get("/", requirePermission("posts:read"), async (c) => {
     });
     return paginated(c, result);
   } catch (e) {
-    return fail(c, e instanceof Error ? e.message : "Failed to list posts", 500);
+    return fail(c, errorText(e, "Failed to list posts"), 500);
   }
 });
 
@@ -65,6 +74,14 @@ postsRoutes.post("/:id/hide", requirePermission("posts:write"), async (c) => {
     return ok(c, await postsService.hide(c.req.param("id"), getActor(c)));
   } catch (e) {
     return fail(c, e instanceof Error ? e.message : "Hide failed", 500);
+  }
+});
+
+postsRoutes.post("/:id/unhide", requirePermission("posts:write"), async (c) => {
+  try {
+    return ok(c, await postsService.unhide(c.req.param("id"), getActor(c)));
+  } catch (e) {
+    return fail(c, e instanceof Error ? e.message : "Restore failed", 500);
   }
 });
 

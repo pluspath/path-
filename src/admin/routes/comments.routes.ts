@@ -19,7 +19,8 @@ commentsRoutes.get("/", requirePermission("comments:read"), async (c) => {
       search: c.req.query("search"),
     });
     const status = c.req.query("status") || undefined;
-    return paginated(c, await commentsService.list({ ...p, status }));
+    const postId = c.req.query("postId") || c.req.query("post_id") || undefined;
+    return paginated(c, await commentsService.list({ ...p, status, postId }));
   } catch (e) {
     return fail(c, e instanceof Error ? e.message : "Failed to list comments", 500);
   }

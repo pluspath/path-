@@ -1,4 +1,26 @@
+import { findAuthUserByEmail } from "../../lib/auth-users";
+import { hydratePostProfiles } from "../../lib/load-posts";
 import { supabaseAdmin } from "../../supabase";
+import { profileSearchFilter } from "../utils/profile-search";
+
+function dbError(error: unknown, fallback: string): Error {
+  if (error instanceof Error && error.message.trim()) return error;
+  if (error && typeof error === "object" && "message" in error) {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === "string" && message.trim()) return new Error(message);
+  }
+  return new Error(fallback);
+}
+
+function safeIlike(value: string): string {
+  return value.replace(/[%_,.()*]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+const POST_LIST_SELECTS = [
+  "id, user_id, type, content, image_url, location, is_hidden, is_published, created_at, profiles!user_id(id, username, full_name, avatar_url)",
+  "*, profiles!user_id(id, username, full_name, avatar_url)",
+  "*",
+] as const;
 
 export const dataRepository = {
   // ---- Profiles / Users ----
@@ -16,9 +38,17 @@ export const dataRepository = {
 
     if (opts.status) query = query.eq("status", opts.status);
     if (opts.search) {
-      query = query.or(
-        `username.ilike.%${opts.search}%,full_name.ilike.%${opts.search}%,location.ilike.%${opts.search}%`
-      );
+      let emailUserId: string | null = null;
+      if (opts.search.includes("@")) {
+        try {
+          const found = await findAuthUserByEmail(opts.search);
+          if (found.ok && found.user?.id) emailUserId = found.user.id;
+        } catch {
+          emailUserId = null;
+        }
+      }
+      const filter = profileSearchFilter(opts.search, emailUserId);
+      if (filter) query = query.or(filter);
     }
 
     const { data, error, count } = await query;
@@ -76,32 +106,61 @@ export const dataRepository = {
     limit: number;
     offset: number;
   }) {
-    let query = supabaseAdmin
-      .from("posts")
-      .select("*, profiles(id, username, full_name, avatar_url)", { count: "exact" })
-      .order("created_at", { ascending: false })
-      .range(opts.offset, opts.offset + opts.limit - 1);
+    // `profiles(...)` without `!user_id` is ambiguous once posts.repath_of exists,
+    // and moderation columns may be missing until the startup migration runs.
+    let lastError: unknown = null;
+    for (const select of POST_LIST_SELECTS) {
+      for (const withExtras of [true, false]) {
+        let query = supabaseAdmin
+          .from("posts")
+          .select(select, { count: "exact" })
+          .order("created_at", { ascending: false })
+          .range(opts.offset, opts.offset + opts.limit - 1);
 
-    if (opts.type) query = query.eq("type", opts.type);
-    if (opts.hidden !== undefined) query = query.eq("is_hidden", opts.hidden);
-    if (opts.published !== undefined) query = query.eq("is_published", opts.published);
-    if (opts.search) {
-      query = query.or(`content.ilike.%${opts.search}%,location.ilike.%${opts.search}%`);
+        if (opts.type) query = query.eq("type", opts.type);
+        if (withExtras) {
+          if (opts.hidden !== undefined) query = query.eq("is_hidden", opts.hidden);
+          if (opts.published !== undefined) query = query.eq("is_published", opts.published);
+          const raw = (opts.search || "").trim();
+          const term = raw ? safeIlike(raw) : "";
+          const uuidLike =
+            /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(raw);
+          if (uuidLike) {
+            query = query.or(`id.eq.${raw},user_id.eq.${raw}`);
+          } else if (term) {
+            query = query.or(`content.ilike.%${term}%,location.ilike.%${term}%`);
+          }
+        }
+
+        const { data, error, count } = await query;
+        if (!error) {
+          const items = data ?? [];
+          if (items.length > 0 && !items.some((row) => row && typeof row === "object" && "profiles" in row && (row as { profiles?: unknown }).profiles)) {
+            await hydratePostProfiles(items);
+          }
+          return { items, total: count ?? 0 };
+        }
+        lastError = error;
+        const message = dbError(error, "").message;
+        const extrasBrokeIt = /is_hidden|is_published|content|location/.test(message);
+        if (!withExtras || !extrasBrokeIt) break;
+      }
     }
-
-    const { data, error, count } = await query;
-    if (error) throw error;
-    return { items: data ?? [], total: count ?? 0 };
+    throw dbError(lastError, "Failed to list posts");
   },
 
   async getPost(id: string) {
-    const { data, error } = await supabaseAdmin
-      .from("posts")
-      .select("*, profiles(id, username, full_name, avatar_url)")
-      .eq("id", id)
-      .maybeSingle();
-    if (error) throw error;
-    return data;
+    let lastError: unknown = null;
+    for (const select of POST_LIST_SELECTS) {
+      const { data, error } = await supabaseAdmin.from("posts").select(select).eq("id", id).maybeSingle();
+      if (!error) {
+        const row = data as { profiles?: unknown } | null;
+        if (row && !row.profiles) await hydratePostProfiles([row]);
+        return data;
+      }
+      lastError = error;
+    }
+    throw dbError(lastError, "Failed to get post");
   },
 
   async createPost(row: Record<string, unknown>) {
@@ -138,6 +197,7 @@ export const dataRepository = {
   async listComments(opts: {
     search?: string;
     status?: string;
+    postId?: string;
     limit: number;
     offset: number;
   }) {
@@ -148,11 +208,56 @@ export const dataRepository = {
       .range(opts.offset, opts.offset + opts.limit - 1);
 
     if (opts.status) query = query.eq("moderation_status", opts.status);
+    if (opts.postId) query = query.eq("post_id", opts.postId);
     if (opts.search) query = query.ilike("content", `%${opts.search}%`);
 
     const { data, error, count } = await query;
     if (error) throw error;
     return { items: data ?? [], total: count ?? 0 };
+  },
+
+  async countReactionsForPost(postId: string) {
+    const { count, error } = await supabaseAdmin
+      .from("reactions")
+      .select("id", { count: "exact", head: true })
+      .eq("post_id", postId);
+    if (error) throw error;
+    return count ?? 0;
+  },
+
+  async countViewsForPost(postId: string) {
+    const { count, error } = await supabaseAdmin
+      .from("post_views")
+      .select("post_id", { count: "exact", head: true })
+      .eq("post_id", postId);
+    if (error) {
+      // Table may be missing in older environments.
+      if (/post_views|schema cache|does not exist/i.test(error.message ?? "")) return 0;
+      throw error;
+    }
+    return count ?? 0;
+  },
+
+  async countReportsForTarget(targetType: string, targetId: string) {
+    const { count, error } = await supabaseAdmin
+      .from("reports")
+      .select("id", { count: "exact", head: true })
+      .eq("target_type", targetType)
+      .eq("target_id", targetId);
+    if (error) throw error;
+    return count ?? 0;
+  },
+
+  async listReportsForTarget(targetType: string, targetId: string, limit = 20) {
+    const { data, error } = await supabaseAdmin
+      .from("reports")
+      .select("*")
+      .eq("target_type", targetType)
+      .eq("target_id", targetId)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+    if (error) throw error;
+    return data ?? [];
   },
 
   async updateComment(id: string, patch: Record<string, unknown>) {

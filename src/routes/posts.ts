@@ -236,10 +236,18 @@ postsRouter.get("/", async (c) => {
       limit,
       batchSize,
       fetchFriends: (pageCursor, size) =>
-        fetchNewestMomentBatch((q) => q.in("user_id", allowedUserIds), pageCursor, size),
+        fetchNewestMomentBatch(
+          (q) => q.in("user_id", allowedUserIds).eq("is_hidden", false).neq("is_published", false),
+          pageCursor,
+          size
+        ),
       fetchPublic: async (pageCursor, size) => {
         try {
-          return await fetchNewestMomentBatch((q) => q.eq("audience", "public"), pageCursor, size);
+          return await fetchNewestMomentBatch(
+            (q) => q.eq("audience", "public").eq("is_hidden", false).neq("is_published", false),
+            pageCursor,
+            size
+          );
         } catch (e) {
           console.warn("[posts] public moment window failed:", e instanceof Error ? e.message : e);
           return [];
@@ -247,6 +255,9 @@ postsRouter.get("/", async (c) => {
       },
       accept: (p: any) => {
         if (!p?.id) return false;
+        // Admin-hidden / unpublished moments never appear in the user feed.
+        if (p.is_hidden === true) return false;
+        if (p.is_published === false) return false;
         if (p.user_id !== userId && blockedSet.has(p.user_id)) return false;
         if (p.user_id !== userId && deletionHidden.has(p.user_id)) return false;
         if (p.user_id === userId) return true;

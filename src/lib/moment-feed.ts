@@ -6,10 +6,12 @@ import {
   sortMomentsNewestFirst,
 } from "./moment-order";
 
-const META_SELECT = "id, created_at, user_id, audience, type, content, image_url, location";
+const META_SELECT =
+  "id, created_at, user_id, audience, type, content, image_url, location, is_hidden, is_published";
 // Keeps `audience` (privacy-critical) but drops optional display columns.
-const META_NO_LOCATION = "id, created_at, user_id, audience, type, content, image_url";
-const META_BASIC = "id, created_at, user_id, type";
+const META_NO_LOCATION =
+  "id, created_at, user_id, audience, type, content, image_url, is_hidden, is_published";
+const META_BASIC = "id, created_at, user_id, type, is_hidden, is_published";
 
 function orderNewest(query: any): any {
   return query
