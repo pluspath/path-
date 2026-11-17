@@ -58,6 +58,39 @@ const COMMENT_LIST_SELECT =
 const COMMENT_LIST_SELECT_LEGACY =
   "id, post_id, user_id, content, created_at, profiles:user_id(id, full_name, username, avatar_url, gender, is_verified)";
 
+/**
+ * Structured (device GPS) location columns for a Moment, without clobbering an
+ * explicit venue / check-in the client already chose.
+ *  - A client-provided place name (`locationName`) always wins: legacy
+ *    location / lat / lng stay exactly as sent and no GPS-derived structured
+ *    columns are written.
+ *  - For non-check-in Moments the raw GPS coordinates are dropped (only the
+ *    display label / city / region / country are stored), so precise coords are
+ *    never exposed through formatPost for ordinary text/photo Moments.
+ */
+function structuredPostLocationColumns(
+  structuredLoc: ReturnType<typeof parseIncomingLocation>,
+  opts: { explicitPlace: boolean; explicitCoords: boolean; type?: string | null }
+): Record<string, unknown> {
+  if (!structuredLoc || opts.explicitPlace) return {};
+  const cols = postLocationColumns(structuredLoc);
+  const isCheckIn = opts.type === "location";
+  if (!isCheckIn && !opts.explicitCoords) {
+    delete cols.location_lat;
+    delete cols.location_lng;
+  }
+  return cols;
+}
+
+/** Unique reactor counts are an enhancement — never 500 a feed if the SQL fails. */
+async function safeAttachUniqueReactorCounts(posts: any[], blockedIds: string[] = []): Promise<void> {
+  try {
+    await attachUniqueReactorCounts(posts, blockedIds);
+  } catch (e) {
+    console.warn("[posts] unique reactor counts failed:", e instanceof Error ? e.message : e);
+  }
+}
+
 async function withPolls(posts: any[], viewerId?: string): Promise<void> {
   try {
     await attachPollsToPosts(posts, viewerId);
@@ -243,7 +276,7 @@ postsRouter.get("/", async (c) => {
 
   // Latest preview comment per moment in one batched query (before formatPost).
   await attachCommentPreviews(ordered, userId ?? undefined, blockedIds);
-  await attachUniqueReactorCounts(ordered, blockedIds);
+  await safeAttachUniqueReactorCounts(ordered, blockedIds);
   await withPolls(ordered, userId ?? undefined);
   if (userId && ordered.some((p) => p?.original)) {
     // Reuse the friends / close-friends / blocks / deletion sets already loaded above
@@ -407,7 +440,7 @@ postsRouter.get("/hashtag/:tag", async (c) => {
       : null;
 
   await attachCommentPreviews(page, userId ?? undefined, blockedIds);
-  await attachUniqueReactorCounts(page, blockedIds);
+  await safeAttachUniqueReactorCounts(page, blockedIds);
   await withPolls(page, userId ?? undefined);
 
   const formatted = page.map((p) => formatPost(p, userId ?? undefined, blockedIds));
@@ -565,7 +598,7 @@ async function handleInteractedMoments(c: any) {
   await attachOriginals(userClient, orderedPosts);
 
   await attachCommentPreviews(orderedPosts, userId, blockedIds);
-  await attachUniqueReactorCounts(orderedPosts, blockedIds);
+  await safeAttachUniqueReactorCounts(orderedPosts, blockedIds);
   await withPolls(orderedPosts, userId);
 
   const formatted = orderedPosts.map((p: any) => formatPost(p, userId, blockedIds));
@@ -632,7 +665,7 @@ postsRouter.get("/:id", async (c) => {
 
   // Same preview selection as the feed (viewer-priority).
   await attachCommentPreviews([post], userId, blockedIds);
-  await attachUniqueReactorCounts([post], blockedIds);
+  await safeAttachUniqueReactorCounts([post], blockedIds);
   await withPolls([post], userId);
   scrubInvisibleOriginals([post], userId, visCtx);
   const formatted = formatPost(post, userId, blockedIds);
@@ -806,8 +839,8 @@ postsRouter.post("/", async (c) => {
     // Accept either a single `image` (legacy) or an `images` array (up to 6).
     image_url: encodeImages(body.images, body.image),
     location: body.locationName || null,
-    location_lat: body.locationLat || null,
-    location_lng: body.locationLng || null,
+    location_lat: body.locationLat ?? null,
+    location_lng: body.locationLng ?? null,
     venue_category: body.venueCategory || null,
     music_title: body.musicTitle || null,
     music_artist: body.musicArtist || null,
@@ -820,7 +853,11 @@ postsRouter.post("/", async (c) => {
     // sleep_duration is an INTEGER (minutes) column; the client sends "8h 30m".
     // Parse to minutes here so the Awake moment actually inserts.
     sleep_duration: parseDurationToMinutes(body.sleepDuration),
-    ...postLocationColumns(structuredLoc),
+    ...structuredPostLocationColumns(structuredLoc, {
+      explicitPlace: !!body.locationName,
+      explicitCoords: body.locationLat != null && body.locationLng != null,
+      type: body.type,
+    }),
   };
   // Prefer explicit legacy fields when structured location was not sent.
   if (!structuredLoc) {
@@ -1036,7 +1073,16 @@ postsRouter.patch("/:id", async (c) => {
   if ("locationLat" in body) updateData.location_lat = body.locationLat ?? null;
   if ("locationLng" in body) updateData.location_lng = body.locationLng ?? null;
   const editLoc = parseIncomingLocation(body.location ?? body.contentLocation);
-  if (editLoc) Object.assign(updateData, postLocationColumns(editLoc));
+  if (editLoc) {
+    Object.assign(
+      updateData,
+      structuredPostLocationColumns(editLoc, {
+        explicitPlace: !!body.locationName,
+        explicitCoords: body.locationLat != null && body.locationLng != null,
+        type: existingPost.type,
+      })
+    );
+  }
   if (body.clearLocation === true) {
     updateData.location = null;
     updateData.location_lat = null;
@@ -1420,14 +1466,18 @@ postsRouter.post("/:id/view", viewLimiter, async (c) => {
       { onConflict: "post_id,user_id", ignoreDuplicates: true }
     );
   if (viewErr) {
-    const { ensurePostViewsTable } = await import("../lib/schema");
-    await ensurePostViewsTable();
-    await supabaseAdmin
-      .from("post_views")
-      .upsert(
-        { post_id: id, user_id: userId, viewed_at: new Date().toISOString() },
-        { onConflict: "post_id,user_id", ignoreDuplicates: true }
-      );
+    try {
+      const { ensurePostViewsTable } = await import("../lib/schema");
+      await ensurePostViewsTable();
+      await supabaseAdmin
+        .from("post_views")
+        .upsert(
+          { post_id: id, user_id: userId, viewed_at: new Date().toISOString() },
+          { onConflict: "post_id,user_id", ignoreDuplicates: true }
+        );
+    } catch (e) {
+      console.warn("[post_views] retry failed:", e instanceof Error ? e.message : e);
+    }
   }
 
   return c.body(null, 204);
@@ -1550,29 +1600,32 @@ postsRouter.get("/:id/comments", async (c) => {
 
   const whoStarredMe = userId ? await getWhoStarredMe(userId) : new Set<string>();
 
-  // Newest-first fetch (limit+1), then reverse to ascending for display.
-  let commentsQuery = supabaseAdmin
-    .from("comments")
-    .select(COMMENT_LIST_SELECT)
-    .eq("post_id", id)
-    .order("created_at", { ascending: false })
-    .limit(limit + 1);
-  if (beforeCursor?.createdAt) {
-    commentsQuery = commentsQuery.lte("created_at", beforeCursor.createdAt);
-  }
-
-  let { data: commentsNewestFirst, error } = await commentsQuery;
-  if (error && /location_|column/i.test(error.message ?? "")) {
-    commentsQuery = supabaseAdmin
+  // Newest-first keyset fetch (limit+1), then reverse to ascending for display.
+  // Order is (created_at DESC, id DESC) and the cursor is STRICT (<), so the
+  // cursor row (already delivered on the previous page) never takes a slot.
+  const buildCommentsQuery = (select: string) => {
+    let q = supabaseAdmin
       .from("comments")
-      .select(COMMENT_LIST_SELECT_LEGACY)
+      .select(select)
       .eq("post_id", id)
       .order("created_at", { ascending: false })
+      .order("id", { ascending: false })
       .limit(limit + 1);
     if (beforeCursor?.createdAt) {
-      commentsQuery = commentsQuery.lte("created_at", beforeCursor.createdAt);
+      if (beforeCursor.id) {
+        q = q.or(
+          `created_at.lt.${beforeCursor.createdAt},and(created_at.eq.${beforeCursor.createdAt},id.lt.${beforeCursor.id})`
+        );
+      } else {
+        q = q.lt("created_at", beforeCursor.createdAt);
+      }
     }
-    ({ data: commentsNewestFirst, error } = await commentsQuery);
+    return q;
+  };
+
+  let { data: commentsNewestFirst, error } = await buildCommentsQuery(COMMENT_LIST_SELECT);
+  if (error && /location_|column/i.test(error.message ?? "")) {
+    ({ data: commentsNewestFirst, error } = await buildCommentsQuery(COMMENT_LIST_SELECT_LEGACY));
   }
 
   if (error) {
@@ -1580,12 +1633,16 @@ postsRouter.get("/:id/comments", async (c) => {
     return c.json({ error: { message: "Failed to fetch comments" } }, 500);
   }
 
-  let candidates = commentsNewestFirst ?? [];
-  if (beforeCursor) {
-    candidates = candidates.filter((comment: any) =>
-      isOlderThanCursor(String(comment.created_at ?? ""), String(comment.id ?? ""), beforeCursor)
-    );
-  }
+  // hasMore / cursor come from the RAW fetch so blocked / hidden comments
+  // cannot shrink the page and falsely signal "no more".
+  const rawRows: any[] = (commentsNewestFirst as any[] | null) ?? [];
+  const hasMore = rawRows.length > limit;
+  const rawPage = hasMore ? rawRows.slice(0, limit) : rawRows;
+  const rawOldest = rawPage.length > 0 ? rawPage[rawPage.length - 1] : null;
+  const nextCursor =
+    hasMore && rawOldest?.created_at && rawOldest?.id
+      ? encodeCursor(String(rawOldest.created_at), String(rawOldest.id))
+      : null;
 
   const blockedSet = userId ? new Set(await getBlockedIds(userId)) : null;
 
@@ -1598,7 +1655,7 @@ postsRouter.get("/:id/comments", async (c) => {
   }
 
   const visibleComments: any[] = [];
-  for (const comment of candidates) {
+  for (const comment of rawPage) {
     if (blockedSet?.has(comment.user_id)) continue;
     if (!userId) continue;
     if (userId === postRow.user_id || userId === comment.user_id) {
@@ -1618,16 +1675,8 @@ postsRouter.get("/:id/comments", async (c) => {
     if (friendsOk) visibleComments.push(comment);
   }
 
-  const hasMore = visibleComments.length > limit;
-  const pageNewestFirst = hasMore ? visibleComments.slice(0, limit) : visibleComments;
   // Ascending within the page (oldest → newest) for CommentsSheet.
-  const page = pageNewestFirst.slice().reverse();
-  const oldest = page.length > 0 ? page[0] : null;
-  const nextCursor =
-    hasMore && oldest?.created_at && oldest?.id
-      ? encodeCursor(String(oldest.created_at), String(oldest.id))
-      : null;
-
+  const page = visibleComments.slice().reverse();
   const formatted = page.map((comment: any) => formatCommentRow(comment));
 
   return c.json({ data: formatted, nextCursor, hasMore, limit });

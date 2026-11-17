@@ -100,6 +100,17 @@ async function countUniquePublicReactors(
 
 type RawReaction = { user_id: string; type: string | null; created_at: string | null };
 
+/** Always return an ISO string for cursors (direct SQL drivers return Date objects). */
+function toIsoString(value: unknown): string | null {
+  if (value === null || value === undefined || value === "") return null;
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value.toISOString();
+  }
+  const s = String(value);
+  const d = new Date(s);
+  return Number.isNaN(d.getTime()) ? s : d.toISOString();
+}
+
 async function fetchRawWindow(
   postId: string,
   cursor: { createdAt: string; userId: string } | null,
@@ -134,7 +145,7 @@ async function fetchRawWindow(
     return viaSql.map((r) => ({
       user_id: String(r.user_id),
       type: r.type ?? null,
-      created_at: r.created_at ? String(r.created_at) : null,
+      created_at: toIsoString(r.created_at),
     }));
   }
 
@@ -168,7 +179,7 @@ async function fetchRawWindow(
   return (data ?? []).map((r: any) => ({
     user_id: String(r.user_id),
     type: r.type ?? null,
-    created_at: r.created_at ? String(r.created_at) : null,
+    created_at: toIsoString(r.created_at),
   }));
 }
 
@@ -221,7 +232,10 @@ export async function listUniquePublicReactors(params: {
       exhausted = true;
       break;
     }
-    scanCursor = { createdAt: String(last.created_at), userId: String(last.user_id) };
+    scanCursor = {
+      createdAt: toIsoString(last.created_at) ?? String(last.created_at),
+      userId: String(last.user_id),
+    };
     if (rows.length < Math.min(limit * 5, 250)) {
       exhausted = true;
       break;
@@ -269,9 +283,9 @@ export async function listUniquePublicReactors(params: {
   const last = page[page.length - 1];
   const nextCursor =
     hasMore && last?.created_at && last?.user_id
-      ? encodeCursor(String(last.created_at), String(last.user_id))
+      ? encodeCursor(toIsoString(last.created_at) ?? String(last.created_at), String(last.user_id))
       : hasMore && !exhausted && last?.user_id
-        ? encodeCursor(last.created_at ?? new Date(0).toISOString(), String(last.user_id))
+        ? encodeCursor(toIsoString(last.created_at) ?? new Date(0).toISOString(), String(last.user_id))
         : null;
 
   const total = await countUniquePublicReactors(params.postId, blockedSet);

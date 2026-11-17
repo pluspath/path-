@@ -191,10 +191,21 @@ async function countUnreadDirectMessages(
   userId: string
 ): Promise<{ total: number; requests: number }> {
   try {
-    const { data: participations } = await client
+    // Hidden (deleted-for-me) chats must not count toward the badge.
+    let { data: participations, error: partErr } = await client
       .from("conversation_participants")
       .select("conversation_id, last_read_at")
-      .eq("user_id", userId);
+      .eq("user_id", userId)
+      .is("hidden_at", null);
+    if (partErr && /hidden_at|column/i.test(partErr.message ?? "")) {
+      ({ data: participations, error: partErr } = await client
+        .from("conversation_participants")
+        .select("conversation_id, last_read_at")
+        .eq("user_id", userId));
+    }
+    if (partErr) {
+      console.warn("[push] unread DM participations failed:", partErr.message);
+    }
     const parts = participations ?? [];
     if (parts.length === 0) return { total: 0, requests: 0 };
 

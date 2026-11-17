@@ -25,6 +25,7 @@ export async function countUnreadByConversationDirect(
         FROM conversation_participants cp
         INNER JOIN messages m ON m.conversation_id = cp.conversation_id
         WHERE cp.user_id = ${userId}::uuid
+          AND cp.hidden_at IS NULL
           AND m.conversation_id = ANY(${sql.array(convIds)}::uuid[])
           AND m.sender_id <> ${userId}::uuid
           AND (cp.last_read_at IS NULL OR m.created_at > cp.last_read_at)

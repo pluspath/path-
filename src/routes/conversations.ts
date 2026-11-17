@@ -407,7 +407,11 @@ conversationsRouter.get("/", async (c) => {
       pinnedAtByConv[p.conversation_id] = p.pinned_at ?? null;
     }
 
-    const [{ data: conversations }, { data: allParticipants }, blockedIds] = await Promise.all([
+    const [
+      { data: conversations, error: convsErr },
+      { data: allParticipants, error: allPartsErr },
+      blockedIds,
+    ] = await Promise.all([
       db.from("conversations").select("*").in("id", convIds).order("updated_at", { ascending: false }),
       db
         .from("conversation_participants")
@@ -416,6 +420,14 @@ conversationsRouter.get("/", async (c) => {
         .neq("user_id", userId),
       getBlockedIds(userId, db),
     ]);
+
+    if (convsErr || allPartsErr) {
+      console.error(
+        "[conversations] inbox load error:",
+        convsErr?.message ?? allPartsErr?.message
+      );
+      return c.json({ error: { message: "Failed to load conversations" } }, 500);
+    }
 
     const otherUserIdByConv: Record<string, string> = {};
     // Number of non-viewer participants — exactly 1 means an exclusive 1:1 DM.
@@ -923,10 +935,24 @@ conversationsRouter.post("/unread-counts", async (c) => {
 
   const db = supabaseAdmin;
 
-  const { data: participations } = await db
+  // Hidden (deleted-for-me) chats never count toward unread.
+  let participations: any[] | null = null;
+  let partErr: any = null;
+  ({ data: participations, error: partErr } = await db
     .from("conversation_participants")
     .select("conversation_id, last_read_at")
-    .eq("user_id", userId);
+    .eq("user_id", userId)
+    .is("hidden_at", null));
+  if (partErr && /hidden_at|column/i.test(partErr.message ?? "")) {
+    ({ data: participations, error: partErr } = await db
+      .from("conversation_participants")
+      .select("conversation_id, last_read_at")
+      .eq("user_id", userId));
+  }
+  if (partErr) {
+    console.error("[conversations] unread-counts participations error:", partErr.message);
+    return c.json({ error: { message: "Failed to load unread counts" } }, 500);
+  }
 
   const result = await computeUnreadCounts(db, userId, participations ?? []);
 
@@ -962,13 +988,21 @@ async function hideConversationsForUser(
   const now = new Date().toISOString();
 
   // Update without .select() first — some PostgREST configs fail RETURNING even when UPDATE works.
+  // last_read_at = now so deleted chats stop inflating unread counts.
   let { error } = await db
     .from("conversation_participants")
-    .update({ hidden_at: now, pinned_at: null })
+    .update({ hidden_at: now, pinned_at: null, last_read_at: now })
     .eq("user_id", userId)
     .in("conversation_id", unique);
 
   if (error && /pinned_at|column/i.test(error.message ?? "")) {
+    ({ error } = await db
+      .from("conversation_participants")
+      .update({ hidden_at: now, last_read_at: now })
+      .eq("user_id", userId)
+      .in("conversation_id", unique));
+  }
+  if (error && /last_read_at|column/i.test(error.message ?? "")) {
     ({ error } = await db
       .from("conversation_participants")
       .update({ hidden_at: now })
@@ -992,7 +1026,10 @@ async function hideConversationsForUser(
   return { ok: true, deleted: (hiddenRows ?? []).length || unique.length };
 }
 
-/** Unhide a chat for everyone except optionally one user — used when a new message arrives. */
+/**
+ * Unhide a chat for ALL participants (including the sender) — used when a new
+ * message arrives. Pass exceptUserId only if a caller really needs to skip one user.
+ */
 async function unhideConversationForOthers(
   db: typeof supabaseAdmin,
   conversationId: string,
@@ -1005,7 +1042,10 @@ async function unhideConversationForOthers(
       .eq("conversation_id", conversationId)
       .not("hidden_at", "is", null);
     if (exceptUserId) q = q.neq("user_id", exceptUserId);
-    await q;
+    const { error } = await q;
+    if (error) {
+      console.warn("[conversations] unhide failed:", error.message);
+    }
   } catch (e) {
     console.warn(
       "[conversations] unhide skipped:",
@@ -1324,6 +1364,10 @@ conversationsRouter.post("/:id/messages", async (c) => {
     if (parent?.id) replyTo = parent.id;
   }
 
+  // Clear hidden_at for every participant BEFORE the insert so realtime consumers
+  // that refetch on the new message already see the chat in the inbox.
+  await unhideConversationForOthers(db, id);
+
   const rowFull: Record<string, any> = {
     conversation_id: id,
     sender_id: userId,
@@ -1392,9 +1436,15 @@ conversationsRouter.post("/:id/messages", async (c) => {
     return c.json({ error: { message: "Failed to send message" } }, 500);
   }
 
-  await db.from("conversations").update({ updated_at: new Date().toISOString() }).eq("id", id);
-  // New activity brings the chat back for recipients who deleted-for-me.
-  void unhideConversationForOthers(db, id, userId);
+  {
+    const { error: convUpdErr } = await db
+      .from("conversations")
+      .update({ updated_at: new Date().toISOString() })
+      .eq("id", id);
+    if (convUpdErr) {
+      console.warn("[conversations] updated_at bump failed:", convUpdErr.message);
+    }
+  }
 
   // Fire-and-forget push: respond to the client immediately, deliver in background.
   const senderName = (user as any).full_name ?? "Someone";
@@ -1641,6 +1691,9 @@ conversationsRouter.post("/:id/ping", async (c) => {
     return c.json({ error: { message: "Unable to message this user" } }, 403);
   }
 
+  // Clear hidden_at for every participant BEFORE the insert (see POST /:id/messages).
+  await unhideConversationForOthers(db, id);
+
   const { data: message, error: pingError } = await db
     .from("messages")
     .insert({
@@ -1658,8 +1711,15 @@ conversationsRouter.post("/:id/ping", async (c) => {
     return c.json({ error: { message: "Failed to send ping" } }, 500);
   }
 
-  await db.from("conversations").update({ updated_at: new Date().toISOString() }).eq("id", id);
-  void unhideConversationForOthers(db, id, userId);
+  {
+    const { error: convUpdErr } = await db
+      .from("conversations")
+      .update({ updated_at: new Date().toISOString() })
+      .eq("id", id);
+    if (convUpdErr) {
+      console.warn("[conversations] updated_at bump failed:", convUpdErr.message);
+    }
+  }
 
   // Push the ping so the other person's phone buzzes + sounds even if the app is closed.
   // Fire-and-forget: respond immediately, deliver in background.

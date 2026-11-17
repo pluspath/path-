@@ -161,6 +161,30 @@ export async function ensureContentLocationColumns(): Promise<boolean> {
   return ok;
 }
 
+let postViewsReady: boolean | null = null;
+
+/** Moment read-receipt table. Additive and idempotent (mirrors the startup DDL). */
+export async function ensurePostViewsTable(): Promise<boolean> {
+  if (postViewsReady === true) return true;
+  try {
+    await ensureExecSqlFunction();
+    const ok = await runDdl(`
+      CREATE TABLE IF NOT EXISTS public.post_views (
+        post_id uuid NOT NULL REFERENCES public.posts(id) ON DELETE CASCADE,
+        user_id uuid NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+        viewed_at timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (post_id, user_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_post_views_post ON public.post_views (post_id, viewed_at DESC);
+    `);
+    if (ok) postViewsReady = true;
+    return ok;
+  } catch (e) {
+    console.warn("[schema] ensurePostViewsTable failed:", e instanceof Error ? e.message : e);
+    return false;
+  }
+}
+
 let pollsReady: boolean | null = null;
 
 /** Verified-account polls tables. Additive; safe to re-run. */

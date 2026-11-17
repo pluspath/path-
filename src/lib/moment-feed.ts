@@ -7,9 +7,9 @@ import {
 } from "./moment-order";
 
 const META_SELECT = "id, created_at, user_id, audience, type, content, image_url, location";
+// Keeps `audience` (privacy-critical) but drops optional display columns.
+const META_NO_LOCATION = "id, created_at, user_id, audience, type, content, image_url";
 const META_BASIC = "id, created_at, user_id, type";
-
-let metaSelect = META_SELECT;
 
 function orderNewest(query: any): any {
   return query
@@ -17,21 +17,32 @@ function orderNewest(query: any): any {
     .order("id", { ascending: false });
 }
 
-async function runSelect(build: () => any): Promise<any[]> {
-  let { data, error } = await build();
-  if (
-    error &&
-    metaSelect !== META_BASIC &&
-    /column|audience|schema cache/i.test(String(error.message ?? ""))
-  ) {
-    console.warn("[moments] meta select failed, retrying without optional columns:", error.message);
-    metaSelect = META_BASIC;
-    ({ data, error } = await build());
+const SCHEMA_ERROR = /column|audience|schema cache/i;
+
+/**
+ * Runs a select with a per-request fallback ladder. Nothing is cached across
+ * requests, so one transient schema error can never permanently weaken privacy.
+ *
+ * If `audience` cannot be read at all, rows are tagged `audience: "private"`
+ * (fail closed): callers already hide other users' private moments and still
+ * show the viewer's own. Missing audience is never treated as "friends".
+ */
+async function runSelect(build: (select: string) => any): Promise<any[]> {
+  let { data, error } = await build(META_SELECT);
+  if (error && SCHEMA_ERROR.test(String(error.message ?? ""))) {
+    console.warn("[moments] meta select failed, retrying without location:", error.message);
+    ({ data, error } = await build(META_NO_LOCATION));
+  }
+  if (error && SCHEMA_ERROR.test(String(error.message ?? ""))) {
+    console.warn("[moments] audience select failed, failing closed:", error.message);
+    ({ data, error } = await build(META_BASIC));
+    if (!error) {
+      return (data ?? []).map((row: any) => ({ ...row, audience: "private", audience_unknown: true }));
+    }
   }
   if (error) throw new Error(error.message);
   return data ?? [];
 }
-
 /**
  * Next `batchSize` moments matching `applyFilters`, strictly older than `cursor`,
  * newest first. Ordering is applied on the posts table before the limit.
@@ -44,15 +55,14 @@ export async function fetchNewestMomentBatch(
   batchSize: number
 ): Promise<any[]> {
   const size = Math.max(1, batchSize);
-  const select = () => metaSelect;
 
   const dated = async (narrow: (query: any) => any) =>
-    runSelect(() => orderNewest(narrow(applyFilters(supabaseAdmin.from("posts").select(select())))).limit(size));
+    runSelect((select) => orderNewest(narrow(applyFilters(supabaseAdmin.from("posts").select(select)))).limit(size));
 
   const withUndated = async (datedRows: any[]) => {
     if (datedRows.length >= size) return sortMomentsNewestFirst(datedRows).slice(0, size);
-    const undated = await runSelect(() =>
-      applyFilters(supabaseAdmin.from("posts").select(select()))
+    const undated = await runSelect((select) =>
+      applyFilters(supabaseAdmin.from("posts").select(select))
         .is("created_at", null)
         .order("id", { ascending: false })
         .limit(size - datedRows.length)
@@ -68,8 +78,8 @@ export async function fetchNewestMomentBatch(
   const [older, same] = await Promise.all([
     dated((query) => query.lt("created_at", cursor.createdAt)),
     cursor.id
-      ? runSelect(() =>
-          applyFilters(supabaseAdmin.from("posts").select(select()))
+      ? runSelect((select) =>
+          applyFilters(supabaseAdmin.from("posts").select(select))
             .eq("created_at", cursor.createdAt)
             .lt("id", normalizeMomentId(cursor.id))
             .order("id", { ascending: false })
