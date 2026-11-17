@@ -88,18 +88,6 @@ export default function PostsPage() {
     setFormOpen(true);
   }
 
-  function openEdit(post: Post) {
-    setEditing(post);
-    setForm({
-      user_id: post.user_id || "",
-      type: post.type || "moment",
-      content: post.content || "",
-      image_url: post.image_url || "",
-      location: post.location || "",
-    });
-    setFormOpen(true);
-  }
-
   async function saveForm() {
     setBusy(true);
     try {
