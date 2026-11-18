@@ -240,6 +240,32 @@ export async function ensurePostViewsTable(): Promise<boolean> {
   }
 }
 
+let commentParentReady: boolean | null = null;
+
+/** Nested replies: nullable parent_comment_id on comments. Additive / idempotent. */
+export async function ensureCommentParentColumn(): Promise<boolean> {
+  if (commentParentReady === true) return true;
+  await ensureExecSqlFunction();
+  const ok = await runDdl(`
+    ALTER TABLE public.comments
+      ADD COLUMN IF NOT EXISTS parent_comment_id UUID
+      REFERENCES public.comments(id) ON DELETE SET NULL;
+    CREATE INDEX IF NOT EXISTS idx_comments_parent
+      ON public.comments (parent_comment_id)
+      WHERE parent_comment_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_comments_post_parent_created
+      ON public.comments (post_id, parent_comment_id, created_at ASC);
+  `);
+  if (ok) {
+    commentParentReady = true;
+    console.log("[schema] comments.parent_comment_id ready");
+    await runDdl("NOTIFY pgrst, 'reload schema';");
+  } else {
+    console.warn("[schema] Could not ensure comments.parent_comment_id");
+  }
+  return ok;
+}
+
 let pollsReady: boolean | null = null;
 
 /** Verified-account polls tables. Additive; safe to re-run. */

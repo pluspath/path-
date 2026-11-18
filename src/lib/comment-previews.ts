@@ -39,12 +39,15 @@ export function formatCommentRow(comment: any) {
         ? [comment.location_city.trim(), comment.location_country?.trim()].filter(Boolean).join(", ")
         : undefined;
   const shared = comment.location_shared === true || !!label;
+  const parentId = comment.parent_comment_id ?? comment.parentCommentId ?? null;
   return {
     id: comment.id,
     postId: comment.post_id ?? comment.postId,
     userId: comment.user_id ?? comment.userId,
     content: comment.content,
     createdAt: comment.created_at ?? comment.createdAt,
+    updatedAt: comment.updated_at ?? comment.updatedAt ?? undefined,
+    ...(parentId ? { parentCommentId: String(parentId) } : {}),
     // Public display only — never expose comment coordinates.
     ...(shared && label
       ? {

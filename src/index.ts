@@ -465,6 +465,7 @@ WHERE COALESCE(p.comment_count, 0) > 0
             ensureThemePreferenceColumn,
             ensureVerifiedColumn,
             ensureContentLocationColumns,
+            ensureCommentParentColumn,
             ensurePollTables,
           } = await import("./lib/schema");
           await ensureRepathColumn();
@@ -472,6 +473,7 @@ WHERE COALESCE(p.comment_count, 0) > 0
           await ensureThemePreferenceColumn();
           await ensureVerifiedColumn();
           await ensureContentLocationColumns();
+          await ensureCommentParentColumn();
           await ensurePollTables();
           const { ensureInboxColumns } = await import("./lib/inbox-columns");
           await ensureInboxColumns();

@@ -55,7 +55,9 @@ import type { HonoVariables } from "../types";
 const postsRouter = new Hono<{ Variables: HonoVariables }>();
 
 const COMMENT_LIST_SELECT =
-  "id, post_id, user_id, content, created_at, location_label, location_city, location_region, location_country, location_precision, location_captured_at, location_shared, profiles:user_id(id, full_name, username, avatar_url, gender, is_verified)";
+  "id, post_id, user_id, content, created_at, updated_at, parent_comment_id, location_label, location_city, location_region, location_country, location_precision, location_captured_at, location_shared, profiles:user_id(id, full_name, username, avatar_url, gender, is_verified)";
+const COMMENT_LIST_SELECT_NO_PARENT =
+  "id, post_id, user_id, content, created_at, updated_at, location_label, location_city, location_region, location_country, location_precision, location_captured_at, location_shared, profiles:user_id(id, full_name, username, avatar_url, gender, is_verified)";
 const COMMENT_LIST_SELECT_LEGACY =
   "id, post_id, user_id, content, created_at, profiles:user_id(id, full_name, username, avatar_url, gender, is_verified)";
 
@@ -1820,6 +1822,9 @@ postsRouter.get("/:id/comments", async (c) => {
   // `before` / `cursor` = load older comments (exclusive). First page = newest.
   const beforeRaw = c.req.query("before") ?? c.req.query("cursor");
   const beforeCursor = parseCursor(beforeRaw);
+  // Incremental sync: comments created/updated after this ISO timestamp.
+  const sinceRaw = String(c.req.query("since") ?? "").trim();
+  const sinceIso = sinceRaw && !Number.isNaN(Date.parse(sinceRaw)) ? sinceRaw : null;
 
   const { data: postRow } = await supabaseAdmin
     .from("posts")
@@ -1837,11 +1842,23 @@ postsRouter.get("/:id/comments", async (c) => {
   // Newest-first keyset fetch (limit+1), then reverse to ascending for display.
   // Order is (created_at DESC, id DESC) and the cursor is STRICT (<), so the
   // cursor row (already delivered on the previous page) never takes a slot.
+  // When `since` is set, return only rows created/updated after that time
+  // (ascending) for efficient 5s polling without re-downloading the whole page.
   const buildCommentsQuery = (select: string) => {
     let q = supabaseAdmin
       .from("comments")
       .select(select)
-      .eq("post_id", id)
+      .eq("post_id", id);
+    if (sinceIso) {
+      // New + recently-edited rows for the 5s poller.
+      q = q
+        .or(`created_at.gt.${sinceIso},updated_at.gt.${sinceIso}`)
+        .order("created_at", { ascending: true })
+        .order("id", { ascending: true })
+        .limit(limit + 1);
+      return q;
+    }
+    q = q
       .order("created_at", { ascending: false })
       .order("id", { ascending: false })
       .limit(limit + 1);
@@ -1858,6 +1875,28 @@ postsRouter.get("/:id/comments", async (c) => {
   };
 
   let { data: commentsNewestFirst, error } = await buildCommentsQuery(COMMENT_LIST_SELECT);
+  if (error && /parent_comment_id|column/i.test(error.message ?? "")) {
+    const { ensureCommentParentColumn } = await import("../lib/schema");
+    await ensureCommentParentColumn();
+    ({ data: commentsNewestFirst, error } = await buildCommentsQuery(COMMENT_LIST_SELECT_NO_PARENT));
+  }
+  if (error && /updated_at|column/i.test(error.message ?? "")) {
+    // Retry without updated_at in select / since filter.
+    const buildCreatedOnly = (select: string) => {
+      let q = supabaseAdmin.from("comments").select(select).eq("post_id", id);
+      if (sinceIso) {
+        return q
+          .gt("created_at", sinceIso)
+          .order("created_at", { ascending: true })
+          .order("id", { ascending: true })
+          .limit(limit + 1);
+      }
+      return buildCommentsQuery(select.replace(", updated_at", ""));
+    };
+    ({ data: commentsNewestFirst, error } = await buildCreatedOnly(
+      COMMENT_LIST_SELECT_NO_PARENT.replace(", updated_at", "")
+    ));
+  }
   if (error && /location_|column/i.test(error.message ?? "")) {
     ({ data: commentsNewestFirst, error } = await buildCommentsQuery(COMMENT_LIST_SELECT_LEGACY));
   }
@@ -1872,9 +1911,11 @@ postsRouter.get("/:id/comments", async (c) => {
   const rawRows: any[] = (commentsNewestFirst as any[] | null) ?? [];
   const hasMore = rawRows.length > limit;
   const rawPage = hasMore ? rawRows.slice(0, limit) : rawRows;
-  const rawOldest = rawPage.length > 0 ? rawPage[rawPage.length - 1] : null;
+  // For newest-first pages the last raw row is the oldest (pagination cursor).
+  // For `since` (ascending) pages, do not expose a before-cursor — clients sync by timestamp.
+  const rawOldest = !sinceIso && rawPage.length > 0 ? rawPage[rawPage.length - 1] : null;
   const nextCursor =
-    hasMore && rawOldest?.created_at && rawOldest?.id
+    !sinceIso && hasMore && rawOldest?.created_at && rawOldest?.id
       ? encodeCursor(String(rawOldest.created_at), String(rawOldest.id))
       : null;
 
@@ -1910,7 +1951,8 @@ postsRouter.get("/:id/comments", async (c) => {
   }
 
   // Ascending within the page (oldest → newest) for CommentsSheet.
-  const page = visibleComments.slice().reverse();
+  // `since` queries are already ascending.
+  const page = sinceIso ? visibleComments : visibleComments.slice().reverse();
   const formatted = page.map((comment: any) => formatCommentRow(comment));
 
   return c.json({ data: formatted, nextCursor, hasMore, limit });
@@ -1942,6 +1984,30 @@ postsRouter.post("/:id/comments", async (c) => {
     return c.json({ error: { message: "Comments are turned off for this moment" } }, 403);
   }
 
+  // Optional nested reply — parent must belong to this same Moment.
+  const parentRaw =
+    typeof body?.parentCommentId === "string"
+      ? body.parentCommentId.trim()
+      : typeof body?.parent_comment_id === "string"
+        ? body.parent_comment_id.trim()
+        : "";
+  let parentCommentId: string | null = null;
+  let parentAuthorId: string | null = null;
+  if (parentRaw) {
+    const { ensureCommentParentColumn } = await import("../lib/schema");
+    await ensureCommentParentColumn();
+    const { data: parentRow } = await supabaseAdmin
+      .from("comments")
+      .select("id, post_id, user_id")
+      .eq("id", parentRaw)
+      .maybeSingle();
+    if (!parentRow || parentRow.post_id !== id) {
+      return c.json({ error: { message: "Parent comment not found" } }, 404);
+    }
+    parentCommentId = parentRow.id as string;
+    parentAuthorId = parentRow.user_id as string;
+  }
+
   // Comment location is independent of the Moment's location — never copy it.
   const commentLoc = parseIncomingLocation(body.location ?? body.contentLocation);
   const insertRow: Record<string, unknown> = {
@@ -1949,6 +2015,7 @@ postsRouter.post("/:id/comments", async (c) => {
     post_id: id,
     user_id: userId,
     content,
+    ...(parentCommentId ? { parent_comment_id: parentCommentId } : {}),
     ...commentLocationColumns(commentLoc),
   };
 
@@ -1956,17 +2023,42 @@ postsRouter.post("/:id/comments", async (c) => {
     .from("comments")
     .insert(insertRow)
     .select(
-      "id, post_id, user_id, content, created_at, location_label, location_city, location_region, location_country, location_precision, location_captured_at, location_shared"
+      "id, post_id, user_id, content, created_at, parent_comment_id, location_label, location_city, location_region, location_country, location_precision, location_captured_at, location_shared"
     )
     .single();
 
-  // If location columns are not migrated yet, still publish the comment.
-  if (error && /location_|column/i.test(error.message ?? "")) {
+  // If location / parent columns are not migrated yet, degrade safely.
+  if (error && /parent_comment_id|column/i.test(error.message ?? "")) {
+    const { ensureCommentParentColumn } = await import("../lib/schema");
+    await ensureCommentParentColumn();
     ({ data: comment, error } = await supabaseAdmin
       .from("comments")
-      .insert({ id: insertRow.id, post_id: id, user_id: userId, content })
-      .select("id, post_id, user_id, content, created_at")
+      .insert(insertRow)
+      .select(
+        "id, post_id, user_id, content, created_at, parent_comment_id, location_label, location_city, location_region, location_country, location_precision, location_captured_at, location_shared"
+      )
       .single());
+  }
+  if (error && /location_|column/i.test(error.message ?? "")) {
+    const bare: Record<string, unknown> = {
+      id: insertRow.id,
+      post_id: id,
+      user_id: userId,
+      content,
+      ...(parentCommentId ? { parent_comment_id: parentCommentId } : {}),
+    };
+    ({ data: comment, error } = await supabaseAdmin
+      .from("comments")
+      .insert(bare)
+      .select("id, post_id, user_id, content, created_at, parent_comment_id")
+      .single());
+    if (error && /parent_comment_id|column/i.test(error.message ?? "")) {
+      ({ data: comment, error } = await supabaseAdmin
+        .from("comments")
+        .insert({ id: insertRow.id, post_id: id, user_id: userId, content })
+        .select("id, post_id, user_id, content, created_at")
+        .single());
+    }
   }
 
   if (error || !comment) {
@@ -1998,58 +2090,97 @@ postsRouter.post("/:id/comments", async (c) => {
     }
 
     try {
+      const replySnippet = halfLineSnippet(content);
+      const momentSnippet = halfLineSnippet(targetPost.content);
+      const recipients = new Map<
+        string,
+        { type: "reply" | "comment"; message: string; title: string; body: string }
+      >();
+
+      if (parentCommentId && parentAuthorId && parentAuthorId !== userId) {
+        recipients.set(parentAuthorId, {
+          type: "reply",
+          message: "replied to your comment",
+          title: "New Reply",
+          body: replySnippet
+            ? `${user.full_name} replied: ${replySnippet}`
+            : `${user.full_name} replied to your comment`,
+        });
+      }
+
       if (targetPost.user_id !== userId) {
-        const snippet = halfLineSnippet(targetPost.content);
-        let inserted: { id: string } | null = null;
-        const withComment = await supabaseAdmin
+        // One notification per recipient — if owner is also the parent author, keep reply.
+        if (!recipients.has(targetPost.user_id)) {
+          recipients.set(targetPost.user_id, {
+            type: parentCommentId ? "reply" : "comment",
+            message: parentCommentId ? "replied on your moment" : "commented on your moment",
+            title: parentCommentId ? "New Reply" : "New Comment",
+            body: parentCommentId
+              ? replySnippet
+                ? `${user.full_name} replied: ${replySnippet}`
+                : `${user.full_name} replied on your Moment`
+              : momentSnippet
+                ? `${user.full_name} commented on your Moment ${momentSnippet}`
+                : `${user.full_name} commented on your Moment`,
+          });
+        }
+      }
+
+      for (const [recipientId, payload] of recipients) {
+        // Dedupe retries: same actor + type + comment_id.
+        const { data: existing } = await supabaseAdmin
           .from("notifications")
-          .insert({
-            user_id: targetPost.user_id,
-            from_user_id: userId,
-            type: "comment",
-            message: "commented on your moment",
-            post_id: id,
-            comment_id: comment.id,
-            read: false,
-          })
           .select("id")
-          .single();
-        if (withComment.error && /comment_id|column/i.test(withComment.error.message ?? "")) {
-          const fallback = await supabaseAdmin
+          .eq("user_id", recipientId)
+          .eq("from_user_id", userId)
+          .eq("type", payload.type)
+          .eq("comment_id", comment.id)
+          .maybeSingle();
+
+        let notificationId = existing?.id as string | undefined;
+        if (!notificationId) {
+          const withComment = await supabaseAdmin
             .from("notifications")
             .insert({
-              user_id: targetPost.user_id,
+              user_id: recipientId,
               from_user_id: userId,
-              type: "comment",
-              message: "commented on your moment",
+              type: payload.type,
+              message: payload.message,
               post_id: id,
+              comment_id: comment.id,
               read: false,
             })
             .select("id")
             .single();
-          inserted = fallback.data;
-        } else {
-          inserted = withComment.data;
+          if (withComment.error && /comment_id|column/i.test(withComment.error.message ?? "")) {
+            const fallback = await supabaseAdmin
+              .from("notifications")
+              .insert({
+                user_id: recipientId,
+                from_user_id: userId,
+                type: payload.type,
+                message: payload.message,
+                post_id: id,
+                read: false,
+              })
+              .select("id")
+              .single();
+            notificationId = fallback.data?.id;
+          } else {
+            notificationId = withComment.data?.id;
+          }
         }
 
-        void sendPushToUser(
-          supabaseAdmin,
-          targetPost.user_id,
-          "New Comment",
-          snippet
-            ? `${user.full_name} commented on your Moment ${snippet}`
-            : `${user.full_name} commented on your Moment`,
-          {
-            postId: id,
-            commentId: comment.id,
-            type: "comment",
-            fromUserId: userId,
-            notificationId: inserted?.id,
-          }
-        );
+        void sendPushToUser(supabaseAdmin, recipientId, payload.title, payload.body, {
+          postId: id,
+          commentId: comment.id,
+          type: payload.type,
+          fromUserId: userId,
+          notificationId,
+        });
       }
     } catch (e) {
-      console.error("[notifications] comment insert error:", e);
+      console.error("[notifications] comment/reply insert error:", e);
     }
 
     void notifyMentions({
