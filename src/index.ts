@@ -461,12 +461,14 @@ WHERE COALESCE(p.comment_count, 0) > 0
         if (!schemaCacheBlocked) {
           const {
             ensureRepathColumn,
+            ensureRepathUniqueIndex,
             ensureThemePreferenceColumn,
             ensureVerifiedColumn,
             ensureContentLocationColumns,
             ensurePollTables,
           } = await import("./lib/schema");
           await ensureRepathColumn();
+          await ensureRepathUniqueIndex();
           await ensureThemePreferenceColumn();
           await ensureVerifiedColumn();
           await ensureContentLocationColumns();

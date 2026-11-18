@@ -48,9 +48,24 @@ async function ensureExecSqlFunction(): Promise<boolean> {
   `);
 }
 
+/** Probe whether repath_of is already usable without running DDL. */
+async function probeRepathColumn(): Promise<boolean> {
+  const { error } = await supabaseAdmin.from("posts").select("repath_of").limit(1);
+  if (!error) return true;
+  // Missing-column errors mean we still need DDL; other errors are inconclusive.
+  if (/repath_of|column/i.test(error.message ?? "")) return false;
+  // Column likely exists but select failed for unrelated reasons — treat as ready.
+  return true;
+}
+
 /** Ensure repath_of exists on posts (required for Repath). Safe to call repeatedly. */
 export async function ensureRepathColumn(): Promise<boolean> {
   if (repathColumnReady === true) return true;
+
+  if (await probeRepathColumn()) {
+    repathColumnReady = true;
+    return true;
+  }
 
   await ensureExecSqlFunction();
 
@@ -58,15 +73,51 @@ export async function ensureRepathColumn(): Promise<boolean> {
     "ALTER TABLE public.posts ADD COLUMN IF NOT EXISTS repath_of UUID REFERENCES public.posts(id) ON DELETE SET NULL;"
   );
 
-  if (ok) {
+  if (ok || (await probeRepathColumn())) {
     repathColumnReady = true;
     console.log("[schema] repath_of column ready");
     // Force PostgREST to pick up the new column (avoids PGRST204 schema cache errors).
     await runDdl("NOTIFY pgrst, 'reload schema';");
-  } else {
-    console.warn("[schema] Could not ensure repath_of column");
+    return true;
   }
 
+  console.warn("[schema] Could not ensure repath_of column");
+  return false;
+}
+
+let repathUniqueReady: boolean | null = null;
+
+/**
+ * One Repath per (user, root moment). Cleans obvious duplicates first, then
+ * creates a partial unique index. Safe / idempotent.
+ */
+export async function ensureRepathUniqueIndex(): Promise<boolean> {
+  if (repathUniqueReady === true) return true;
+  await ensureExecSqlFunction();
+  const ok = await runDdl(`
+    WITH ranked AS (
+      SELECT id,
+             ROW_NUMBER() OVER (
+               PARTITION BY user_id, repath_of
+               ORDER BY created_at DESC NULLS LAST, id DESC
+             ) AS rn
+      FROM public.posts
+      WHERE repath_of IS NOT NULL
+    )
+    DELETE FROM public.posts p
+    USING ranked r
+    WHERE p.id = r.id AND r.rn > 1;
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_posts_user_repath_unique
+      ON public.posts (user_id, repath_of)
+      WHERE repath_of IS NOT NULL;
+  `);
+  if (ok) {
+    repathUniqueReady = true;
+    console.log("[schema] unique (user_id, repath_of) index ready");
+  } else {
+    console.warn("[schema] Could not ensure unique repath index");
+  }
   return ok;
 }
 
@@ -121,6 +172,10 @@ export async function ensureVerifiedColumn(): Promise<boolean> {
 /** Probe whether repath_of is usable (cached after first successful ensure). */
 export async function isRepathColumnReady(): Promise<boolean> {
   if (repathColumnReady === true) return true;
+  if (await probeRepathColumn()) {
+    repathColumnReady = true;
+    return true;
+  }
   return ensureRepathColumn();
 }
 

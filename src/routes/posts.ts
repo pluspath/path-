@@ -834,15 +834,17 @@ postsRouter.post("/", async (c) => {
       return c.json({ error: { message: "Invalid repath target" } }, 400);
     }
 
-    const { ensureRepathColumn } = await import("../lib/schema");
+    const { ensureRepathColumn, ensureRepathUniqueIndex } = await import("../lib/schema");
     const ready = await ensureRepathColumn();
     if (!ready) {
       return c.json({ error: { message: "Repath is temporarily unavailable. Please try again shortly." } }, 503);
     }
+    // Best-effort uniqueness; create path still dedupes in application logic.
+    void ensureRepathUniqueIndex();
 
     const { data: target } = await supabaseAdmin
       .from("posts")
-      .select("id, user_id, repath_of")
+      .select("id, user_id, repath_of, audience")
       .eq("id", originalId)
       .maybeSingle();
     if (!target) {
@@ -852,26 +854,63 @@ postsRouter.post("/", async (c) => {
     // Always repath the root moment (one level deep) and notify its owner.
     let rootId = originalId;
     let originalOwnerId = target.user_id as string;
+    let rootAudience = (target as { audience?: string | null }).audience ?? null;
     if (target.repath_of) {
       rootId = target.repath_of as string;
       const { data: root } = await supabaseAdmin
         .from("posts")
-        .select("id, user_id")
+        .select("id, user_id, audience")
         .eq("id", rootId)
         .maybeSingle();
       if (!root) {
         return c.json({ error: { message: "Original moment not found" } }, 404);
       }
       originalOwnerId = root.user_id as string;
+      rootAudience = (root as { audience?: string | null }).audience ?? null;
     }
 
     if (originalOwnerId === userId) {
       return c.json({ error: { message: "You cannot repath your own moment" } }, 400);
     }
 
+    // Enforce the same visibility / block rules as feed + moment detail.
+    const canSeeRoot = await viewerCanAccessMoment(userId, {
+      user_id: originalOwnerId,
+      audience: rootAudience,
+    });
+    if (!canSeeRoot) {
+      return c.json({ error: { message: "Original moment not found" } }, 404);
+    }
+
+    // Idempotent: repeated taps / retries return the existing Repath.
+    const { data: existingRepaths } = await supabaseAdmin
+      .from("posts")
+      .select("id")
+      .eq("user_id", userId)
+      .eq("repath_of", rootId)
+      .order("created_at", { ascending: false })
+      .limit(1);
+    const existingRepathId = existingRepaths?.[0]?.id as string | undefined;
+    if (existingRepathId) {
+      let existingPost: any = null;
+      const { data: rows } = await loadPosts((select) =>
+        supabaseAdmin.from("posts").select(select).eq("id", existingRepathId).limit(1)
+      );
+      existingPost = rows[0] ?? null;
+      if (existingPost?.repath_of) await attachOriginals(userClient, [existingPost]);
+      const formattedExisting = formatPost(existingPost, userId);
+      await refreshFriendshipAvatars([formattedExisting]);
+      await refreshReactionActors([formattedExisting]);
+      if (formattedExisting.original) {
+        await refreshFriendshipAvatars([formattedExisting.original]);
+        await refreshReactionActors([formattedExisting.original]);
+      }
+      return c.json({ data: formattedExisting }, 200);
+    }
+
     const repathInsert = {
       user_id: userId,
-      type: body.type,
+      type: body.type || "thought",
       content: body.content || null,
       repath_of: rootId,
     };
@@ -891,6 +930,34 @@ postsRouter.post("/", async (c) => {
         .single());
     }
 
+    // Unique index race: another request created the same Repath first.
+    if (error && /duplicate|unique|idx_posts_user_repath/i.test(error.message ?? "")) {
+      const { data: raced } = await supabaseAdmin
+        .from("posts")
+        .select("id")
+        .eq("user_id", userId)
+        .eq("repath_of", rootId)
+        .order("created_at", { ascending: false })
+        .limit(1);
+      const racedId = raced?.[0]?.id as string | undefined;
+      if (racedId) {
+        const { data: rows } = await loadPosts((select) =>
+          supabaseAdmin.from("posts").select(select).eq("id", racedId).limit(1)
+        );
+        post = rows[0] ?? null;
+        error = null;
+        if (post?.repath_of) await attachOriginals(userClient, [post]);
+        const formattedRaced = formatPost(post, userId);
+        await refreshFriendshipAvatars([formattedRaced]);
+        await refreshReactionActors([formattedRaced]);
+        if (formattedRaced.original) {
+          await refreshFriendshipAvatars([formattedRaced.original]);
+          await refreshReactionActors([formattedRaced.original]);
+        }
+        return c.json({ data: formattedRaced }, 200);
+      }
+    }
+
     if (error) {
       console.error("[posts] repath create error:", error.message);
       return c.json({ error: { message: "Failed to repath moment" } }, 500);
@@ -905,20 +972,34 @@ postsRouter.post("/", async (c) => {
     }
     if (post?.repath_of) await attachOriginals(userClient, [post]);
 
-    // Notify the original moment owner (activity feed + push). post_id is the
-    // new repath so tapping opens User B's repath of the moment, not the feed.
+    // Notify the original moment owner once per (viewer → root) Repath.
     try {
       if (post?.id && originalOwnerId !== userId) {
-        const { data: existingNotif } = await supabaseAdmin
+        const { data: priorNotifs } = await supabaseAdmin
           .from("notifications")
-          .select("id")
+          .select("id, post_id")
           .eq("user_id", originalOwnerId)
           .eq("from_user_id", userId)
           .eq("type", "repath")
-          .eq("post_id", post.id)
-          .maybeSingle();
+          .order("created_at", { ascending: false })
+          .limit(20);
 
-        let notificationId = existingNotif?.id as string | undefined;
+        let notificationId: string | undefined;
+        const priorIds = (priorNotifs ?? []).map((n: any) => n.post_id).filter(Boolean);
+        if (priorIds.length > 0) {
+          const { data: priorRepaths } = await supabaseAdmin
+            .from("posts")
+            .select("id")
+            .in("id", priorIds)
+            .eq("repath_of", rootId)
+            .limit(1);
+          if (priorRepaths?.[0]?.id) {
+            notificationId = (priorNotifs ?? []).find(
+              (n: any) => n.post_id === priorRepaths[0].id
+            )?.id as string | undefined;
+          }
+        }
+
         if (!notificationId) {
           const { data: inserted } = await supabaseAdmin.from("notifications").insert({
             user_id: originalOwnerId,
@@ -929,20 +1010,20 @@ postsRouter.post("/", async (c) => {
             read: false,
           }).select("id").single();
           notificationId = inserted?.id;
-        }
 
-        void sendPushToUser(
-          supabaseAdmin,
-          originalOwnerId,
-          "New Repath",
-          `${user.full_name} repathed your moment`,
-          {
-            postId: post.id,
-            type: "repath",
-            fromUserId: userId,
-            notificationId,
-          }
-        );
+          void sendPushToUser(
+            supabaseAdmin,
+            originalOwnerId,
+            "New Repath",
+            `${user.full_name} repathed your moment`,
+            {
+              postId: post.id,
+              type: "repath",
+              fromUserId: userId,
+              notificationId,
+            }
+          );
+        }
       }
     } catch (e) {
       console.error("[notifications] repath insert error:", e);
@@ -1314,7 +1395,7 @@ postsRouter.delete("/:id", async (c) => {
 
   const { data: post } = await userClient
     .from("posts")
-    .select("id, user_id, type")
+    .select("id, user_id, type, repath_of")
     .eq("id", id)
     .maybeSingle();
 
@@ -1326,6 +1407,16 @@ postsRouter.delete("/:id", async (c) => {
   if (error) {
     console.error("Delete post error:", error);
     return c.json({ error: { message: "Failed to delete post" } }, 500);
+  }
+
+  // Removing a Repath (or any moment) must not leave stale activity rows.
+  try {
+    await supabaseAdmin.from("notifications").delete().eq("post_id", id);
+  } catch (e) {
+    console.warn(
+      "[posts] notification cleanup after delete failed:",
+      e instanceof Error ? e.message : e
+    );
   }
 
   return c.json({ data: null });
