@@ -6,12 +6,19 @@ import { ensureFriendshipMoments } from "../lib/systemMoments";
 import { getBlockedIds, isBlocked } from "../lib/blocks";
 import { resolveAvatarUrl } from "../lib/avatar";
 import { isDeletionHiddenProfile } from "../lib/account-deletion";
+import { acceptFriendshipSecurely } from "../lib/friend-accept";
+import {
+  FRIEND_LIMIT_CODE,
+  MAX_ACCEPTED_FRIENDS,
+  friendLimitMessage,
+  wouldExceedFriendLimit,
+} from "../lib/friend-limit";
 import type { HonoVariables } from "../types";
 
 const friendsRouter = new Hono<{ Variables: HonoVariables }>();
 
-/** Accepted friends + outgoing pending requests count toward this cap. */
-const MAX_FRIENDS = 150;
+/** Strict maximum of accepted friendships per user. Pending does not count. */
+const MAX_FRIENDS = MAX_ACCEPTED_FRIENDS;
 
 // Close friends ("starred" friends) are PRIVATE to the owner.
 // Schema drift: some DBs use `user_id`, others use `owner_id`. Support both.
@@ -543,7 +550,9 @@ friendsRouter.get("/", async (c) => {
       suggestedHasMore: suggested.length >= PEOPLE_PAGE_SIZE,
       suggestedPageSize: PEOPLE_PAGE_SIZE,
       friendLimit: MAX_FRIENDS,
-      friendSlotsUsed: acceptedFriends.length + pendingSentFriends.length,
+      // Only accepted friendships consume the hard 150 cap.
+      friendSlotsUsed: acceptedFriends.length,
+      pendingSentCount: pendingSentFriends.length,
     },
   });
 });
@@ -737,26 +746,22 @@ friendsRouter.post("/request/:userId", async (c) => {
     return c.json({ error: { message: "User not found" } }, 404);
   }
 
-  // Count accepted friends + outgoing pending toward the circle cap.
-  // Multiple outgoing requests are allowed until this limit is reached.
-  const [{ count: acceptedCount }, { count: pendingSentCount }] = await Promise.all([
-    supabaseAdmin
-      .from("friendships")
-      .select("id", { count: "exact", head: true })
-      .eq("status", "accepted")
-      .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`),
-    supabaseAdmin
-      .from("friendships")
-      .select("id", { count: "exact", head: true })
-      .eq("requester_id", userId)
-      .eq("status", "pending"),
-  ]);
-  const slotsUsed = (acceptedCount ?? 0) + (pendingSentCount ?? 0);
-  if (slotsUsed >= MAX_FRIENDS) {
+  // Hard cap is accepted friendships only (pending does not count).
+  const { count: acceptedCount, error: acceptedCountError } = await supabaseAdmin
+    .from("friendships")
+    .select("id", { count: "exact", head: true })
+    .eq("status", "accepted")
+    .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`);
+  if (acceptedCountError) {
+    console.error("[friends] accepted count failed:", acceptedCountError.message);
+    return c.json({ error: { message: "Failed to send request" } }, 500);
+  }
+  if (wouldExceedFriendLimit(acceptedCount ?? 0, MAX_FRIENDS)) {
     return c.json(
       {
         error: {
-          message: `Friend limit reached (${MAX_FRIENDS}). Remove a friend or cancel a pending request first.`,
+          code: FRIEND_LIMIT_CODE,
+          message: friendLimitMessage(MAX_FRIENDS),
         },
       },
       400
@@ -845,30 +850,36 @@ friendsRouter.post("/accept/:id", async (c) => {
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const { id } = c.req.param();
-  const userClient = createUserClient(token);
 
-  const { data: friendship } = await userClient.from("friendships").select("*").eq("id", id).single();
-  if (!friendship || friendship.receiver_id !== userId) {
-    return c.json({ error: { message: "Not found" } }, 404);
+  const acceptResult = await acceptFriendshipSecurely({
+    friendshipId: id,
+    accepterId: userId,
+  });
+  if (!acceptResult.ok) {
+    return c.json(
+      {
+        error: {
+          message: acceptResult.message,
+          ...(acceptResult.code ? { code: acceptResult.code } : {}),
+        },
+      },
+      acceptResult.status
+    );
   }
 
-  const { data: updated } = await userClient
-    .from("friendships")
-    .update({ status: "accepted" })
-    .eq("id", id)
-    .select()
-    .single();
+  const updated = acceptResult.friendship;
+  const requesterId = String(updated.requester_id ?? "");
 
   // Create the reciprocal "Became friends with X" system moments for both
   // users, timestamped to this accept. Idempotent per pair.
-  await ensureFriendshipMoments(friendship.requester_id, userId);
+  await ensureFriendshipMoments(requesterId, userId);
 
   // Notify the requester that their friend request was accepted. Use the
   // admin client since this row is owned by the requester, not the accepter,
   // and RLS on userClient would silently block the insert.
   try {
     const { data: acceptedNotif } = await supabaseAdmin.from("notifications").insert({
-      user_id: friendship.requester_id,
+      user_id: requesterId,
       from_user_id: userId,
       type: "friend_accepted",
       message: `${user.full_name} accepted your friend request`,
@@ -877,7 +888,7 @@ friendsRouter.post("/accept/:id", async (c) => {
 
     void sendPushToUser(
       supabaseAdmin,
-      friendship.requester_id,
+      requesterId,
       user.full_name || "Path+",
       `${user.full_name} accepted your friend request`,
       {
@@ -896,12 +907,12 @@ friendsRouter.post("/accept/:id", async (c) => {
     const { data: requesterProfile } = await supabaseAdmin
       .from("profiles")
       .select("full_name")
-      .eq("id", friendship.requester_id)
+      .eq("id", requesterId)
       .maybeSingle();
     const requesterName = requesterProfile?.full_name ?? "Someone";
     const { data: nowFriendsNotif } = await supabaseAdmin.from("notifications").insert({
       user_id: userId,
-      from_user_id: friendship.requester_id,
+      from_user_id: requesterId,
       type: "now_friends",
       message: `You are now friends with ${requesterName}`,
       read: false,
@@ -914,7 +925,7 @@ friendsRouter.post("/accept/:id", async (c) => {
       `You are now friends with ${requesterName}`,
       {
         type: "now_friends",
-        fromUserId: friendship.requester_id,
+        fromUserId: requesterId,
         notificationId: nowFriendsNotif?.id,
       }
     );
