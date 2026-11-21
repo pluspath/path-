@@ -948,8 +948,13 @@ postsRouter.post("/:id/reactions", async (c) => {
   if (!user || !userId || !token) return c.json({ error: { message: "Unauthorized" } }, 401);
 
   const { id } = c.req.param();
-  const { type } = await c.req.json();
-  const userClient = createUserClient(token);
+  const body = await c.req.json().catch(() => ({} as Record<string, unknown>));
+  const type = typeof body?.type === "string" ? body.type : "";
+  const intentRaw = typeof body?.intent === "string" ? body.intent : "toggle";
+  const intent =
+    intentRaw === "set" || intentRaw === "clear" || intentRaw === "toggle"
+      ? intentRaw
+      : "toggle";
 
   const { data: targetMoment } = await supabaseAdmin
     .from("posts")
@@ -962,6 +967,9 @@ postsRouter.post("/:id/reactions", async (c) => {
 
   // The client always sends a plain emoji; normalize defensively.
   const incoming = baseReactionType(type);
+  if (intent !== "clear" && !incoming) {
+    return c.json({ error: { message: "Reaction type required" } }, 400);
+  }
 
   // Use admin client to bypass RLS and safely handle any existing duplicates.
   // Avoid ordering by created_at — that column is missing on older schemas.
@@ -973,121 +981,150 @@ postsRouter.post("/:id/reactions", async (c) => {
     .limit(1)
     .maybeSingle();
 
-  // Track whether this call actually ADDED a reaction (vs toggled one off), so
+  // Track whether this call actually ADDED a reaction (vs cleared / no-op), so
   // we only notify the owner on a genuine new reaction.
   let didReact = false;
-  if (existing) {
-    // Delete ALL reactions for this user+post (cleans up any historical duplicates too)
-    await supabaseAdmin.from("reactions").delete().eq("post_id", id).eq("user_id", userId);
-    if (baseReactionType(existing.type) !== incoming) {
-      // Different emoji → switch to the new one (a fresh reaction is public/unlocked)
+  let didRemove = false;
+
+  if (intent === "clear") {
+    if (existing) {
+      await supabaseAdmin.from("reactions").delete().eq("post_id", id).eq("user_id", userId);
+      didRemove = true;
+    }
+  } else if (intent === "set") {
+    if (existing) {
+      if (baseReactionType(existing.type) !== incoming) {
+        // Replace in place (unique post_id+user_id). Switching clears any lock.
+        await supabaseAdmin
+          .from("reactions")
+          .update({ type: incoming })
+          .eq("post_id", id)
+          .eq("user_id", userId);
+        didReact = true;
+      }
+      // Same emoji already set → idempotent no-op (preserves lock).
+    } else {
       await supabaseAdmin.from("reactions").insert({ post_id: id, user_id: userId, type: incoming });
       didReact = true;
     }
-    // Same emoji → already deleted above (toggle off; any lock is cleared with it)
+  } else if (existing) {
+    // Legacy toggle: same emoji removes; different emoji replaces.
+    await supabaseAdmin.from("reactions").delete().eq("post_id", id).eq("user_id", userId);
+    if (baseReactionType(existing.type) !== incoming) {
+      await supabaseAdmin.from("reactions").insert({ post_id: id, user_id: userId, type: incoming });
+      didReact = true;
+    } else {
+      didRemove = true;
+    }
   } else {
     await supabaseAdmin.from("reactions").insert({ post_id: id, user_id: userId, type: incoming });
     didReact = true;
   }
 
-  // Notify the post owner (activity feed + push), never about their own action,
-  // and only when a reaction was actually added. Removing a like deletes the
-  // prior reaction notification so Moment text never lingers as stale "sensitive"
-  // preview data. The sheep (🐑) from a sleep moment reads as "sent you a sheep".
-  try {
-    const { data: postOwner } = await supabaseAdmin.from("posts").select("user_id, content").eq("id", id).maybeSingle();
-    if (postOwner && postOwner.user_id !== userId) {
-      // Keep denormalized profile like_count in sync for visitors.
-      let delta = 0;
-      if (!existing && didReact) delta = 1;
-      else if (existing && !didReact) delta = -1;
-      if (delta !== 0) {
-        const { data: row } = await supabaseAdmin
-          .from("profiles")
-          .select("like_count")
-          .eq("id", postOwner.user_id)
-          .maybeSingle();
-        const next = Math.max(0, (Number((row as any)?.like_count) || 0) + delta);
-        await supabaseAdmin.from("profiles").update({ like_count: next }).eq("id", postOwner.user_id);
-      }
-
-      // Clear prior like notices for this actor+moment (unlike OR emoji switch).
-      // Keep "X is sleeping" alerts (also type=sleep) — only remove sheep likes.
-      await supabaseAdmin
-        .from("notifications")
-        .delete()
-        .eq("user_id", postOwner.user_id)
-        .eq("from_user_id", userId)
-        .eq("post_id", id)
-        .eq("type", "reaction");
-      await supabaseAdmin
-        .from("notifications")
-        .delete()
-        .eq("user_id", postOwner.user_id)
-        .eq("from_user_id", userId)
-        .eq("post_id", id)
-        .eq("type", "sleep")
-        .ilike("message", "%sheep%");
-    }
-    if (didReact && postOwner && postOwner.user_id !== userId) {
-      const isSheep = incoming === "🐑";
-      // Do not embed Moment text in push/body — avoids leaking caption content via notices.
-      const { data: inserted } = await supabaseAdmin.from("notifications").insert({
-        user_id: postOwner.user_id,
-        from_user_id: userId,
-        type: isSheep ? "sleep" : "reaction",
-        message: isSheep ? "sent you a sheep" : "liked your Moment",
-        post_id: id,
-        read: false,
-      }).select("id").single();
-
-      void sendPushToUser(
-        supabaseAdmin,
-        postOwner.user_id,
-        isSheep ? "New Sheep" : "New Reaction",
-        isSheep
-          ? `${user.full_name} sent you a sheep`
-          : `${user.full_name} liked your Moment`,
-        {
-          postId: id,
-          type: isSheep ? "sleep" : "reaction",
-          fromUserId: userId,
-          notificationId: inserted?.id,
-        }
-      );
-    }
-  } catch (e) {
-    console.error("[notifications] reaction insert error:", e);
-  }
-
-  const { data: ownerRow } = await supabaseAdmin.from("posts").select("user_id").eq("id", id).maybeSingle();
+  const ownerId = targetMoment.user_id as string;
 
   // A reaction implies the friend saw the moment — persist a read receipt so
   // removing an open/locked like returns their avatar to the Seen row.
-  if (didReact && ownerRow?.user_id && ownerRow.user_id !== userId) {
-    try {
-      await supabaseAdmin.from("post_views").upsert(
+  if (didReact && ownerId && ownerId !== userId) {
+    void supabaseAdmin
+      .from("post_views")
+      .upsert(
         { post_id: id, user_id: userId, viewed_at: new Date().toISOString() },
         { onConflict: "post_id,user_id", ignoreDuplicates: true }
-      );
-    } catch (e) {
-      console.error("[post_views] reaction view upsert error:", e);
-    }
+      )
+      .then(({ error }) => {
+        if (error) console.error("[post_views] reaction view upsert error:", error.message);
+      });
   }
 
   const { data: reactions } = await supabaseAdmin
     .from("reactions")
     .select("user_id, type")
     .eq("post_id", id);
-  // Attach live profiles (nested embeds are unreliable for reactor names).
-  const { hydrateReactionProfiles } = await import("../lib/load-posts");
-  const shell = [{ reactions: reactions ?? [] }];
-  await hydrateReactionProfiles(shell);
+
+  // Do NOT call missing hydrateReactionProfiles — refreshReactionActors is enough.
   const formatted = {
-    reactions: formatReactions(shell[0].reactions ?? [], userId, ownerRow?.user_id),
+    reactions: formatReactions(reactions ?? [], userId, ownerId),
   };
   await refreshReactionActors([formatted]);
-  return c.json({ data: { reactions: formatted.reactions } });
+
+  // Notifications / like_count run after the response path is ready so the
+  // client is not blocked on push delivery.
+  if (ownerId && ownerId !== userId && (didReact || didRemove || (existing && didReact))) {
+    void (async () => {
+      try {
+        let delta = 0;
+        if (!existing && didReact) delta = 1;
+        else if (existing && didRemove) delta = -1;
+        if (delta !== 0) {
+          const { data: row } = await supabaseAdmin
+            .from("profiles")
+            .select("like_count")
+            .eq("id", ownerId)
+            .maybeSingle();
+          const next = Math.max(0, (Number((row as any)?.like_count) || 0) + delta);
+          await supabaseAdmin.from("profiles").update({ like_count: next }).eq("id", ownerId);
+        }
+
+        // Clear prior like notices for this actor+moment (unlike OR emoji switch).
+        await supabaseAdmin
+          .from("notifications")
+          .delete()
+          .eq("user_id", ownerId)
+          .eq("from_user_id", userId)
+          .eq("post_id", id)
+          .eq("type", "reaction");
+        await supabaseAdmin
+          .from("notifications")
+          .delete()
+          .eq("user_id", ownerId)
+          .eq("from_user_id", userId)
+          .eq("post_id", id)
+          .eq("type", "sleep")
+          .ilike("message", "%sheep%");
+
+        if (didReact) {
+          const isSheep = incoming === "🐑";
+          const { data: inserted } = await supabaseAdmin
+            .from("notifications")
+            .insert({
+              user_id: ownerId,
+              from_user_id: userId,
+              type: isSheep ? "sleep" : "reaction",
+              message: isSheep ? "sent you a sheep" : "liked your Moment",
+              post_id: id,
+              read: false,
+            })
+            .select("id")
+            .single();
+
+          void sendPushToUser(
+            supabaseAdmin,
+            ownerId,
+            isSheep ? "New Sheep" : "New Reaction",
+            isSheep
+              ? `${user.full_name} sent you a sheep`
+              : `${user.full_name} liked your Moment`,
+            {
+              postId: id,
+              type: isSheep ? "sleep" : "reaction",
+              fromUserId: userId,
+              notificationId: inserted?.id,
+            }
+          );
+        }
+      } catch (e) {
+        console.error("[notifications] reaction insert error:", e);
+      }
+    })();
+  }
+
+  return c.json({
+    data: {
+      reactions: formatted.reactions,
+      reactionCount: Array.isArray(reactions) ? reactions.length : formatted.reactions.length,
+    },
+  });
 });
 
 // Toggle the privacy lock on the current user's reaction for a post.
@@ -1115,7 +1152,6 @@ postsRouter.post("/:id/reactions/lock", async (c) => {
     .select("id, type")
     .eq("post_id", id)
     .eq("user_id", userId)
-    .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
 
@@ -1125,16 +1161,13 @@ postsRouter.post("/:id/reactions/lock", async (c) => {
   const newType = nextLocked ? lockedReactionType(existing.type) : baseReactionType(existing.type);
   await supabaseAdmin.from("reactions").update({ type: newType }).eq("post_id", id).eq("user_id", userId);
 
-  const { data: ownerRow } = await supabaseAdmin.from("posts").select("user_id").eq("id", id).maybeSingle();
+  const ownerId = lockTarget.user_id as string;
   const { data: reactions } = await supabaseAdmin
     .from("reactions")
     .select("user_id, type")
     .eq("post_id", id);
-  const { hydrateReactionProfiles } = await import("../lib/load-posts");
-  const shell = [{ reactions: reactions ?? [] }];
-  await hydrateReactionProfiles(shell);
   const formatted = {
-    reactions: formatReactions(shell[0].reactions ?? [], userId, ownerRow?.user_id),
+    reactions: formatReactions(reactions ?? [], userId, ownerId),
   };
   await refreshReactionActors([formatted]);
   return c.json({ data: { locked: nextLocked, reactions: formatted.reactions } });
